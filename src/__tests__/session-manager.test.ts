@@ -271,6 +271,8 @@ describe('SessionManager', () => {
       expect(info.created).toBeDefined();
       expect(info.stats).toBeDefined();
       expect(info.stats.isReady).toBe(true);
+      expect(info.orchestrationRunId).toMatch(/^session-/);
+      expect(info.orchestrationAgentKey).toBe('test1');
       expect(lastMock().startCalled).toBe(1);
     });
 
@@ -393,6 +395,8 @@ describe('SessionManager', () => {
 
       expect(result.output).toContain('hello world');
       expect(result.sessionId).toBeDefined();
+      expect(result.orchestrationRunId).toMatch(/^session-/);
+      expect(result.orchestrationAgentKey).toBe('msg-test');
       expect(lastMock().sendCalls.length).toBe(1);
       expect(lastMock().sendCalls[0].message).toBe('hello world');
     });

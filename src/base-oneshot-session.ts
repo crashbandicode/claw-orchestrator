@@ -24,6 +24,7 @@ import {
 } from './types.js';
 import { resolveAlias, getContextWindow } from './models.js';
 import { MAX_HISTORY_ITEMS, DEFAULT_HISTORY_LIMIT, SESSION_EVENT } from './constants.js';
+import { sanitizeCwd } from './validation.js';
 
 // ─── Engine Configuration ──────────────────────────────────────────────────
 
@@ -109,8 +110,12 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
 
   async start(): Promise<this> {
     if (this.options.cwd) {
-      this.options.cwd = path.resolve(this.options.cwd);
-      if (!fs.existsSync(this.options.cwd)) {
+      this.options.cwd = sanitizeCwd(this.options.cwd)!;
+      const isWindowsPath = /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(this.options.cwd!);
+      const isForeignPath = process.platform === 'win32'
+        ? path.posix.isAbsolute(this.options.cwd!) && !isWindowsPath
+        : isWindowsPath;
+      if (!isForeignPath && !fs.existsSync(this.options.cwd!)) {
         fs.mkdirSync(this.options.cwd, { recursive: true });
       }
     }

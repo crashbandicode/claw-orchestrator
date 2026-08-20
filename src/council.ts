@@ -487,6 +487,17 @@ export class Council extends EventEmitter {
           customEngine: agent.customEngine,
           effort: agent.effort,
           ultracode: agent.ultracode,
+          orchestration: {
+            runId: sessionId,
+            runKind: 'council',
+            agentKey: `${agent.name}:round-${round}`,
+            agentName: agent.name,
+            codename: `${agent.emoji} ${agent.name}`,
+            engine,
+            model: agent.model,
+            effort: agent.effort,
+            cwd: workDir,
+          },
         });
 
         // Send the prompt and wait for completion

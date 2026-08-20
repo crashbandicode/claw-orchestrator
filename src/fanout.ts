@@ -147,6 +147,16 @@ export class Fanout {
         maxTurns: this.config.maxTurnsPerAgent ?? DEFAULT_MAX_TURNS,
         maxBudgetUsd: this.config.maxBudgetUsd,
         customEngine: spec.customEngine,
+        orchestration: {
+          runId: this.session.id,
+          runKind: 'fanout',
+          agentKey: spec.name,
+          agentName: spec.name,
+          codename: spec.name,
+          engine,
+          model: spec.model,
+          cwd: this.config.projectDir,
+        },
       });
       const result = await this.manager.sendMessage(sessionName, spec.prompt || this.config.task, {
         timeout: this.config.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
@@ -195,6 +205,16 @@ export class Fanout {
         permissionMode: 'bypassPermissions',
         maxTurns: this.config.maxTurnsPerAgent ?? DEFAULT_MAX_TURNS,
         maxBudgetUsd: this.config.maxBudgetUsd,
+        orchestration: {
+          runId: this.session.id,
+          runKind: 'fanout',
+          agentKey: 'synthesis',
+          agentName: 'Synthesis',
+          codename: 'synthesis',
+          engine: this.config.synthesisEngine || 'claude',
+          model: this.config.synthesisModel,
+          cwd: this.config.projectDir,
+        },
       });
       const result = await this.manager.sendMessage(sessionName, prompt, {
         timeout: this.config.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,

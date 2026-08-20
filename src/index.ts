@@ -1095,7 +1095,12 @@ const plugin = {
           maxTurnsPerAgent: args.maxTurnsPerAgent as number | undefined,
           maxBudgetUsd: args.maxBudgetUsd as number | undefined,
         });
-        return { ok: true, ...session, note: 'Fan-out running in background. Poll with fanout_status.' };
+        return {
+          ok: true,
+          ...session,
+          orchestrationRunId: session.id,
+          note: 'Fan-out running in background. Poll with fanout_status.',
+        };
       },
     });
 
@@ -1194,7 +1199,12 @@ const plugin = {
         };
 
         const session = getManager().councilStart(args.task as string, config);
-        return { ok: true, ...session, note: 'Council running in background. Poll with council_status.' };
+        return {
+          ok: true,
+          ...session,
+          orchestrationRunId: session.id,
+          note: 'Council running in background. Poll with council_status.',
+        };
       },
     });
 

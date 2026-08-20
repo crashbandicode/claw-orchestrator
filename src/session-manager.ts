@@ -8,6 +8,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
+import { randomUUID } from 'node:crypto';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -153,6 +154,9 @@ import {
   type RuleInfo,
   type StreamEvent,
   type ISession,
+  type OrchestrationAgentContext,
+  type OrchestrationAgentStatus,
+  type OrchestrationRunStatus,
   type CouncilConfig,
   type CouncilSession,
   type CouncilReviewResult,
@@ -173,6 +177,7 @@ import type { AutoloopState, PushPolicy } from './autoloop/types.js';
 import { DEFAULT_PUSH_POLICY } from './autoloop/types.js';
 import { Msg as AutoloopMsg, type PushChannel, type PushLevel } from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
+import { OrchestrationEventWriter } from './orchestration-events.js';
 import { UltraappManager } from './ultraapp/manager.js';
 import { UltraappStore, defaultStoreRoot } from './ultraapp/store.js';
 import type { UltraappRouter } from './ultraapp/router.js';
@@ -215,6 +220,9 @@ interface ManagedSession {
    * session listings can show *why* a session stopped accepting turns.
    */
   budgetExhausted?: boolean;
+  orchestration: OrchestrationAgentContext;
+  orchestrationBoundNativeId?: string;
+  orchestrationLastStatus: OrchestrationAgentStatus;
 }
 
 interface SendOptions {
@@ -495,9 +503,15 @@ export class SessionManager {
   private _ultraappManager: UltraappManager | null = null;
   private _ultraappRouter: UltraappRouter | null = null;
   private _ultraappRuntimeMode: 'host' | 'docker' = 'host';
+  private _orchestrationEvents: OrchestrationEventWriter;
+  private _startedOrchestrationRuns = new Set<string>();
 
   constructor(config?: Partial<PluginConfig>, logger?: Logger) {
     this.logger = logger || createConsoleLogger('SessionManager');
+    this._orchestrationEvents = new OrchestrationEventWriter(
+      { orchestratorVersion: getPluginVersion() },
+      this.logger,
+    );
     this.pluginConfig = {
       claudeBin: config?.claudeBin || 'claude',
       defaultModel: config?.defaultModel,
@@ -646,19 +660,30 @@ export class SessionManager {
     // config (agy resume-id lookups, _persistSession's registry entry) see the
     // real engine even when it came from the persisted registry.
     fullConfig.engine = engine;
+    const orchestration = this._normalizeOrchestrationContext(name, fullConfig, engine);
+    fullConfig.orchestration = orchestration;
+    this._ensureOrchestrationRunStarted(orchestration);
+    this._orchestrationEvents.emit('agent.declared', orchestration, { agentStatus: 'declared' });
 
-    // Circuit breaker — reject early if engine is in backoff
-    this._circuitBreaker.check(engine);
-
-    if (engine === 'claude' && fullConfig.resolvedModel && !fullConfig.baseUrl) {
-      if (!isClaudeModel(fullConfig.resolvedModel!)) {
-        const proxyPort = await this._ensureProxyServer();
-        if (proxyPort) {
-          fullConfig.baseUrl = `http://127.0.0.1:${proxyPort}`;
+    let session: ISession;
+    try {
+      // Circuit breaker and proxy setup are part of starting the declared
+      // child. Every rejection must therefore close its lifecycle record.
+      this._circuitBreaker.check(engine);
+      if (engine === 'claude' && fullConfig.resolvedModel && !fullConfig.baseUrl) {
+        if (!isClaudeModel(fullConfig.resolvedModel!)) {
+          const proxyPort = await this._ensureProxyServer();
+          if (proxyPort) {
+            fullConfig.baseUrl = `http://127.0.0.1:${proxyPort}`;
+          }
         }
       }
+      session = this._createSession(engine, fullConfig);
+    } catch (err) {
+      this._orchestrationEvents.emit('agent.status', orchestration, { agentStatus: 'failed' });
+      if (orchestration.runKind === 'session') this._emitOrchestrationRunStatus(orchestration, 'failed');
+      throw err;
     }
-    const session = this._createSession(engine, fullConfig);
 
     session.on(SESSION_EVENT.LOG, (...args: unknown[]) => this.logger.info(`[Session:${name}]`, ...args));
 
@@ -666,6 +691,8 @@ export class SessionManager {
       await session.start();
     } catch (err) {
       this._circuitBreaker.recordFailure(engine);
+      this._orchestrationEvents.emit('agent.status', orchestration, { agentStatus: 'failed' });
+      if (orchestration.runKind === 'session') this._emitOrchestrationRunStatus(orchestration, 'failed');
       throw err;
     }
 
@@ -686,6 +713,8 @@ export class SessionManager {
       cwd: fullConfig.cwd,
       claudeSessionId: this._sessionResumeId(engine, session),
       skipPersistence: skipPersist,
+      orchestration,
+      orchestrationLastStatus: 'idle',
     };
 
     this.sessions.set(name, managed);
@@ -695,6 +724,9 @@ export class SessionManager {
     if (!skipPersist) {
       this._persistSession(name, managed);
     }
+
+    this._bindOrchestrationIdentity(managed);
+    this._setOrchestrationAgentStatus(managed, 'idle');
 
     return this._toSessionInfo(name, managed);
   }
@@ -782,6 +814,7 @@ export class SessionManager {
       let turnError: string | undefined;
 
       try {
+        this._setOrchestrationAgentStatus(managed, 'running');
         const result = await managed.session.send(message, sendOpts);
 
         // Update the resume-capable session ID if available (skip disk persist
@@ -793,6 +826,7 @@ export class SessionManager {
             this._persistSession(name, managed);
           }
         }
+        this._bindOrchestrationIdentity(managed);
 
         if ('text' in result) {
           // The CLI reports turn-level failures (invalid --model, auth loss) as a
@@ -808,17 +842,28 @@ export class SessionManager {
           if (evt?.is_error) {
             turnError = String((evt.result as string) || result.text || 'turn failed');
           }
+          this._setOrchestrationAgentStatus(managed, turnError ? 'failed' : 'idle');
           return {
             output: result.text,
             sessionId: this._managedResumeId(managed),
             error: turnError,
             events: [],
+            orchestrationRunId: managed.orchestration.runId,
+            orchestrationAgentKey: managed.orchestration.agentKey,
           };
         }
 
-        return { output: '', sessionId: this._managedResumeId(managed), events: [] };
+        this._setOrchestrationAgentStatus(managed, 'idle');
+        return {
+          output: '',
+          sessionId: this._managedResumeId(managed),
+          events: [],
+          orchestrationRunId: managed.orchestration.runId,
+          orchestrationAgentKey: managed.orchestration.agentKey,
+        };
       } catch (err) {
         turnError = (err as Error).message;
+        this._setOrchestrationAgentStatus(managed, 'failed');
         throw err;
       } finally {
         this._recordRunTurn(name, managed, ledgerBefore, startedAt, turnError, options.parentRunId);
@@ -964,6 +1009,15 @@ export class SessionManager {
 
   async stopSession(name: string, opts: { keepPersisted?: boolean } = {}): Promise<void> {
     const managed = this._getSession(name);
+    const terminalStatus: OrchestrationAgentStatus =
+      managed.orchestrationLastStatus === 'failed' ? 'failed' : 'completed';
+    this._setOrchestrationAgentStatus(managed, terminalStatus);
+    if (managed.orchestration.runKind === 'session') {
+      this._emitOrchestrationRunStatus(
+        managed.orchestration,
+        terminalStatus === 'failed' ? 'failed' : 'completed',
+      );
+    }
     managed.session.stop();
     this.sessions.delete(name);
     // Remove PID tracking
@@ -1944,17 +1998,18 @@ export class SessionManager {
 
   private _persistSession(name: string, managed: ManagedSession): void {
     const resumeSessionId = this._managedResumeId(managed);
-    if (!resumeSessionId) {
-      if (managed.config.engine === 'agy' && this.persistedSessions.delete(name)) {
-        this._debouncedSave();
-      }
+    if (!resumeSessionId && managed.config.engine === 'agy') {
+      if (this.persistedSessions.delete(name)) this._debouncedSave();
       return;
     }
-    managed.claudeSessionId = resumeSessionId;
     const existing = this.persistedSessions.get(name);
+    if (resumeSessionId) managed.claudeSessionId = resumeSessionId;
     this.persistedSessions.set(name, {
       name,
-      claudeSessionId: resumeSessionId,
+      // Persist engine/sandbox configuration independently from native
+      // identity. Cursor and Codex only reveal a resumable id on their first
+      // turn; a stop/restart before that must not silently become Claude.
+      claudeSessionId: resumeSessionId || existing?.claudeSessionId || '',
       cwd: managed.cwd,
       model: managed.config.resolvedModel || managed.config.model,
       engine: managed.config.engine,
@@ -2160,12 +2215,84 @@ export class SessionManager {
       paused: false,
       stats,
       costUsd: Math.round(costUsd * 10000) / 10000,
+      engine: managed.config.engine,
+      orchestrationRunId: managed.orchestration.runId,
+      orchestrationAgentKey: managed.orchestration.agentKey,
     };
     if (managed.config.maxBudgetUsd) {
       info.budgetUsd = managed.config.maxBudgetUsd;
       info.budgetExhausted = managed.budgetExhausted || isBudgetExceeded(costUsd, managed.config.maxBudgetUsd);
     }
     return info;
+  }
+
+  private _normalizeOrchestrationContext(
+    name: string,
+    config: SessionConfig,
+    engine: EngineType,
+  ): OrchestrationAgentContext {
+    const supplied = config.orchestration;
+    const runId = supplied?.runId || `session-${randomUUID().slice(0, 12)}`;
+    return {
+      runId,
+      runKind: supplied?.runKind || 'session',
+      agentKey: supplied?.agentKey || name,
+      agentName: supplied?.agentName || name,
+      ...(supplied?.codename ? { codename: supplied.codename } : {}),
+      engine,
+      model: config.resolvedModel || config.model,
+      effort: config.effort,
+      cwd: config.cwd,
+    };
+  }
+
+  private _ensureOrchestrationRunStarted(context: OrchestrationAgentContext): void {
+    if (this._startedOrchestrationRuns.has(context.runId)) return;
+    this._startedOrchestrationRuns.add(context.runId);
+    this._orchestrationEvents.emit('run.started', context, { runStatus: 'running' });
+  }
+
+  private _emitOrchestrationRunStatus(
+    context: OrchestrationAgentContext,
+    status: OrchestrationRunStatus,
+  ): void {
+    this._orchestrationEvents.emit('run.status', context, { runStatus: status });
+  }
+
+  private _bindOrchestrationIdentity(managed: ManagedSession): void {
+    const nativeSessionId = this._managedResumeId(managed);
+    if (!nativeSessionId || nativeSessionId === managed.orchestrationBoundNativeId) return;
+    managed.orchestrationBoundNativeId = nativeSessionId;
+    this._orchestrationEvents.emit('agent.identity_bound', managed.orchestration, {
+      nativeSessionId,
+      agentStatus: managed.orchestrationLastStatus,
+    });
+  }
+
+  private _setOrchestrationAgentStatus(managed: ManagedSession, status: OrchestrationAgentStatus): void {
+    managed.orchestrationLastStatus = status;
+    this._orchestrationEvents.emit('agent.status', managed.orchestration, {
+      nativeSessionId: managed.orchestrationBoundNativeId,
+      agentStatus: status,
+    });
+  }
+
+  /** Record a run-level terminal state after fanout/council has joined its children. */
+  recordOrchestrationRunStatus(
+    runId: string,
+    runKind: OrchestrationAgentContext['runKind'],
+    status: OrchestrationRunStatus,
+  ): void {
+    const context: OrchestrationAgentContext = {
+      runId,
+      runKind,
+      agentKey: '__run__',
+      agentName: runKind,
+      engine: 'claude',
+      cwd: process.cwd(),
+    };
+    this._ensureOrchestrationRunStarted(context);
+    this._emitOrchestrationRunStatus(context, status);
   }
 
   private _resolveModel(alias: string, overrides?: Record<string, string>): string {
@@ -2192,6 +2319,9 @@ export class SessionManager {
     }
     if (engine === 'codex') {
       return (session as { threadId?: string }).threadId;
+    }
+    if (engine === 'cursor') {
+      return session.getStats().cursorChatId;
     }
     return session.sessionId;
   }
@@ -2253,11 +2383,18 @@ export class SessionManager {
     council
       .run()
       .then(() => {
+        const status = council.getSession()?.status;
+        this.recordOrchestrationRunStatus(
+          initialSession.id,
+          'council',
+          status === 'error' ? 'failed' : 'completed',
+        );
         // Keep completed council queryable; schedule cleanup after TTL
         this._scheduleCouncilCleanup(initialSession.id);
       })
       .catch((err) => {
         this.logger.error(`Council ${initialSession.id} failed:`, err);
+        this.recordOrchestrationRunStatus(initialSession.id, 'council', 'failed');
         this._scheduleCouncilCleanup(initialSession.id);
       });
 
@@ -2341,6 +2478,7 @@ export class SessionManager {
     const council = this.councils.get(id);
     if (!council) throw new Error(`Council '${id}' not found`);
     council.abort();
+    this.recordOrchestrationRunStatus(id, 'council', 'aborted');
     this.councils.delete(id);
     // Drop the orphaned cleanup timer so it doesn't fire later on a deleted council.
     this._clearCleanupTimer(this.councilCleanupTimers, id);
@@ -2397,7 +2535,15 @@ export class SessionManager {
     this.fanouts.set(session.id, fanout);
     fanout
       .run()
-      .catch((err) => this.logger.error(`Fanout ${session.id} failed:`, err))
+      .then((finished) => {
+        const status: OrchestrationRunStatus =
+          finished.status === 'done' ? 'completed' : finished.status === 'aborted' ? 'aborted' : 'failed';
+        this.recordOrchestrationRunStatus(session.id, 'fanout', status);
+      })
+      .catch((err) => {
+        this.logger.error(`Fanout ${session.id} failed:`, err);
+        this.recordOrchestrationRunStatus(session.id, 'fanout', 'failed');
+      })
       .finally(() => this._scheduleFanoutCleanup(session.id));
     return session;
   }
@@ -2412,6 +2558,7 @@ export class SessionManager {
     const fanout = this.fanouts.get(id);
     if (!fanout) throw new Error(`Fanout '${id}' not found`);
     fanout.abort();
+    this.recordOrchestrationRunStatus(id, 'fanout', 'aborted');
     this._scheduleFanoutCleanup(id);
   }
 

@@ -15,11 +15,13 @@ function makeManager(
   } = {},
 ) {
   const started: string[] = [];
+  const startConfigs: Array<Record<string, unknown>> = [];
   const stopped: string[] = [];
   const sent: Array<{ name: string; message: string }> = [];
   const manager = {
-    startSession: vi.fn(async (config: { name?: string }) => {
+    startSession: vi.fn(async (config: { name?: string } & Record<string, unknown>) => {
       started.push(config.name!);
+      startConfigs.push(config);
       return { name: config.name } as never;
     }),
     sendMessage: vi.fn(async (name: string, message: string) => {
@@ -32,7 +34,7 @@ function makeManager(
       stopped.push(name);
     }),
   };
-  return { manager, started, stopped, sent };
+  return { manager, started, startConfigs, stopped, sent };
 }
 
 const baseConfig = (agents: FanoutConfig['agents'], extra: Partial<FanoutConfig> = {}): FanoutConfig => ({
@@ -61,6 +63,25 @@ describe('Fanout', () => {
     // Each agent's session was started and stopped.
     expect(started).toHaveLength(2);
     expect(stopped).toHaveLength(2);
+  });
+
+  it('gives every native child an explicit shared run id and unique agent key', async () => {
+    const { manager, startConfigs } = makeManager();
+    const fan = new Fanout(
+      baseConfig([
+        { name: 'reviewer', engine: 'codex', model: 'gpt-test' },
+        { name: 'implementer', engine: 'cursor', model: 'cursor-test' },
+      ]),
+      manager,
+    );
+    const initialized = fan.init();
+    await fan.run();
+
+    expect(startConfigs).toHaveLength(2);
+    expect(startConfigs.map((config) => config.orchestration)).toEqual([
+      expect.objectContaining({ runId: initialized.id, runKind: 'fanout', agentKey: 'reviewer' }),
+      expect.objectContaining({ runId: initialized.id, runKind: 'fanout', agentKey: 'implementer' }),
+    ]);
   });
 
   it('uses a per-agent prompt override when provided, else the shared task', async () => {

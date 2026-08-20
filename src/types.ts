@@ -339,6 +339,28 @@ export interface SessionConfig {
   codexProfile?: string;
   /** Custom engine configuration — required when engine is 'custom' */
   customEngine?: CustomEngineConfig;
+  /**
+   * Internal, content-free correlation metadata for external transcript
+   * indexers. Public callers normally omit this; fanout/council populate it so
+   * their short-lived native sessions remain linked after Claw cleans them up.
+   */
+  orchestration?: OrchestrationAgentContext;
+}
+
+export type OrchestrationRunKind = 'session' | 'fanout' | 'council' | 'autoloop' | 'ultraplan' | 'ultrareview';
+export type OrchestrationAgentStatus = 'declared' | 'idle' | 'running' | 'completed' | 'failed' | 'aborted';
+export type OrchestrationRunStatus = 'running' | 'completed' | 'failed' | 'aborted';
+
+export interface OrchestrationAgentContext {
+  runId: string;
+  runKind: OrchestrationRunKind;
+  agentKey: string;
+  agentName: string;
+  codename?: string;
+  engine: EngineType;
+  model?: string;
+  effort?: EffortLevel;
+  cwd: string;
 }
 
 // ─── Session Stats ───────────────────────────────────────────────────────────
@@ -490,6 +512,9 @@ export interface SessionInfo {
   budgetUsd?: number;
   /** True once `costUsd` reached `budgetUsd` — further turns are refused. */
   budgetExhausted?: boolean;
+  engine?: EngineType;
+  orchestrationRunId?: string;
+  orchestrationAgentKey?: string;
 }
 
 export interface SendResult {
@@ -497,6 +522,8 @@ export interface SendResult {
   sessionId?: string;
   error?: string;
   events: StreamEvent[];
+  orchestrationRunId?: string;
+  orchestrationAgentKey?: string;
 }
 
 export interface GrepMatch {

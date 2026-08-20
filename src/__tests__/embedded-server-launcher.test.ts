@@ -6,6 +6,7 @@ import * as path from 'node:path';
 import { SessionManager } from '../session-manager.js';
 import { EmbeddedServer } from '../embedded-server.js';
 import type { CouncilSession } from '../types.js';
+import { sanitizeCwd } from '../validation.js';
 import { useIsolatedHome } from './helpers/isolate-home.js';
 
 // Tests construct real EmbeddedServer instances, which write to
@@ -232,7 +233,7 @@ describe('POST /autoloop/new', () => {
     expect(r.status).toBe(200);
     expect(manager.autoloopStart).toHaveBeenLastCalledWith({
       runId: 'multi-engine-http',
-      workspace: fs.realpathSync('/tmp'),
+      workspace: sanitizeCwd('/tmp'),
       plannerEngine: 'codex',
       plannerModel: 'gpt-planner',
       coderEngine: 'opencode',

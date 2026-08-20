@@ -15,6 +15,14 @@ import RE2 from 're2';
 
 /** System-critical directories that must never be used as a working directory */
 const BLOCKED_PREFIXES = ['/etc', '/proc', '/sys', '/var/run', '/var/log', '/boot', '/sbin'];
+const BLOCKED_WINDOWS_PREFIXES = [
+  'c:/windows',
+  'c:/program files',
+  'c:/program files (x86)',
+  'c:/programdata',
+  'c:/recovery',
+  'c:/system volume information',
+];
 
 /** Sensitive directories under the user's home that must never be used as cwd */
 const BLOCKED_HOME_SUBDIRS = ['.ssh', '.gnupg', '.aws', '.config/gcloud'];
@@ -31,15 +39,30 @@ const BLOCKED_HOME_SUBDIRS = ['.ssh', '.gnupg', '.aws', '.config/gcloud'];
 export function sanitizeCwd(cwd: string | undefined): string | undefined {
   if (!cwd) return undefined;
 
+  const isPosixAbsolute = path.posix.isAbsolute(cwd);
+  // win32.isAbsolute('/tmp') is true because Windows accepts rooted paths
+  // without a drive. Treat only a drive-qualified or UNC path as explicitly
+  // Windows so a genuine POSIX path survives a Windows -> WSL launch intact.
+  const isWindowsAbsolute = /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(cwd);
+  const usesNativeGrammar = process.platform === 'win32'
+    ? isWindowsAbsolute || !isPosixAbsolute
+    : !isWindowsAbsolute;
+
   // Logical path: resolves .. and . but does NOT follow symlinks.
-  // This catches the obvious cases (/etc, /var/run, /sbin) on all platforms.
-  const logical = path.resolve(cwd);
+  // Resolve with the caller's path grammar. Claw can launch an agent in a
+  // different environment (for example WSL from Windows), so using only the
+  // host grammar would silently turn /tmp/project into C:\tmp\project.
+  const logical = isPosixAbsolute
+    ? path.posix.resolve(cwd)
+    : isWindowsAbsolute
+      ? path.win32.resolve(cwd)
+      : path.resolve(cwd);
 
   // Real path: follows symlinks. This catches symlink-based bypasses
   // (e.g. /tmp/safe → /etc). Falls back to logical for non-existent paths.
   let real: string;
   try {
-    real = fs.realpathSync(cwd);
+    real = usesNativeGrammar ? fs.realpathSync(cwd) : logical;
   } catch {
     real = logical;
   }
@@ -47,6 +70,12 @@ export function sanitizeCwd(cwd: string | undefined): string | undefined {
   // Collect all paths to check — logical, real, and their de-prefixed
   // variants for macOS where /etc → /private/etc, /var → /private/var.
   const pathsToCheck = new Set([logical, real]);
+  // A host process can be asked to launch a different-platform CLI (notably
+  // Windows Claw launching a WSL agent). Preserve the caller's path grammar
+  // as an additional validation view instead of letting path.resolve('/etc')
+  // reinterpret it as C:\etc on Windows.
+  if (isPosixAbsolute) pathsToCheck.add(path.posix.resolve(cwd));
+  if (isWindowsAbsolute) pathsToCheck.add(path.win32.resolve(cwd));
   for (const p of [logical, real]) {
     if (p.startsWith('/private/')) {
       pathsToCheck.add(p.slice('/private'.length));
@@ -63,7 +92,17 @@ export function sanitizeCwd(cwd: string | undefined): string | undefined {
   // Block system-critical prefixes
   for (const check of pathsToCheck) {
     for (const prefix of BLOCKED_PREFIXES) {
-      if (check === prefix || check.startsWith(prefix + '/')) {
+      const normalized = check.replaceAll('\\', '/');
+      if (normalized === prefix || normalized.startsWith(prefix + '/')) {
+        throw new Error(`Unsafe working directory: ${logical}`);
+      }
+    }
+    const normalizedWindows = check.replaceAll('\\', '/').toLocaleLowerCase();
+    for (const prefix of BLOCKED_WINDOWS_PREFIXES) {
+      if (
+        normalizedWindows === prefix
+        || normalizedWindows.startsWith(prefix + '/')
+      ) {
         throw new Error(`Unsafe working directory: ${logical}`);
       }
     }
@@ -74,7 +113,12 @@ export function sanitizeCwd(cwd: string | undefined): string | undefined {
   for (const check of pathsToCheck) {
     for (const subdir of BLOCKED_HOME_SUBDIRS) {
       const sensitive = path.join(home, subdir);
-      if (check === sensitive || check.startsWith(sensitive + '/')) {
+      const normalizedCheck = check.replaceAll('\\', '/').toLocaleLowerCase();
+      const normalizedSensitive = sensitive.replaceAll('\\', '/').toLocaleLowerCase();
+      if (
+        normalizedCheck === normalizedSensitive
+        || normalizedCheck.startsWith(normalizedSensitive + '/')
+      ) {
         throw new Error(`Unsafe working directory: ${logical}`);
       }
     }
