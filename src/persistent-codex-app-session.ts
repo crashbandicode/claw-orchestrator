@@ -27,6 +27,7 @@ import { EventEmitter } from 'node:events';
 import * as readline from 'node:readline';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { resolveWindowsNodeInvocation } from './windows-command.js';
 
 import type {
   SessionConfig,
@@ -188,10 +189,12 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     }
 
     const args = ['app-server', '--listen', 'stdio://', '--enable', 'goals'];
-    this.proc = spawn(this.codexBin, args, {
+    const invocation = resolveWindowsNodeInvocation(this.codexBin);
+    this.proc = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
       cwd: this.options.cwd,
       env: { ...process.env },
       stdio: ['pipe', 'pipe', 'pipe'],
+      windowsHide: process.platform === 'win32',
     });
 
     this._rl = readline.createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });

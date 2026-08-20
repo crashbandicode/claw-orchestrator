@@ -22,6 +22,7 @@ import { join } from 'node:path';
 import type { SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
 import { SESSION_EVENT } from './constants.js';
 import { BaseOneShotSession } from './base-oneshot-session.js';
+import { resolveWindowsNodeInvocation } from './windows-command.js';
 
 // ─── Codex JSON event shapes (subset we consume) ────────────────────────────
 //
@@ -289,10 +290,12 @@ export class PersistentCodexSession extends BaseOneShotSession {
       let turnError: string | undefined;
       let settled = false;
 
-      const proc = spawn(this.engineBin, args, {
+      const invocation = resolveWindowsNodeInvocation(this.engineBin);
+      const proc = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
         cwd: this.options.cwd,
         env: { ...process.env },
         stdio: ['ignore', 'pipe', 'pipe'],
+        windowsHide: process.platform === 'win32',
       });
       this.currentProc = proc;
 
