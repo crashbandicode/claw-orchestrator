@@ -8,7 +8,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
-import { readFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 // Mock child_process before importing the session
@@ -18,7 +19,7 @@ vi.mock('node:child_process', () => ({
 }));
 
 // Import after mocking
-const { PersistentCursorSession } = await import('../persistent-cursor-session.js');
+const { PersistentCursorSession, resolveCursorInvocation } = await import('../persistent-cursor-session.js');
 
 // ─── Mock Process Helper ────────────────────────────────────────────────────
 
@@ -84,6 +85,25 @@ describe('PersistentCursorSession', () => {
   // ─── spawn flags ────────────────────────────────────────────────────────
 
   describe('spawn flags', () => {
+    it('unwraps the Windows Cursor launcher without shell or cmd indirection', () => {
+      const root = mkdtempSync(join(tmpdir(), 'claw-cursor-launcher-'));
+      try {
+        const runtime = join(root, 'versions', '2026.08.11-e8db854');
+        mkdirSync(runtime, { recursive: true });
+        writeFileSync(join(runtime, 'node.exe'), 'test');
+        writeFileSync(join(runtime, 'index.js'), 'test');
+        const launcher = join(root, 'cursor-agent.cmd');
+        writeFileSync(launcher, '@echo off');
+
+        const invocation = resolveCursorInvocation(launcher, 'win32');
+        expect(invocation.command).toBe(join(runtime, 'node.exe'));
+        expect(invocation.prefixArgs).toEqual([join(runtime, 'index.js')]);
+        expect(invocation.env.CURSOR_INVOKED_AS).toBe('cursor-agent.cmd');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it('uses -p --force --trust --output-format stream-json', async () => {
       const session = new PersistentCursorSession({
         name: 'test',
