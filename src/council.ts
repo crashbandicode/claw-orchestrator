@@ -106,6 +106,62 @@ function spawnAsync(
 }
 
 const VALID_AGENT_NAME = /^[a-zA-Z0-9_-]+$/;
+const LEGACY_COUNCIL_GIT_NAME = 'Council';
+const LEGACY_COUNCIL_GIT_EMAIL = 'council@openclaw';
+
+export interface GitIdentity {
+  name: string;
+  email: string;
+}
+
+async function readGitConfigValue(projectDir: string, args: string[]): Promise<string | undefined> {
+  try {
+    const result = await spawnAsync('git', ['-C', projectDir, 'config', ...args], { timeout: GIT_CMD_TIMEOUT_MS });
+    return result.stdout.trim() || undefined;
+  } catch (err) {
+    // `git config --get` exits 1 when the key is absent. Other failures (bad
+    // repository, inaccessible config, etc.) must remain visible.
+    if ((err as Error).message.startsWith('git exited with code 1:')) return undefined;
+    throw err;
+  }
+}
+
+/**
+ * Preserve a project's Git identity and repair the repository-wide identity
+ * written by Claw Orchestrator releases before 5.0.0-memento.5.
+ *
+ * Linked worktrees normally share the repository's local config, so repairing
+ * the common `user.*` values here repairs every linked Council worktree too.
+ */
+export async function ensureProjectGitIdentity(projectDir: string, logger?: Logger): Promise<GitIdentity> {
+  const log = logger || createConsoleLogger('Council');
+  const localName = await readGitConfigValue(projectDir, ['--local', '--get', 'user.name']);
+  const localEmail = await readGitConfigValue(projectDir, ['--local', '--get', 'user.email']);
+  const hasLegacyCouncilIdentity = localName === LEGACY_COUNCIL_GIT_NAME || localEmail === LEGACY_COUNCIL_GIT_EMAIL;
+
+  if (hasLegacyCouncilIdentity) {
+    const globalName = await readGitConfigValue(projectDir, ['--global', '--get', 'user.name']);
+    const globalEmail = await readGitConfigValue(projectDir, ['--global', '--get', 'user.email']);
+    if (!globalName || !globalEmail) {
+      throw new Error('Cannot repair legacy Council Git identity: configure global user.name and user.email first');
+    }
+
+    await spawnAsync('git', ['-C', projectDir, 'config', '--local', 'user.name', globalName], {
+      timeout: GIT_CMD_TIMEOUT_MS,
+    });
+    await spawnAsync('git', ['-C', projectDir, 'config', '--local', 'user.email', globalEmail], {
+      timeout: GIT_CMD_TIMEOUT_MS,
+    });
+    log.warn(`Repaired legacy Council Git identity; future commits inherit ${globalName} <${globalEmail}>`);
+  }
+
+  const name = await readGitConfigValue(projectDir, ['--get', 'user.name']);
+  const email = await readGitConfigValue(projectDir, ['--get', 'user.email']);
+  if (!name || !email) {
+    throw new Error('Council requires Git user.name and user.email to be configured for the project or user');
+  }
+  return { name, email };
+}
 
 /** Best-effort cleanup of already-created worktrees when a batch creation fails */
 async function cleanupCreatedWorktrees(
@@ -151,17 +207,8 @@ async function setupWorktrees(
     await spawnAsync('git', ['-C', projectDir, 'init'], { timeout: GIT_CMD_TIMEOUT_MS });
   }
 
-  // Git user config
-  await spawnAsync('git', ['-C', projectDir, 'config', '--local', 'user.email', 'council@openclaw'], {
-    timeout: GIT_CMD_TIMEOUT_MS,
-  }).catch((err) => {
-    log.error('Failed to set git user.email:', err.message);
-  });
-  await spawnAsync('git', ['-C', projectDir, 'config', '--local', 'user.name', 'Council'], {
-    timeout: GIT_CMD_TIMEOUT_MS,
-  }).catch((err) => {
-    log.error('Failed to set git user.name:', err.message);
-  });
+  // Preserve the project's identity and self-heal the legacy Council override.
+  await ensureProjectGitIdentity(projectDir, log);
 
   // Ensure at least one commit
   const hasCommit = await spawnAsync('git', ['-C', projectDir, 'rev-parse', 'HEAD'], { timeout: GIT_CMD_TIMEOUT_MS })
