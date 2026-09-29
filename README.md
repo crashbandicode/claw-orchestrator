@@ -84,7 +84,7 @@ Installs via npm, registers the plugin in `~/.openclaw/openclaw.json`, restarts 
 npm install -g @enderfga/claw-orchestrator   # clawo-mcp is now on PATH
 ```
 
-Register `clawo-mcp` with any MCP-compatible host: Hermes Agent, Claude Desktop, Cursor, Cline, Continue, Zed, Windsurf, Goose, and others. Per-host stdio-config snippets and the `CLAWO_MCP_TOOLS` allowlist for tight tool budgets are in [`mcp.md`](./skills/references/mcp.md).
+Register `clawo-mcp` with any MCP-compatible host: Hermes Agent, Claude Desktop, Cursor, Cline, Continue, Zed, Windsurf, Goose, and others. The open-session limit is configurable with `CLAWO_MAX_CONCURRENT_SESSIONS` (default `5`, `0` = unlimited). Per-host stdio-config snippets and the `CLAWO_MCP_TOOLS` allowlist for tight tool budgets are in [`mcp.md`](./skills/references/mcp.md).
 
 ### Agent Client Protocol Agent
 

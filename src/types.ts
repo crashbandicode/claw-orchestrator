@@ -638,6 +638,7 @@ export interface PluginConfig {
   defaultModel?: string;
   defaultPermissionMode: PermissionMode;
   defaultEffort: EffortLevel;
+  /** Maximum open sessions per manager, including idle/starting sessions; 0 disables the limit. */
   maxConcurrentSessions: number;
   sessionTtlMinutes: number;
   proxy?: ProxyConfig;

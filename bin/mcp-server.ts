@@ -18,6 +18,8 @@
  *   CLAWO_MCP_TOOLS         comma-separated allowlist of tool names. Unlisted
  *                            tools are not exposed. Useful when the host has a
  *                            tight tool budget (default: expose everything).
+ *   CLAWO_MAX_CONCURRENT_SESSIONS non-negative integer open-session limit per
+ *                            MCP process (default 5; 0 = unlimited).
  *   CLAWO_NO_EMBEDDED_SERVER set automatically; suppresses the plugin's HTTP
  *                            control-plane (port 18796) which is dead weight
  *                            for MCP-only deployments.

@@ -257,6 +257,7 @@ describe('SessionManager', () => {
 
   afterEach(async () => {
     await mgr.shutdown();
+    vi.unstubAllEnvs();
     vi.useRealTimers();
   });
 
@@ -358,6 +359,93 @@ describe('SessionManager', () => {
   // ─── Max Concurrent Sessions ────────────────────────────────────────
 
   describe('max concurrent sessions', () => {
+    it('preserves five as the default when no configuration is supplied', async () => {
+      vi.stubEnv('CLAWO_MAX_CONCURRENT_SESSIONS', '');
+      const maxMgr = createManager({ maxConcurrentSessions: undefined });
+      try {
+        for (let i = 0; i < 5; i++) await maxMgr.startSession({ name: `default-${i}`, cwd: '/tmp' });
+        await expect(maxMgr.startSession({ name: 'sixth', cwd: '/tmp' })).rejects.toThrow(
+          'Max concurrent sessions (5) reached',
+        );
+      } finally {
+        await maxMgr.shutdown();
+      }
+    });
+
+    it.each([0, 8])('allows eight concurrent starts with capacity %s', async (limit) => {
+      const maxMgr = createManager({ maxConcurrentSessions: limit });
+      try {
+        const sessions = await Promise.all(
+          Array.from({ length: 8 }, (_, i) => maxMgr.startSession({ name: `s-${i}`, cwd: '/tmp' })),
+        );
+        expect(sessions).toHaveLength(8);
+        expect(maxMgr.listSessions()).toHaveLength(8);
+      } finally {
+        await maxMgr.shutdown();
+      }
+    });
+
+    it('rejects concurrent starts beyond a finite cap without creating their engines', async () => {
+      const maxMgr = createManager({ maxConcurrentSessions: 2 });
+      try {
+        const results = await Promise.allSettled(
+          Array.from({ length: 6 }, (_, i) => maxMgr.startSession({ name: `s-${i}`, cwd: '/tmp' })),
+        );
+        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(2);
+        expect(results.filter((r) => r.status === 'rejected')).toHaveLength(4);
+        expect(mockSessions).toHaveLength(2);
+        const existing = await maxMgr.startSession({ name: 's-0', cwd: '/tmp' });
+        expect(existing.name).toBe('s-0');
+      } finally {
+        await maxMgr.shutdown();
+      }
+    });
+
+    it('releases a reserved slot when engine startup fails', async () => {
+      const maxMgr = createManager({ maxConcurrentSessions: 1 });
+      const fail = vi.spyOn(MockSession.prototype, 'start').mockRejectedValueOnce(new Error('startup failed'));
+      try {
+        await expect(maxMgr.startSession({ name: 'failed', cwd: '/tmp' })).rejects.toThrow('startup failed');
+        expect((await maxMgr.startSession({ name: 'replacement', cwd: '/tmp' })).name).toBe('replacement');
+      } finally {
+        fail.mockRestore();
+        await maxMgr.shutdown();
+      }
+    });
+
+    it.each(['0', '8'])('reads MCP environment capacity %s when no plugin limit is specified', async (limit) => {
+      vi.stubEnv('CLAWO_MAX_CONCURRENT_SESSIONS', limit);
+      const maxMgr = createManager({ maxConcurrentSessions: undefined });
+      try {
+        for (let i = 0; i < 8; i++) await maxMgr.startSession({ name: `env-${i}`, cwd: '/tmp' });
+        expect(maxMgr.listSessions()).toHaveLength(8);
+      } finally {
+        await maxMgr.shutdown();
+      }
+    });
+
+    it('gives explicit plugin capacity precedence over the environment', async () => {
+      vi.stubEnv('CLAWO_MAX_CONCURRENT_SESSIONS', '0');
+      const maxMgr = createManager({ maxConcurrentSessions: 1 });
+      try {
+        await maxMgr.startSession({ name: 'first', cwd: '/tmp' });
+        await expect(maxMgr.startSession({ name: 'second', cwd: '/tmp' })).rejects.toThrow(
+          'Max concurrent sessions (1) reached',
+        );
+      } finally {
+        await maxMgr.shutdown();
+      }
+    });
+
+    it.each([-1, 1.5, NaN, Infinity])('rejects invalid configured capacity %s', (limit) => {
+      expect(() => createManager({ maxConcurrentSessions: limit })).toThrow('must be a non-negative integer');
+    });
+
+    it.each(['-1', '1.5', 'NaN', 'Infinity', 'invalid'])('rejects invalid environment capacity %s', (limit) => {
+      vi.stubEnv('CLAWO_MAX_CONCURRENT_SESSIONS', limit);
+      expect(() => createManager({ maxConcurrentSessions: undefined })).toThrow('must be a non-negative integer');
+    });
+
     it('throws when limit is reached', async () => {
       const maxMgr = createManager({ maxConcurrentSessions: 2 });
 

@@ -50,6 +50,12 @@ const result = await manager.sendMessage('my-task', 'Fix the auth bug', {
 console.log(result.output);
 ```
 
+### Session capacity
+
+The default is five open sessions **per SessionManager/MCP process**, not five workers per machine or provider. Idle sessions consume slots until stopped or expired by the idle TTL; pending starts reserve slots too. Reopening an existing session does not consume another slot.
+
+Set plugin `maxConcurrentSessions` to a non-negative integer, or set `CLAWO_MAX_CONCURRENT_SESSIONS` in the MCP server's environment. Explicit plugin configuration takes precedence. `0` disables Claw's admission limit; a positive number sets a finite cap. Invalid values are rejected. This setting does not override model-provider quotas, host memory, or the calling harness's own worker limit. Restart/reconnect an idle MCP server to load configuration changes; running servers keep their existing setting.
+
 ### Session Persistence
 
 Sessions automatically persist to `~/.openclaw/claude-sessions.json`:

@@ -112,9 +112,8 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
     if (this.options.cwd) {
       this.options.cwd = sanitizeCwd(this.options.cwd)!;
       const isWindowsPath = /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(this.options.cwd!);
-      const isForeignPath = process.platform === 'win32'
-        ? path.posix.isAbsolute(this.options.cwd!) && !isWindowsPath
-        : isWindowsPath;
+      const isForeignPath =
+        process.platform === 'win32' ? path.posix.isAbsolute(this.options.cwd!) && !isWindowsPath : isWindowsPath;
       if (!isForeignPath && !fs.existsSync(this.options.cwd!)) {
         fs.mkdirSync(this.options.cwd, { recursive: true });
       }
