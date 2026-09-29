@@ -6,7 +6,7 @@
  * and optionally override _cleanupProc() for extra cleanup (readline, streams).
  */
 
-import { ChildProcess } from 'node:child_process';
+import { ChildProcess, execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -41,8 +41,37 @@ export interface OneShotEngineConfig {
   defaultModelDisplay?: string;
   /** Whether this engine tracks cached token pricing (Codex=false, Gemini/Cursor=true) */
   supportsCachedTokens: boolean;
+  /**
+   * Whether the engine's reported input-token count already contains the cached
+   * reads it reports separately.
+   *
+   * This decides whether the cost math may subtract one from the other, and the
+   * two answers are not interchangeable. Verified by checking each engine's own
+   * arithmetic against the `total` it reports for the same turn:
+   *
+   *   codex     total 19704 = input 19699 + output 5              → inclusive
+   *   grok      total 30034 = input 19393 + output 17 + read 10624 → exclusive
+   *   opencode  total 26315 = input 58    + output 17 + read 26240 → exclusive
+   *
+   * Subtracting on an exclusive engine removes tokens that were never in
+   * `input` and prices them at the cached rate instead. It fails silently and
+   * without bound: after two opencode turns the running cached total exceeds
+   * the running input total, `Math.max(0, …)` clamps to zero, and the whole
+   * session's input bills at the cached rate.
+   *
+   * Defaults to `true`, which is the behaviour every engine had before the flag
+   * existed, so an engine that has not been measured keeps its old numbers
+   * rather than silently switching to new ones.
+   */
+  inputIncludesCachedTokens?: boolean;
   /** Human-readable engine name for compact() no-op message */
   engineDisplayName: string;
+  /**
+   * Whether the CLI has its own flag for `appendSystemPrompt` (grok: `--rules`).
+   * An engine without one receives it at the top of the first message of each
+   * conversation instead — see `_withAppendedInstructions`.
+   */
+  appendsSystemPromptNatively?: boolean;
 }
 
 // ─── BaseOneShotSession ────────────────────────────────────────────────────
@@ -75,6 +104,13 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
     tokensIn: 0,
     tokensOut: 0,
     cachedTokens: 0,
+    /**
+     * Prompt tokens written into the cache, on engines whose `tokensIn`
+     * excludes them. Priced at the plain input rate — a floor, not the exact
+     * figure, since a provider that charges a cache-write premium is not
+     * modelled here. Left at zero on engines whose input already contains them.
+     */
+    cacheCreationTokens: 0,
     costUsd: 0,
     lastActivity: null as string | null,
     /** Set by _markTurnEstimated() when this turn fell back to estimateTokens(). */
@@ -128,13 +164,39 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
 
   // ── send() ─────────────────────────────────────────────────────────────
 
+  /**
+   * Whether the next turn continues a conversation the engine already holds.
+   * Subclasses that resume a thread or conversation by id override this; an
+   * engine that starts fresh on every turn keeps the default.
+   */
+  protected _continuesConversation(): boolean {
+    return false;
+  }
+
+  /**
+   * Deliver `appendSystemPrompt` to an engine that has no flag for it.
+   *
+   * Codex, Antigravity and OpenCode take no system-prompt argument, so the
+   * option used to be dropped for them without a word — including every
+   * council seat on those engines, whose whole charter travels this way. It is
+   * put at the top of the first message of a conversation instead: a resumed
+   * conversation already carries it, and repeating it on every turn would only
+   * grow the thread. A user turn binds less firmly than a system prompt; it is
+   * the strongest channel these CLIs offer.
+   */
+  private _withAppendedInstructions(message: string): string {
+    const instructions = this.options.appendSystemPrompt?.trim();
+    if (!instructions || this.engineCfg.appendsSystemPromptNatively || this._continuesConversation()) return message;
+    return `${instructions}\n\n---\n\n${message}`;
+  }
+
   async send(
     message: string | unknown[],
     options: SessionSendOptions = {},
   ): Promise<TurnResult | { requestId: number; sent: boolean }> {
     if (!this._isReady) throw new Error('Session not ready. Call start() first.');
     const requestId = ++this.currentRequestId;
-    const textMessage = typeof message === 'string' ? message : JSON.stringify(message);
+    const textMessage = this._withAppendedInstructions(typeof message === 'string' ? message : JSON.stringify(message));
 
     // Per-turn flag: cleared here, set only if this turn takes the estimate
     // fallback. Reading it after the turn tells the ledger whether the numbers
@@ -204,7 +266,12 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
    * model's published maximum. Return 0 to disable the metric.
    */
   protected _effectiveContextWindow(): number {
-    return getContextWindow(this.options.resolvedModel || this.options.model || '');
+    // Falls back to the engine's own default model, not to the registry's
+    // catch-all 200K: a session that named no model still runs on something,
+    // and that something is what `_getModelPricing()` already bills it as.
+    // Measuring a grok session against 200K while pricing it as grok-4.6 (500K)
+    // reported a half-full context as full.
+    return getContextWindow(this.options.resolvedModel || this.options.model || this.engineCfg.defaultModel);
   }
 
   /**
@@ -296,7 +363,7 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
 
     if (this.engineCfg.supportsCachedTokens) {
       const cachedPrice = pricing.cached ?? 0;
-      const nonCachedIn = Math.max(0, this._stats.tokensIn - this._stats.cachedTokens);
+      const nonCachedIn = this._fullRateInputTokens();
       return {
         model: displayModel,
         tokensIn: this._stats.tokensIn,
@@ -357,7 +424,23 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
   protected _cleanupProc(): void {
     if (this.currentProc) {
       try {
-        this.currentProc.kill('SIGTERM');
+        // On Windows `kill` ends only the process it is given, and the engine
+        // CLI's own children keep running; taskkill /T takes the whole tree. It
+        // runs synchronously on the cleanup path, so it is bounded: a hung
+        // taskkill must not stall the server's event loop.
+        if (process.platform === 'win32' && this.currentProc.pid) {
+          try {
+            execFileSync('taskkill', ['/pid', String(this.currentProc.pid), '/T', '/F'], {
+              stdio: 'ignore',
+              timeout: 5_000,
+              windowsHide: true,
+            });
+          } catch {
+            this.currentProc.kill('SIGTERM');
+          }
+        } else {
+          this.currentProc.kill('SIGTERM');
+        }
       } catch {
         // Process may have already exited
       }
@@ -400,18 +483,32 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
     if (this._history.length > MAX_HISTORY_ITEMS) this._history.shift();
   }
 
+  /**
+   * Input tokens that bill at the full rate — everything in `tokensIn` that is
+   * not a cached read, plus the cache writes an exclusive engine reports apart
+   * from `tokensIn`. See `inputIncludesCachedTokens` for why the subtraction is
+   * conditional.
+   */
+  private _fullRateInputTokens(): number {
+    const base =
+      this.engineCfg.inputIncludesCachedTokens === false
+        ? this._stats.tokensIn
+        : Math.max(0, this._stats.tokensIn - this._stats.cachedTokens);
+    return base + this._stats.cacheCreationTokens;
+  }
+
   protected _updateCost(): void {
     const pricing = this._getModelPricing();
     if (this.engineCfg.supportsCachedTokens) {
       const cachedPrice = pricing.cached ?? 0;
-      const nonCachedIn = Math.max(0, this._stats.tokensIn - this._stats.cachedTokens);
       this._stats.costUsd =
-        (nonCachedIn / 1_000_000) * pricing.input +
+        (this._fullRateInputTokens() / 1_000_000) * pricing.input +
         (this._stats.cachedTokens / 1_000_000) * cachedPrice +
         (this._stats.tokensOut / 1_000_000) * pricing.output;
     } else {
       this._stats.costUsd =
-        (this._stats.tokensIn / 1_000_000) * pricing.input + (this._stats.tokensOut / 1_000_000) * pricing.output;
+        ((this._stats.tokensIn + this._stats.cacheCreationTokens) / 1_000_000) * pricing.input +
+        (this._stats.tokensOut / 1_000_000) * pricing.output;
     }
   }
 }

@@ -9,7 +9,7 @@ import type { EngineType } from './types.js';
 
 // ─── Types ───────────────────────────────────────────────────────────────────
 
-export type ProviderName = 'anthropic' | 'openai' | 'google' | 'cursor' | 'custom';
+export type ProviderName = 'anthropic' | 'openai' | 'google' | 'cursor' | 'xai' | 'custom';
 
 export interface ModelPricing {
   input: number; // per 1M tokens
@@ -38,31 +38,70 @@ export interface ModelDef {
 
 const MODELS: ModelDef[] = [
   // ── Anthropic ──────────────────────────────────────────────────────────
-  // Fable 5 — first model of the Claude 5 family, a Mythos-class tier above
-  // Opus. $10/$50 per Mtok, cache read $1 (0.1× input), full 1M-token context
-  // at standard pricing (no long-context surcharge). Claude Mythos 5 is the
-  // same model at the same price but limited-availability (approved orgs
-  // only), so we register only Fable.
+  // The Fable tier sits above Opus: $10/$50 per Mtok and a full 1M-token
+  // context at standard pricing (no long-context surcharge). Mythos is the same
+  // model at the same price under limited availability, so each generation is
+  // registered in both spellings — an unregistered id does not fail, it prices
+  // at the family default.
+  //
+  // Cache reads are where the two generations differ, and 5.1 is the exception
+  // to a rule that holds everywhere else in this file: a cache hit is 0.1x base
+  // input on every Claude model EXCEPT Fable 5.1 and Mythos 5.1, which are
+  // 0.025x — $0.25 per Mtok against a $10 input price. Deriving it from the
+  // input rate would over-report those two by 4x. Cache *writes* keep the usual
+  // 1.25x / 2x multipliers, which is why only the read is stored here.
+  //
+  // The `fable` alias points at 5.1 because that is what the CLI's own `fable`
+  // resolves to — verified against 2.1.258 by reading `modelUsage.canonicalModel`
+  // back from a real turn, not inferred from the release note. (A Claude apps
+  // gateway session still resolves `fable` to Fable 5 while gateways catch up;
+  // that is the gateway's mapping, not this registry's.)
+  {
+    id: 'claude-fable-5-1',
+    engine: 'claude',
+    provider: 'anthropic',
+    pricing: { input: 10, output: 50, cached: 0.25 },
+    aliases: ['fable'],
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'claude-mythos-5-1',
+    engine: 'claude',
+    provider: 'anthropic',
+    pricing: { input: 10, output: 50, cached: 0.25 },
+    contextWindow: 1_000_000,
+  },
   {
     id: 'claude-fable-5',
     engine: 'claude',
     provider: 'anthropic',
     pricing: { input: 10, output: 50, cached: 1 },
-    aliases: ['fable'],
     contextWindow: 1_000_000,
   },
-  // Opus pricing is flat across 4.6 through 5: input:5 / output:25 / cached:0.5,
-  // each with a 1M-token context window. Fast mode (Opus 5 and 4.8) bills at 2×
-  // the standard rate, but it's a human-interactive `/fast` toggle the CLI never
-  // enables in our headless spawn path, so we model the standard rate only.
-  // The `opus` alias points at Opus 5 because that is what the CLI's own `opus`
-  // alias resolves to (verified against the binary, CLI 2.1.220).
+  // Opus pricing was flat across 4.6 through 5 — input:5 / output:25 / cached:0.5
+  // — and Opus 5.5 breaks that: it is cheaper per token (4/20) and its cache
+  // reads are 5% of input rather than the usual 10%, so 0.20 rather than 0.40.
+  // Every Opus has a 1M-token context window. Fast mode bills at 2× the standard
+  // rate, but it's a human-interactive `/fast` toggle the CLI never enables in
+  // our headless spawn path, so we model the standard rate only.
+  // The `opus` alias moved with the CLI's own: 2.1.280 made Opus 5.5 the default
+  // Opus, and `--model opus` resolves to `claude-opus-5-5` (verified against the
+  // binary, CLI 2.1.280). Leaving the alias on Opus 5 would have priced every
+  // alias session — the autoloop Planner, the ultraplan default — at the old,
+  // higher rate, which is the number `maxBudgetUsd` gates on.
+  {
+    id: 'claude-opus-5-5',
+    engine: 'claude',
+    provider: 'anthropic',
+    pricing: { input: 4, output: 20, cached: 0.2 },
+    aliases: ['opus'],
+    contextWindow: 1_000_000,
+  },
   {
     id: 'claude-opus-5',
     engine: 'claude',
     provider: 'anthropic',
     pricing: { input: 5, output: 25, cached: 0.5 },
-    aliases: ['opus'],
     contextWindow: 1_000_000,
   },
   {
@@ -86,8 +125,27 @@ const MODELS: ModelDef[] = [
     pricing: { input: 5, output: 25, cached: 0.5 },
     contextWindow: 1_000_000,
   },
-  // Sonnet 5 is the current-generation Sonnet and the Claude Code default as of
-  // CLI 2.1.197. Native 1M-token context. $2/$10 per Mtok, cached read 0.1× input.
+  // Sonnet 5.5 is the model `--model sonnet` resolves to since CLI 2.1.284
+  // (verified against the binary), so the `sonnet` alias moved to it, as `opus`
+  // did for Opus 5.5. It is priced like Sonnet 5 — $2/$10 per Mtok, cached read
+  // 0.1× input, 1M-token context — so the move changes no cost figure today.
+  {
+    id: 'claude-sonnet-5-5',
+    engine: 'claude',
+    provider: 'anthropic',
+    pricing: { input: 2, output: 10, cached: 0.2 },
+    aliases: ['sonnet'],
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'claude-mythos-5',
+    engine: 'claude',
+    provider: 'anthropic',
+    pricing: { input: 10, output: 50, cached: 1 },
+    contextWindow: 1_000_000,
+  },
+  // Sonnet 5 was the Claude Code default from CLI 2.1.197. Native 1M-token
+  // context. $2/$10 per Mtok, cached read 0.1× input.
   //
   // This entry used to carry $3/$15 deliberately: $2/$10 was announced as
   // introductory pricing through 2026-08-31, and pricing the scheduled rate kept
@@ -96,24 +154,11 @@ const MODELS: ModelDef[] = [
   // over-reports every Sonnet turn by 50% — including against `maxBudgetUsd`,
   // which trips on these numbers. Price what the vendor charges today; a
   // scheduled change is not a fact until it happens.
-  //
-  // The `sonnet` alias points here so it tracks the CLI's own `sonnet` default.
-  // Mythos 5 shares Fable 5's specs and pricing exactly. Invitation-only
-  // (Project Glasswing), but it is a documented id a caller can pass, and an
-  // unregistered id silently prices at the family default instead.
-  {
-    id: 'claude-mythos-5',
-    engine: 'claude',
-    provider: 'anthropic',
-    pricing: { input: 10, output: 50, cached: 1 },
-    contextWindow: 1_000_000,
-  },
   {
     id: 'claude-sonnet-5',
     engine: 'claude',
     provider: 'anthropic',
     pricing: { input: 2, output: 10, cached: 0.2 },
-    aliases: ['sonnet'],
     contextWindow: 1_000_000,
   },
   {
@@ -171,38 +216,91 @@ const MODELS: ModelDef[] = [
   // model config listing 272,000 for these ids — that is the CLI's own cap
   // (272K is also the price-tier breakpoint), NOT the model's window, so it is
   // deliberately not mirrored here.
-  // Bare `gpt-5.6` IS documented (1,050,000 window, $5/$0.5/$30 — identical to
-  // Sol) and codex 0.148.0 offers it, so it is registered. Unregistered it fell
-  // back to Sonnet pricing and a 200K window, which over-reported contextPercent
-  // by 5.25x. `gpt-5.6-pro` appears in the codex binary but has no model-docs
-  // page (404), so it stays out rather than carry invented pricing.
+  // Bare `gpt-5.6` IS documented and codex offers it, so it is registered.
+  // Unregistered it fell back to Sonnet pricing and a 200K window, which
+  // over-reported contextPercent by 5.25x.
+  //
+  // All three tiers were repriced downward after launch (Sol's reduction is
+  // promotional, held at least through 2026-11-21). The rates below are the
+  // current published ones, cross-checked against both the pricing table and
+  // each model's own docs page. The launch rates this file used to carry —
+  // 5/0.5/30, 2.5/0.25/15, 1/0.1/6 — over-reported Luna's cost by 5x.
+  //
+  // Deliberately unregistered: `gpt-5.6-pro` is in the codex binary but has no
+  // docs page and no pricing-table row, so registering it would mean inventing
+  // numbers. `gpt-5.6-cyber` is the reverse — documented (400K window,
+  // 12.5/1.25/75) but absent from the codex binary, so no engine here can
+  // select it.
   {
     id: 'gpt-5.6',
     engine: 'codex',
     provider: 'openai',
-    pricing: { input: 5, output: 30, cached: 0.5 },
+    pricing: { input: 4, output: 20, cached: 0.4 },
     contextWindow: 1_050_000,
   },
   {
     id: 'gpt-5.6-sol',
     engine: 'codex',
     provider: 'openai',
-    pricing: { input: 5, output: 30, cached: 0.5 },
+    pricing: { input: 4, output: 20, cached: 0.4 },
     contextWindow: 1_050_000,
   },
   {
     id: 'gpt-5.6-terra',
     engine: 'codex',
     provider: 'openai',
-    pricing: { input: 2.5, output: 15, cached: 0.25 },
+    pricing: { input: 2, output: 12, cached: 0.2 },
     contextWindow: 1_050_000,
   },
   {
     id: 'gpt-5.6-luna',
     engine: 'codex',
     provider: 'openai',
-    pricing: { input: 1, output: 6, cached: 0.1 },
+    pricing: { input: 0.2, output: 1.2, cached: 0.02 },
     contextWindow: 1_050_000,
+  },
+
+  // ── OpenAI GPT-6 ──────────────────────────────────────────────────────
+  // New flagship generation. Absent from codex 0.153.0 and present in 0.153.2,
+  // which is why the sweep baselines on upstream rather than on whatever is
+  // installed — the older binary would have hidden it for another week.
+  {
+    id: 'gpt-6-astra',
+    engine: 'codex',
+    provider: 'openai',
+    pricing: { input: 10, output: 50, cached: 1 },
+    contextWindow: 1_050_000,
+  },
+
+  // Codex 0.156.1 added both to the model picker, and recommends Luna when a
+  // rate limit forces a switch. Same 1.05M window as the rest of the generation;
+  // Luna is the cheap tier, two orders of magnitude under Astra on input.
+  {
+    id: 'gpt-6-sol',
+    engine: 'codex',
+    provider: 'openai',
+    pricing: { input: 2, output: 10, cached: 0.2 },
+    contextWindow: 1_050_000,
+  },
+  {
+    id: 'gpt-6-luna',
+    engine: 'codex',
+    provider: 'openai',
+    pricing: { input: 0.1, output: 0.5, cached: 0.01 },
+    contextWindow: 1_050_000,
+  },
+
+  // ── OpenAI GPT-5.2 ────────────────────────────────────────────────────
+  // Previous-generation frontier model, still selectable in the Codex model
+  // list. Registered so `--model gpt-5.2` is priced as itself rather than
+  // falling through to the family default, which put it at a 200K window
+  // (against a real 400K) and Sonnet rates.
+  {
+    id: 'gpt-5.2',
+    engine: 'codex',
+    provider: 'openai',
+    pricing: { input: 1.75, output: 14, cached: 0.175 },
+    contextWindow: 400_000,
   },
 
   // ── OpenAI GPT-5.4 ────────────────────────────────────────────────────
@@ -229,18 +327,24 @@ const MODELS: ModelDef[] = [
   },
 
   // ── OpenAI Reasoning ───────────────────────────────────────────────────
+  // Standard-tier rates. OpenAI's pricing page publishes four tiers per model
+  // (Standard, Batch, Flex, Fast) in identically shaped tables, and o4-mini sat
+  // here at 0.55/2.2 — the Batch and Flex number, exactly half of Standard —
+  // understating its cost by 2x until the sweep started diffing this file
+  // against the published table. Read the Standard table, not whichever one the
+  // eye lands on.
   {
     id: 'o3',
     engine: 'codex',
     provider: 'openai',
-    pricing: { input: 2, output: 8 },
+    pricing: { input: 2, output: 8, cached: 0.5 },
     contextWindow: 200_000,
   },
   {
     id: 'o4-mini',
     engine: 'codex',
     provider: 'openai',
-    pricing: { input: 0.55, output: 2.2 },
+    pricing: { input: 1.1, output: 4.4, cached: 0.275 },
     contextWindow: 200_000,
   },
   {
@@ -278,20 +382,57 @@ const MODELS: ModelDef[] = [
   // `result` event when it carries usage and fall back to estimateTokens()
   // otherwise; the run ledger flags which of the two a turn used.
   //
-  // Slugs verified against agy 1.1.13 (`agy models`), which lists ONLY
-  // effort-qualified names (gemini-3.7-flash-high, gemini-3.1-pro-low, …).
+  // Slugs verified against agy 1.1.25 (`agy models`), which lists ONLY
+  // effort-qualified names (gemini-3.8-flash-high, gemini-3.1-pro-low, …).
+  // 1.1.25 dropped gemini-3.5-flash from that list and added 3.8: a session
+  // asking for 3.5 now gets `status: ERROR` with no message, so the
+  // `agy-flash` alias and the engine default both moved to 3.8. The 3.5 entry
+  // stays registered because it is still a real API model id with a real price;
+  // it is simply no longer reachable through this engine.
   // The base slugs registered below are the halves agy composes with
   // `--effort`, which PersistentAgySession always supplies — passing a base
   // slug without one is a hard CLI error, not a silent fallback. Tiers are not
-  // uniform: gemini-3.1-pro has low/high only. agy also proxies Claude/GPT-OSS
-  // models and accepts qualified slugs directly; both pass through unregistered
-  // and price at their family default.
+  // uniform: gemini-3.1-pro has low/high only. agy also accepts qualified slugs
+  // directly, which the agy session prices as their base model; the Claude and
+  // GPT-OSS models it proxies pass through unregistered at the engine default.
+  //
+  // Every Flash tier agy offers is registered, not just the one this engine
+  // defaults to. An unregistered tier does not fail — it falls through to the
+  // family default, which meant `gemini-3.7-flash` (the newest, and what a
+  // caller naming a model is most likely to ask for) was measured against a
+  // 200K window instead of 1M and priced at Sonnet rates.
+  //
+  // Prices are the Gemini API paid-tier list rates for the same models. The three
+  // newest Flash tiers are $0.75/$3.75 today and are scheduled to double on
+  // 2027-01-01; the scheduled number is deliberately NOT priced, because a
+  // future rate is not what a turn run today costs.
+  {
+    id: 'gemini-3.8-flash',
+    engine: 'agy',
+    provider: 'google',
+    pricing: { input: 0.75, output: 3.75 },
+    aliases: ['agy-flash'],
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'gemini-3.7-flash',
+    engine: 'agy',
+    provider: 'google',
+    pricing: { input: 0.75, output: 3.75 },
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'gemini-3.6-flash',
+    engine: 'agy',
+    provider: 'google',
+    pricing: { input: 0.75, output: 3.75 },
+    contextWindow: 1_000_000,
+  },
   {
     id: 'gemini-3.5-flash',
     engine: 'agy',
     provider: 'google',
-    pricing: { input: 0.5, output: 3 },
-    aliases: ['agy-flash'],
+    pricing: { input: 1.5, output: 9 },
     contextWindow: 1_000_000,
   },
   {
@@ -319,6 +460,54 @@ const MODELS: ModelDef[] = [
     pricing: { input: 0.15, output: 0.6, cached: 0.0375 },
     listed: false,
     contextWindow: 1_000_000,
+  },
+
+  // ── xAI Grok Build ─────────────────────────────────────────────────────
+  // Registered for the context window and the informational cost breakdown only:
+  // PersistentGrokSession takes `total_cost_usd` straight from the CLI, so these
+  // rates never decide what a turn cost. That also makes grok's two-tier pricing
+  // a non-issue — $2/$0.50/$6 below a 200K prompt and $4/$1/$12 at or above it,
+  // charged across the whole request. We register the base tier, as with every
+  // other long-context tier in this file; the engine bills the right one itself.
+  // Verified against docs.x.ai/docs/models and grok 1.0.5 (`grok models`).
+  {
+    id: 'grok-4.6',
+    engine: 'grok',
+    provider: 'xai',
+    pricing: { input: 2, output: 6, cached: 0.5 },
+    aliases: ['grok'],
+    contextWindow: 500_000,
+  },
+
+  // Fork native routes, checked against Cursor's model/pricing documentation.
+  // Registry presence does not assert that every account advertises the route.
+  {
+    id: 'grok-4.7',
+    engine: 'cursor',
+    provider: 'xai',
+    pricing: { input: 2, output: 6, cached: 0.5 },
+    contextWindow: 256_000,
+  },
+  {
+    id: 'gemini-3.8-flash-high',
+    engine: 'cursor',
+    provider: 'google',
+    pricing: { input: 0.75, output: 3.5, cached: 0.075 },
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'composer-2.5',
+    engine: 'cursor',
+    provider: 'cursor',
+    pricing: { input: 0.5, output: 2.5, cached: 0.2 },
+    contextWindow: 200_000,
+  },
+  {
+    id: 'composer-2.5-fast',
+    engine: 'cursor',
+    provider: 'cursor',
+    pricing: { input: 3, output: 15, cached: 0.5 },
+    contextWindow: 200_000,
   },
 
   // ── Cursor Composer ────────────────────────────────────────────────────
@@ -353,6 +542,18 @@ const MODELS: ModelDef[] = [
     pricing: { input: 2.5, output: 10, cached: 1.25 },
     listed: false,
     contextWindow: 128_000,
+  },
+  // Priced by OpenAI and reachable from Codex under API-key auth, but unregistered
+  // until the sweep's missing-model check first actually ran — it had been
+  // scanning nothing — and named it. Unregistered it priced as the Sonnet
+  // fallback with a 200K window instead of its own ~1M.
+  {
+    id: 'gpt-4.1',
+    engine: 'codex',
+    provider: 'openai',
+    pricing: { input: 2, output: 8, cached: 0.5 },
+    listed: false,
+    contextWindow: 1_047_576,
   },
 ];
 
@@ -397,6 +598,10 @@ export function resolveEngineAndModel(model: string): { engine: EngineType; mode
     return { engine: 'agy', model: resolveAlias(model.slice('agy/'.length)) };
   }
 
+  // OpenCode provider IDs are transport bindings, including gateway-only models
+  // such as Nemotron. Keep their complete provider/model identifier intact.
+  if (model.startsWith('nvidia/') || model.startsWith('nvidia-b/')) return { engine: 'opencode', model };
+
   // 1. Exact match (id or alias)
   const known = lookupModel(model);
   if (known) return { engine: known.engine, model: known.id };
@@ -407,6 +612,7 @@ export function resolveEngineAndModel(model: string): { engine: EngineType; mode
     return { engine: 'codex', model };
   if (model.startsWith('composer') || model.startsWith('cursor') || model === 'auto')
     return { engine: 'cursor', model };
+  if (model.startsWith('grok')) return { engine: 'grok', model };
 
   // 3. Default: claude engine passthrough
   return { engine: 'claude', model };
@@ -416,7 +622,17 @@ export function resolveEngineAndModel(model: string): { engine: EngineType; mode
 export function resolveProvider(model: string): { provider: ProviderName; apiModel: string } {
   // Strip vendor prefixes
   let clean = model;
-  for (const prefix of ['anthropic/', 'openai/', 'openai-codex/', 'gemini/', 'google/', 'agy/', 'cursor/']) {
+  for (const prefix of [
+    'anthropic/',
+    'openai/',
+    'openai-codex/',
+    'gemini/',
+    'google/',
+    'agy/',
+    'cursor/',
+    'grok/',
+    'xai/',
+  ]) {
     if (clean.startsWith(prefix)) {
       clean = clean.slice(prefix.length);
       break;
@@ -452,23 +668,59 @@ export function resolveProvider(model: string): { provider: ProviderName; apiMod
 }
 
 /** Get context window size for a model. Returns 200k default for unknown models. */
+/**
+ * Claude Code names a 1M-context selection with a `[1m]` suffix (`claude-opus-5[1m]`,
+ * `opus[1m]`) and reports it that way in its init event. The suffix selects a window,
+ * not a different model, so lookups drop it.
+ */
+const ONE_M_SUFFIX = /\[1m\]$/i;
+
 export function getContextWindow(model: string): number {
-  const clean = model.replace(/^(anthropic|openai|openai-codex|google|gemini|agy|cursor)\//g, '');
-  const known = lookupModel(clean);
-  return known?.contextWindow ?? 200_000;
+  const clean = model.replace(/^(anthropic|openai|openai-codex|google|gemini|agy|cursor|grok|xai)\//g, '');
+  const known = lookupModel(resolveAlias(clean.replace(ONE_M_SUFFIX, '')));
+  const window = known?.contextWindow ?? 200_000;
+  return ONE_M_SUFFIX.test(clean) ? Math.max(window, 1_000_000) : window;
+}
+
+/**
+ * Canonical key for the runtime pricing table: strip the vendor prefix, then
+ * resolve aliases. Reads and writes MUST share this, or an override written as
+ * `opus` never gets found by a session that resolved itself to `claude-opus-5`
+ * (and vice versa).
+ */
+function pricingKey(model: string): string {
+  return resolveAlias(
+    model
+      .replace(/^(anthropic|openai|openai-codex|google|gemini|agy|cursor|grok|xai)\//g, '')
+      .replace(ONE_M_SUFFIX, ''),
+  );
+}
+
+/** Effective pricing for an already-canonical key: a runtime override wins over the registry. */
+function effectivePricing(key: string): ModelPricing | undefined {
+  return _pricingOverrides.get(key) ?? lookupModel(key)?.pricing;
 }
 
 /** Get pricing for a model. Falls back to sonnet pricing for unknown models. */
 export function getModelPricing(model?: string, defaultModel = 'claude-sonnet-4-6'): ModelPricing {
-  if (!model) return lookupModel(defaultModel)?.pricing ?? { input: 0, output: 0 };
-  const clean = model.replace(/^(anthropic|openai|openai-codex|google|gemini|agy|cursor)\//g, '');
-  // Check overrides first
-  const override = _pricingOverrides.get(clean);
-  if (override) return override;
-  const known = lookupModel(clean);
-  if (known) return known.pricing;
-  console.warn(`[models] Unknown model "${model}" — falling back to ${defaultModel} pricing`);
-  return lookupModel(defaultModel)?.pricing ?? { input: 0, output: 0 };
+  // No model means "the engine default" — which still goes through the override
+  // map, exactly like an explicit one. `||` and not `??`: an empty string is a
+  // missing model, not a model named "", and callers do pass one (`session_start`
+  // puts no minLength on `model`, and the config spread preserves it verbatim).
+  const direct = effectivePricing(pricingKey(model || defaultModel));
+  if (direct) return direct;
+  if (model) console.warn(`[models] Unknown model "${model}" — falling back to ${defaultModel} pricing`);
+  return effectivePricing(pricingKey(defaultModel)) ?? { input: 0, output: 0 };
+}
+
+/**
+ * Whether a runtime override was configured for this model, as opposed to the
+ * price coming from the registry. Engines that keep their own pricing table need
+ * this to tell "the user set 0" from "the registry had nothing", which the
+ * returned rate cannot express: both are zero.
+ */
+export function hasPricingOverride(model?: string, defaultModel = 'claude-sonnet-4-6'): boolean {
+  return _pricingOverrides.has(pricingKey(model || defaultModel));
 }
 
 /** Mutable pricing table for runtime overrides (backward compat). */
@@ -476,8 +728,19 @@ const _pricingOverrides = new Map<string, ModelPricing>();
 
 export function overrideModelPricing(overrides: Record<string, Partial<ModelPricing>>): void {
   for (const [model, pricing] of Object.entries(overrides)) {
-    const base = lookupModel(model)?.pricing ?? { input: 0, output: 0 };
-    _pricingOverrides.set(model, {
+    const key = pricingKey(model);
+    const known = lookupModel(key);
+    // There is no list price to merge onto, so the unspecified fields become 0
+    // — free tokens. That is a legitimate idiom (subscription accounting) and a
+    // very common typo, and the two are indistinguishable here, so say it out
+    // loud instead of guessing a price no one registered.
+    if (!known && (pricing.input === undefined || pricing.output === undefined))
+      console.warn(
+        `[models] Partial pricing override for unregistered model "${model}" — unspecified fields default to 0 (free), ` +
+          `not to any model's list price. Give both input and output, or register the model.`,
+      );
+    const base = known?.pricing ?? { input: 0, output: 0 };
+    _pricingOverrides.set(key, {
       input: pricing.input ?? base.input,
       output: pricing.output ?? base.output,
       cached: pricing.cached ?? base.cached,

@@ -34,8 +34,9 @@ import {
   type CustomEngineConfig,
   getModelPricing as _getModelPricingBase,
 } from './types.js';
-import { resolveAlias, estimateTokens } from './models.js';
+import { resolveAlias, estimateTokens, hasPricingOverride } from './models.js';
 import { buildSanitizer } from './sanitize.js';
+import { resolveCustomEngine } from './engine-presets.js';
 
 import {
   CONTEXT_HIGH_THRESHOLD,
@@ -52,9 +53,14 @@ import {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function getModelPricing(model: string | undefined, engineConfig: CustomEngineConfig) {
-  // Try the model registry first; fall back to engine-level pricing
+  // Try the model registry first; fall back to engine-level pricing.
+  // A user-configured override is not a fallback: an all-zero rate is what a
+  // subscription seat is *supposed* to look like, and it reads identically to
+  // "the registry had nothing", so ask which one it was rather than guessing.
+  // Without this, zeroing a model would hand back engineConfig.pricing — the
+  // opposite of what was asked for, and dearer than not overriding at all.
   const base = _getModelPricingBase(model, 'claude-sonnet-4-6');
-  if (base.input === 0 && base.output === 0 && engineConfig.pricing) {
+  if (base.input === 0 && base.output === 0 && engineConfig.pricing && !hasPricingOverride(model)) {
     return engineConfig.pricing;
   }
   return base;
@@ -114,7 +120,10 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     if (!config.customEngine) {
       throw new Error('CustomEngineConfig is required for custom engine sessions');
     }
-    this.engineConfig = config.customEngine;
+    // A preset id is expanded by SessionManager before it gets here. Resolving
+    // again is cheap and keeps this class usable on its own, in a test or by a
+    // caller that constructs it directly.
+    this.engineConfig = resolveCustomEngine(config.customEngine)!;
     this.engineBin = resolveBin(this.engineConfig);
     this.sanitize = buildSanitizer({
       extraPatterns: this.engineConfig.sanitizePatterns,
@@ -609,19 +618,9 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
         if (!inner) break;
         const innerType = inner.type as string;
 
-        if (innerType === 'content_block_start') {
-          const block = (inner as Record<string, unknown>).content_block as Record<string, unknown> | undefined;
-          if (block?.type === 'tool_use') {
-            this._stats.toolCalls++;
-            const toolEvent = { tool: { name: block.name, input: {} } };
-            try {
-              this._streamCallbacks?.onToolUse?.(toolEvent);
-            } catch {
-              /* ignore */
-            }
-            this.emit(SESSION_EVENT.TOOL_USE, toolEvent);
-          }
-        } else if (innerType === 'content_block_delta') {
+        // A tool_use block is reported from the `assistant` event that repeats it
+        // with its input, not from `content_block_start` too — see the claude wrapper.
+        if (innerType === 'content_block_delta') {
           const delta = (inner as Record<string, unknown>).delta as Record<string, unknown> | undefined;
           if (delta?.type === 'text_delta' && delta.text) {
             try {

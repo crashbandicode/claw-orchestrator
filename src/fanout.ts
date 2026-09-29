@@ -20,26 +20,39 @@ import type {
   SendResult,
   PermissionMode,
   CustomEngineConfig,
+  SessionStats,
+  AgentBinding,
 } from './types.js';
 import { type Logger } from './logger.js';
+import { mapBounded } from './concurrency.js';
 
 /** Minimal SessionManager surface used by Fanout (avoids a circular import). */
 interface SessionManagerLike {
   startSession(config: Partial<SessionConfig> & { name?: string }): Promise<SessionInfo>;
   sendMessage(name: string, message: string, options?: Partial<SendOptions>): Promise<SendResult>;
   stopSession(name: string): Promise<void>;
+  /** Optional so lightweight fakes stay valid; `ok` falls back to throw/no-throw without it. */
+  getStatus?(name: string): SessionInfo & { stats: SessionStats };
+  /** Optional for the same reason; without it every agent starts at once. */
+  freeSessionSlots?(): number;
 }
 
-export interface FanoutAgentSpec {
+export interface FanoutAgentSpec extends AgentBinding {
   /** Unique label for this agent (used in the session name and results). */
   name: string;
-  engine?: EngineType;
-  model?: string;
-  /** Per-agent prompt; defaults to the shared task when omitted. */
+  /** Complete per-agent prompt; replaces the shared task when non-empty. */
   prompt?: string;
+  /** Role instructions prepended to the shared task without a non-empty prompt. */
+  persona?: string;
   baseUrl?: string;
   customEngine?: CustomEngineConfig;
   permissionMode?: PermissionMode;
+  /**
+   * The engine-agnostic sandbox. `permissionMode: 'plan'` constrains Claude only;
+   * `sandboxMode: 'read-only'` is what keeps an agent on any engine from writing,
+   * and it matters here because every agent shares the one project directory.
+   */
+  sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
 }
 
 export interface FanoutConfig {
@@ -50,9 +63,27 @@ export interface FanoutConfig {
   synthesize?: boolean;
   synthesisModel?: string;
   synthesisEngine?: EngineType;
+  /**
+   * Permission mode for the synthesis pass. Defaults to `bypassPermissions`
+   * like the agents do, but a read-only fan-out has to pass `plan` here too:
+   * synthesis shares the project directory, so a writable synthesiser can edit
+   * the code the read-only agents were only allowed to look at.
+   */
+  synthesisPermissionMode?: PermissionMode;
   agentTimeoutMs?: number;
   maxTurnsPerAgent?: number;
   maxBudgetUsd?: number;
+  /**
+   * Identity for this run, supplied by the kernel.
+   *
+   * Without it the fan-out minted its own `fanout-<uuid>` and stamped THAT onto
+   * every ledger row's `parentRunId` — so the rows could not be grouped by the
+   * kernel run they belonged to, and the two ids had to be joined by hand.
+   * One execution, one identity.
+   */
+  runId?: string;
+  /** Polled before each queued agent starts and before synthesis; set by the kernel. */
+  signal?: { aborted: boolean };
 }
 
 export interface FanoutAgentResult {
@@ -79,8 +110,14 @@ export interface FanoutSession {
   error?: string;
 }
 
-const DEFAULT_AGENT_TIMEOUT_MS = 600_000;
+export const DEFAULT_AGENT_TIMEOUT_MS = 600_000;
 const DEFAULT_MAX_TURNS = 30;
+
+function agentMessage(spec: FanoutAgentSpec, task: string): string {
+  if (spec.prompt) return spec.prompt;
+  if (spec.persona) return `${spec.persona}\n\n## Shared task\n\n${task}`;
+  return task;
+}
 
 export class Fanout {
   private session: FanoutSession;
@@ -92,7 +129,7 @@ export class Fanout {
     private logger?: Logger,
   ) {
     this.session = {
-      id: `fanout-${randomUUID().slice(0, 8)}`,
+      id: config.runId ?? `fanout-${randomUUID().slice(0, 8)}`,
       status: 'running',
       task: config.task,
       agentCount: config.agents.length,
@@ -114,9 +151,12 @@ export class Fanout {
 
   async run(): Promise<FanoutSession> {
     try {
-      // Each agent isolates its own failure (never throws); collect all.
-      this.session.results = await Promise.all(this.config.agents.map((a) => this._runAgent(a)));
-      if (!this._aborted && this.config.synthesize) {
+      // Each agent isolates its own failure (never throws); collect all. No more
+      // agents run at once than there are session slots, so the rest wait for one.
+      const agents = this.config.agents;
+      const slots = this.manager.freeSessionSlots?.() ?? agents.length;
+      this.session.results = await mapBounded(agents, slots, (a) => this._runAgent(a));
+      if (!this._stopped() && this.config.synthesize) {
         const ok = this.session.results.filter((r) => r.ok);
         if (ok.length >= 2) this.session.synthesis = await this._synthesize(ok);
       }
@@ -132,8 +172,24 @@ export class Fanout {
     return this.session;
   }
 
+  private _stopped(): boolean {
+    return this._aborted || this.config.signal?.aborted === true;
+  }
+
   private async _runAgent(spec: FanoutAgentSpec): Promise<FanoutAgentResult> {
     const engine: EngineType = spec.engine || 'claude';
+    // An agent still queued for a slot when the run was aborted never starts.
+    if (this._stopped()) {
+      return {
+        agent: spec.name,
+        engine,
+        model: spec.model,
+        ok: false,
+        output: '',
+        error: 'aborted before start',
+        durationMs: 0,
+      };
+    }
     const sessionName = `${this.session.id}-${spec.name}`;
     const start = Date.now();
     try {
@@ -142,8 +198,10 @@ export class Fanout {
         cwd: this.config.projectDir,
         engine,
         model: spec.model,
+        ...(spec.effort === undefined ? {} : { effort: spec.effort }),
         baseUrl: spec.baseUrl,
         permissionMode: spec.permissionMode ?? 'bypassPermissions',
+        sandboxMode: spec.sandboxMode,
         maxTurns: this.config.maxTurnsPerAgent ?? DEFAULT_MAX_TURNS,
         maxBudgetUsd: this.config.maxBudgetUsd,
         customEngine: spec.customEngine,
@@ -158,16 +216,27 @@ export class Fanout {
           cwd: this.config.projectDir,
         },
       });
-      const result = await this.manager.sendMessage(sessionName, spec.prompt || this.config.task, {
+      const before = this._stats(sessionName);
+      const result = await this.manager.sendMessage(sessionName, agentMessage(spec, this.config.task), {
         timeout: this.config.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
         parentRunId: this.session.id,
+        nodeKind: 'fanout',
       });
+      const after = this._stats(sessionName);
+      // `ok` used to be an unconditional true in this block, i.e. "the call did
+      // not throw" — so an engine that ran, failed, and reported the failure
+      // cleanly was recorded as a success. Read the engine's own terminal
+      // verdict instead, the same predicate the run ledger uses.
+      const ok =
+        !result.error &&
+        (before && after ? (after.turns > before.turns ? after.turnsSucceeded > before.turnsSucceeded : true) : true);
       return {
         agent: spec.name,
         engine,
         model: spec.model,
-        ok: true,
+        ok,
         output: result.output,
+        error: ok ? undefined : result.error || 'engine did not report the turn as succeeded',
         durationMs: Date.now() - start,
       };
     } catch (err) {
@@ -187,6 +256,24 @@ export class Fanout {
     }
   }
 
+  /**
+   * Engine-reported counters, when the manager can supply them.
+   *
+   * Copied rather than aliased on purpose: the real `getStats()` happens to build
+   * a fresh object each call, but nothing states that as a contract, and a
+   * before/after pair that turns out to be the same reference silently compares
+   * a value against itself and always reports success.
+   */
+  private _stats(name: string): { turns: number; turnsSucceeded: number } | undefined {
+    if (!this.manager.getStatus) return undefined;
+    try {
+      const s = this.manager.getStatus(name).stats;
+      return { turns: s.turns, turnsSucceeded: s.turnsSucceeded };
+    } catch {
+      return undefined;
+    }
+  }
+
   private async _synthesize(results: FanoutAgentResult[]): Promise<string | undefined> {
     const sessionName = `${this.session.id}-synthesis`;
     const combined = results
@@ -202,7 +289,7 @@ export class Fanout {
         cwd: this.config.projectDir,
         engine: this.config.synthesisEngine || 'claude',
         model: this.config.synthesisModel,
-        permissionMode: 'bypassPermissions',
+        permissionMode: this.config.synthesisPermissionMode ?? 'bypassPermissions',
         maxTurns: this.config.maxTurnsPerAgent ?? DEFAULT_MAX_TURNS,
         maxBudgetUsd: this.config.maxBudgetUsd,
         orchestration: {
@@ -220,6 +307,17 @@ export class Fanout {
         timeout: this.config.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
         parentRunId: this.session.id,
       });
+      // `sendMessage` reports a turn-level failure (auth loss mid-turn, invalid
+      // model, rate-limit exhaustion) by RETURNING `{error}`, not by throwing —
+      // so the catch below never saw those and `result.output` (the error text,
+      // or '') was written to `session.synthesis` while `synthesisError` stayed
+      // undefined and status went to 'done'. `_runAgent`, one method up in this
+      // same file, already reads `result.error`; this is the same contract.
+      if (result.error) {
+        this.session.synthesisError = result.error;
+        this.logger?.error?.(`Fanout synthesis failed: ${result.error}`);
+        return undefined;
+      }
       return result.output;
     } catch (err) {
       const msg = (err as Error).message;

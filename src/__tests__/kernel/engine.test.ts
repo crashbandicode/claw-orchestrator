@@ -1,0 +1,774 @@
+/**
+ * The run kernel.
+ *
+ * The assertions that matter most are the honesty ones: a run with no acceptance
+ * contract must finish `unverified` rather than claiming success, a run whose
+ * contract failed must never reach `completed`, and a contract must never be
+ * sourced from an agent's own output.
+ */
+
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { prepareSpec, RunKernel, IMPLICIT_VERIFIER_ID } from '../../kernel/engine.js';
+import type { NodeExecutor, NodeResult } from '../../kernel/engine.js';
+import { loadRun, readEvents } from '../../kernel/store.js';
+import type { WorkflowSpec } from '../../kernel/types.js';
+
+let tmp: string;
+const saved = process.env.CLAWO_WF_DIR;
+
+beforeEach(() => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-engine-'));
+  process.env.CLAWO_WF_DIR = tmp;
+});
+
+afterEach(() => {
+  if (saved === undefined) delete process.env.CLAWO_WF_DIR;
+  else process.env.CLAWO_WF_DIR = saved;
+  fs.rmSync(tmp, { recursive: true, force: true });
+});
+
+/** A kernel whose agent nodes just record that they ran. */
+function makeKernel(over: Partial<Record<string, NodeExecutor>> = {}, ran: string[] = []) {
+  const kernel = new RunKernel({ nodeTimeoutMs: 5000 });
+  kernel.setExecutor('agent', async (node) => {
+    ran.push(node.id);
+    return { ok: true, output: `did ${node.id}` };
+  });
+  kernel.setExecutor('router', async () => ({ ok: true }));
+  kernel.setExecutor('verifier', async () => ({ ok: true, output: 'nothing declared' }));
+  for (const [kind, exec] of Object.entries(over)) {
+    kernel.setExecutor(kind as never, exec as NodeExecutor);
+  }
+  return { kernel, ran };
+}
+
+const linear: WorkflowSpec = {
+  name: 'linear',
+  cwd: '/tmp',
+  nodes: [
+    { id: 'a', kind: 'agent', prompt: 'a' },
+    { id: 'b', kind: 'agent', prompt: 'b' },
+  ],
+};
+
+describe('linear execution', () => {
+  it('runs nodes in order and completes', async () => {
+    const { kernel, ran } = makeKernel();
+    const started = await kernel.start(linear);
+    const done = await kernel.wait(started.runId);
+    expect(ran).toEqual(['a', 'b']);
+    expect(done!.state).toBe('completed');
+    expect(done!.nodes.a.state).toBe('succeeded');
+  });
+
+  it('checkpoints every transition so a reader sees progress on disk', async () => {
+    const { kernel } = makeKernel();
+    const started = await kernel.start(linear);
+    await kernel.wait(started.runId);
+    const events = readEvents(started.runId).map((e) => e.type);
+    expect(events[0]).toBe('run_created');
+    expect(events).toContain('node_state');
+    expect(loadRun(started.runId)!.state).toBe('completed');
+  });
+
+  it('fails the run when a node fails and onFailure is the default', async () => {
+    const { kernel } = makeKernel({ agent: async () => ({ ok: false, error: 'nope' }) });
+    const started = await kernel.start(linear);
+    const done = await kernel.wait(started.runId);
+    expect(done!.state).toBe('failed');
+    expect(done!.error).toContain('nope');
+  });
+
+  it('carries on when a node declares onFailure: continue', async () => {
+    const ran: string[] = [];
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async (node) => {
+      ran.push(node.id);
+      return node.id === 'a' ? { ok: false, error: 'soft' } : { ok: true };
+    });
+    const spec: WorkflowSpec = {
+      name: 'soft',
+      nodes: [
+        { id: 'a', kind: 'agent', prompt: 'a', onFailure: 'continue' },
+        { id: 'b', kind: 'agent', prompt: 'b' },
+      ],
+    };
+    const started = await kernel.start(spec);
+    const done = await kernel.wait(started.runId);
+    expect(ran).toEqual(['a', 'b']);
+    expect(done!.nodes.a.state).toBe('failed');
+    expect(done!.state).toBe('completed');
+  });
+});
+
+describe('honesty about verification', () => {
+  it('completes a contract-free run as unverified — it does not claim success', async () => {
+    const { kernel } = makeKernel();
+    const started = await kernel.start(linear);
+    const done = await kernel.wait(started.runId);
+    expect(done!.state).toBe('completed');
+    expect(done!.outcome).toBe('unverified');
+    expect(done!.evidenceId).toBeUndefined();
+  });
+
+  it('appends an implicit terminal verifier when the workflow declares a contract', () => {
+    const prepared = prepareSpec({
+      ...linear,
+      contract: { checks: [{ spec: { type: 'command', cmd: 'true' }, required: true }] },
+    });
+    expect(prepared.nodes.at(-1)).toMatchObject({ id: IMPLICIT_VERIFIER_ID, kind: 'verifier', contract: 'run' });
+  });
+
+  it('does not append a second verifier when the author placed one', () => {
+    const prepared = prepareSpec({
+      ...linear,
+      contract: { checks: [{ spec: { type: 'command', cmd: 'true' }, required: true }] },
+      nodes: [...linear.nodes, { id: 'mine', kind: 'verifier', contract: 'run' }],
+    });
+    expect(prepared.nodes.filter((n) => n.kind === 'verifier')).toHaveLength(1);
+  });
+
+  it('marks a run verified when the contract passes', async () => {
+    const { kernel } = makeKernel({
+      verifier: async (): Promise<NodeResult> => ({ ok: true, passed: true, evidenceId: 'v-01' }),
+    });
+    const started = await kernel.start({
+      ...linear,
+      contract: { checks: [{ spec: { type: 'command', cmd: 'true' }, required: true }] },
+    });
+    const done = await kernel.wait(started.runId);
+    expect(done!.state).toBe('completed');
+    expect(done!.outcome).toBe('verified');
+    expect(done!.evidenceId).toBe('v-01');
+  });
+
+  it('NEVER completes a run whose contract failed, however the agents voted', async () => {
+    const { kernel } = makeKernel({
+      verifier: async (): Promise<NodeResult> => ({
+        ok: false,
+        passed: false,
+        evidenceId: 'v-01',
+        error: 'acceptance contract failed: npm test exited 1',
+      }),
+    });
+    const started = await kernel.start({
+      ...linear,
+      contract: { checks: [{ spec: { type: 'command', cmd: 'false' }, required: true }] },
+    });
+    const done = await kernel.wait(started.runId);
+    expect(done!.state).toBe('failed');
+    expect(done!.state).not.toBe('completed');
+    expect(done!.outcome).toBe('refuted');
+    expect(done!.error).toContain('npm test');
+  });
+
+  it('records consensus votes without letting them decide anything', async () => {
+    const { kernel } = makeKernel({
+      council: async (): Promise<NodeResult> => ({
+        ok: true,
+        output: 'done',
+        consensusVotes: [{ agent: 'alice', round: 1, vote: true, source: 'strict' }],
+      }),
+      verifier: async (): Promise<NodeResult> => ({ ok: false, passed: false, evidenceId: 'v-01', error: 'red' }),
+    });
+    const started = await kernel.start({
+      name: 'council-run',
+      nodes: [{ id: 'c', kind: 'council', task: 't', agents: [] }],
+      contract: { checks: [{ spec: { type: 'command', cmd: 'false' }, required: true }] },
+    });
+    const done = await kernel.wait(started.runId);
+    expect(done!.consensusVotes?.[0]).toMatchObject({ agent: 'alice', vote: true });
+    expect(done!.state).toBe('failed');
+  });
+});
+
+describe('contract provenance', () => {
+  it('ignores a contract embedded in agent output', async () => {
+    const seen: unknown[] = [];
+    const { kernel } = makeKernel({
+      agent: async () => ({
+        ok: true,
+        // An agent trying to declare its own acceptance criteria.
+        output: JSON.stringify({ contract: { checks: [{ type: 'command', cmd: 'true' }] } }),
+      }),
+      verifier: async (_node, ctx) => {
+        seen.push(ctx.runContract);
+        return { ok: true, output: 'nothing declared' };
+      },
+    });
+    const started = await kernel.start({
+      ...linear,
+      nodes: [...linear.nodes, { id: 'v', kind: 'verifier', contract: 'run' }],
+    });
+    const done = await kernel.wait(started.runId);
+    expect(seen).toEqual([undefined]);
+    expect(done!.outcome).toBe('unverified');
+  });
+
+  it('takes the contract from the caller, normalizing it', async () => {
+    let received: unknown;
+    const { kernel } = makeKernel({
+      verifier: async (_node, ctx) => {
+        received = ctx.runContract;
+        return { ok: true, passed: true, evidenceId: 'v-01' };
+      },
+    });
+    const started = await kernel.start(linear, {
+      contract: { checks: [{ type: 'command', cmd: 'npm', args: ['test'], shell: 'rm -rf /' }] },
+    });
+    await kernel.wait(started.runId);
+    expect(received).toMatchObject({ checks: [{ spec: { type: 'command', cmd: 'npm' } }] });
+    expect(JSON.stringify(received)).not.toContain('rm -rf');
+  });
+});
+
+describe('retry and timeout', () => {
+  it('retries a failing node up to its limit', async () => {
+    let attempts = 0;
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async () => {
+      attempts++;
+      return attempts < 3 ? { ok: false, error: 'flaky' } : { ok: true };
+    });
+    const started = await kernel.start({
+      name: 'retry',
+      nodes: [{ id: 'a', kind: 'agent', prompt: 'a', retry: { max: 3, backoffMs: 1 } }],
+    });
+    const done = await kernel.wait(started.runId);
+    expect(attempts).toBe(3);
+    expect(done!.state).toBe('completed');
+    expect(done!.nodes.a.attempts).toBe(3);
+  });
+
+  it('gives up after the retry limit', async () => {
+    let attempts = 0;
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async () => {
+      attempts++;
+      return { ok: false, error: 'always red' };
+    });
+    const started = await kernel.start({
+      name: 'retry',
+      nodes: [{ id: 'a', kind: 'agent', prompt: 'a', retry: { max: 2, backoffMs: 1 } }],
+    });
+    const done = await kernel.wait(started.runId);
+    expect(attempts).toBe(3);
+    expect(done!.state).toBe('failed');
+  });
+
+  it('fails a node that overruns its timeout instead of waiting forever', async () => {
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', () => new Promise(() => undefined));
+    const started = await kernel.start({
+      name: 'hang',
+      nodes: [{ id: 'a', kind: 'agent', prompt: 'a', timeoutMs: 120 }],
+    });
+    const done = await kernel.wait(started.runId);
+    expect(done!.state).toBe('failed');
+    expect(done!.nodes.a.error).toContain('timed out');
+  });
+
+  it('lets an autoloop node continue past the kernel default timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      let finishAutoloop!: (result: NodeResult) => void;
+      const kernel = new RunKernel();
+      kernel.setExecutor(
+        'autoloop',
+        () =>
+          new Promise<NodeResult>((resolve) => {
+            finishAutoloop = resolve;
+          }),
+      );
+      const started = await kernel.start({
+        name: 'long-autoloop',
+        nodes: [{ id: 'loop', kind: 'autoloop', workspace: tmp, config: {} }],
+      });
+
+      await vi.advanceTimersByTimeAsync(30 * 60_000 + 1);
+
+      expect(loadRun(started.runId)!.nodes.loop.state).toBe('running');
+      finishAutoloop({ ok: true });
+      await vi.advanceTimersByTimeAsync(0);
+      const done = await kernel.wait(started.runId);
+      expect(done!.state).toBe('completed');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('reports a missing executor rather than silently succeeding', async () => {
+    const kernel = new RunKernel();
+    const started = await kernel.start({ name: 'x', nodes: [{ id: 'a', kind: 'agent', prompt: 'a' }] });
+    const done = await kernel.wait(started.runId);
+    expect(done!.state).toBe('failed');
+    expect(done!.error).toContain('no executor');
+  });
+});
+
+describe('router', () => {
+  it('loops back on failure and proceeds once green', async () => {
+    let attempts = 0;
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async (node) => {
+      if (node.id !== 'work') return { ok: true };
+      attempts++;
+      return attempts < 3 ? { ok: false, error: 'red' } : { ok: true };
+    });
+    kernel.setExecutor('router', async (node, ctx) => {
+      const { evaluateCondition } = await import('../../kernel/conditions.js');
+      const r = (node as { routes: Array<{ when: never; to: string }> }).routes.find((x) =>
+        evaluateCondition(ctx.record, x.when),
+      );
+      return { ok: true, goto: r?.to };
+    });
+    const started = await kernel.start({
+      name: 'repair',
+      nodes: [
+        { id: 'work', kind: 'agent', prompt: 'work', onFailure: 'continue' },
+        {
+          id: 'gate',
+          kind: 'router',
+          routes: [{ when: { type: 'node_failed', node: 'work' }, to: 'work' }],
+        },
+        { id: 'ship', kind: 'agent', prompt: 'ship' },
+      ],
+    });
+    const done = await kernel.wait(started.runId);
+    expect(attempts).toBe(3);
+    expect(done!.state).toBe('completed');
+    expect(done!.nodes.ship.state).toBe('succeeded');
+  });
+
+  it('stops an unbounded loop at the visit limit rather than spinning', async () => {
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async () => ({ ok: true }));
+    kernel.setExecutor('router', async () => ({ ok: true, goto: 'a' }));
+    const started = await kernel.start({
+      name: 'spin',
+      maxNodeVisits: 4,
+      nodes: [
+        { id: 'a', kind: 'agent', prompt: 'a' },
+        { id: 'loop', kind: 'router', routes: [{ when: { type: 'always' }, to: 'a' }] },
+      ],
+    });
+    const done = await kernel.wait(started.runId);
+    expect(done!.state).toBe('failed');
+    expect(done!.error).toContain('loop bound');
+  });
+});
+
+describe('human gate', () => {
+  it('parks until approved, then carries on', async () => {
+    const ran: string[] = [];
+    const { kernel } = makeKernel({}, ran);
+    kernel.setExecutor('human_gate', async () => ({ ok: true, awaitHuman: true }));
+    const started = await kernel.start({
+      name: 'gated',
+      nodes: [
+        { id: 'a', kind: 'agent', prompt: 'a' },
+        { id: 'gate', kind: 'human_gate', prompt: 'ok?' },
+        { id: 'b', kind: 'agent', prompt: 'b' },
+      ],
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    expect(loadRun(started.runId)!.state).toBe('awaiting_human');
+    expect(ran).toEqual(['a']);
+
+    expect(kernel.approve(started.runId, true)).toBe(true);
+    const done = await kernel.wait(started.runId);
+    expect(ran).toEqual(['a', 'b']);
+    expect(done!.state).toBe('completed');
+  });
+
+  it('fails the run when the gate is rejected', async () => {
+    const { kernel } = makeKernel();
+    kernel.setExecutor('human_gate', async () => ({ ok: true, awaitHuman: true }));
+    const started = await kernel.start({
+      name: 'gated',
+      nodes: [{ id: 'gate', kind: 'human_gate', prompt: 'ok?' }],
+    });
+    await new Promise((r) => setTimeout(r, 30));
+    kernel.approve(started.runId, false);
+    const done = await kernel.wait(started.runId);
+    expect(done!.state).toBe('failed');
+    expect(done!.error).toContain('human gate');
+  });
+});
+
+describe('cancel', () => {
+  it('cancels a running node and marks the run cancelled', async () => {
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async (_node, ctx) => {
+      for (let i = 0; i < 200; i++) {
+        if (ctx.signal.aborted) return { ok: false, error: 'cancelled' };
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      return { ok: true };
+    });
+    const started = await kernel.start({ name: 'slow', nodes: [{ id: 'a', kind: 'agent', prompt: 'a' }] });
+    await new Promise((r) => setTimeout(r, 20));
+    expect(kernel.cancel(started.runId)).toBe(true);
+    const done = await kernel.wait(started.runId);
+    expect(done!.state).toBe('cancelled');
+  });
+
+  it('reports false for an unknown run', () => {
+    const kernel = new RunKernel();
+    expect(kernel.cancel('nope')).toBe(false);
+  });
+});
+
+describe('resume', () => {
+  it('does not re-run nodes that already succeeded', async () => {
+    const ran: string[] = [];
+    const { kernel } = makeKernel({}, ran);
+    const spec: WorkflowSpec = {
+      name: 'resumable',
+      nodes: [
+        { id: 'a', kind: 'agent', prompt: 'a' },
+        { id: 'b', kind: 'agent', prompt: 'b' },
+        { id: 'c', kind: 'agent', prompt: 'c' },
+      ],
+    };
+    const started = await kernel.start(spec);
+    await kernel.wait(started.runId);
+    expect(ran).toEqual(['a', 'b', 'c']);
+
+    // Simulate the crash: rewind the checkpoint to mid-run, as a killed process
+    // would have left it, and re-attach with a fresh kernel.
+    const record = loadRun(started.runId)!;
+    record.state = 'running';
+    record.endedAt = undefined;
+    record.nodes.b.state = 'running';
+    record.nodes.c.state = 'pending';
+    // A process that died inside `b` last recorded `b` as the node it was on.
+    record.currentNode = 'b';
+    // No unguarded write exists any more, so the "crashed process" is simulated
+    // the way a real one behaves: claim the run, write the checkpoint it died
+    // holding, and let the claim go (a lease whose holder is gone is free).
+    const { acquireLease, commit, releaseLease } = await import('../../kernel/store.js');
+    const crashed = acquireLease(record.runId, 'crashed-process');
+    commit(crashed, { record });
+    releaseLease(crashed);
+
+    const ran2: string[] = [];
+    const { kernel: kernel2 } = makeKernel({}, ran2);
+    await kernel2.resume(started.runId);
+    const done = await kernel2.wait(started.runId);
+
+    expect(ran2).toEqual(['b', 'c']);
+    expect(done!.state).toBe('completed');
+  });
+
+  it('retries the node that was in flight, since a half-finished node left no result', async () => {
+    const { kernel } = makeKernel();
+    const started = await kernel.start(linear);
+    await kernel.wait(started.runId);
+
+    const record = loadRun(started.runId)!;
+    record.state = 'running';
+    record.nodes.b.state = 'running';
+    record.nodes.b.attempts = 2;
+    record.currentNode = 'b';
+    // No unguarded write exists any more, so the "crashed process" is simulated
+    // the way a real one behaves: claim the run, write the checkpoint it died
+    // holding, and let the claim go (a lease whose holder is gone is free).
+    const { acquireLease, commit, releaseLease } = await import('../../kernel/store.js');
+    const crashed = acquireLease(record.runId, 'crashed-process');
+    commit(crashed, { record });
+    releaseLease(crashed);
+
+    const ran2: string[] = [];
+    const { kernel: kernel2 } = makeKernel({}, ran2);
+    await kernel2.resume(started.runId);
+    await kernel2.wait(started.runId);
+    expect(ran2).toEqual(['b']);
+    expect(loadRun(started.runId)!.nodes.b.attempts).toBe(1);
+  });
+
+  // #117. A node on a branch the run never took stays `pending` for good, and the
+  // resume point used to be the first pending node in declaration order — so a
+  // run that died inside `test` came back at the `unblock` gate declared above it.
+  const branched: WorkflowSpec = {
+    name: 'branched',
+    nodes: [
+      { id: 'implement', kind: 'agent', prompt: 'implement' },
+      { id: 'route', kind: 'router', default: 'test' },
+      { id: 'unblock', kind: 'human_gate', prompt: 'unblock?', next: 'implement' },
+      { id: 'test', kind: 'agent', prompt: 'test' },
+    ],
+  };
+
+  /** Finish `branched`, then leave the checkpoint a crash at `at` would have left. */
+  async function crashedAt(at: string, edit: (r: ReturnType<typeof loadRun> & object) => void) {
+    const { kernel } = makeKernel();
+    kernel.setExecutor('human_gate', async () => ({ ok: true, awaitHuman: true }));
+    const started = await kernel.start(branched);
+    await kernel.wait(started.runId);
+    const record = loadRun(started.runId)!;
+    expect(record.nodes.unblock.state).toBe('pending'); // the branch never taken
+    record.state = 'running';
+    record.endedAt = undefined;
+    // The implicit verifier is appended only for some specs; reset it when present.
+    if (record.nodes[IMPLICIT_VERIFIER_ID]) record.nodes[IMPLICIT_VERIFIER_ID].state = 'pending';
+    record.currentNode = at;
+    edit(record);
+    const { acquireLease, commit, releaseLease } = await import('../../kernel/store.js');
+    const crashed = acquireLease(record.runId, 'crashed-process');
+    commit(crashed, { record });
+    releaseLease(crashed);
+    return started.runId;
+  }
+
+  async function resumeAndWait(runId: string) {
+    const ran: string[] = [];
+    const { kernel } = makeKernel({}, ran);
+    kernel.setExecutor('human_gate', async () => ({ ok: true, awaitHuman: true }));
+    await kernel.resume(runId);
+    await new Promise((r) => setTimeout(r, 30));
+    return { ran, record: loadRun(runId)!, kernel };
+  }
+
+  it('resumes at the node that was running, not at a never-visited node declared before it', async () => {
+    const runId = await crashedAt('test', (r) => {
+      r.nodes.test.state = 'running';
+    });
+    const { ran, record, kernel } = await resumeAndWait(runId);
+    expect(record.state).not.toBe('awaiting_human');
+    await kernel.wait(runId);
+    expect(ran).toEqual(['test']);
+    expect(loadRun(runId)!.state).toBe('completed');
+  });
+
+  it('continues at the successor when the process died between two nodes', async () => {
+    // `skipped` sits between `x` and its successor and is never visited, so the
+    // first pending node and the true successor are different nodes here.
+    const ran: string[] = [];
+    const { kernel } = makeKernel({}, ran);
+    const started = await kernel.start({
+      name: 'jumps',
+      nodes: [
+        { id: 'x', kind: 'agent', prompt: 'x', next: 'z' },
+        { id: 'skipped', kind: 'agent', prompt: 'never on the path' },
+        { id: 'z', kind: 'agent', prompt: 'z' },
+      ],
+    });
+    await kernel.wait(started.runId);
+    expect(ran).toEqual(['x', 'z']);
+
+    const record = loadRun(started.runId)!;
+    record.state = 'running';
+    record.endedAt = undefined;
+    record.nodes.z.state = 'pending';
+    if (record.nodes[IMPLICIT_VERIFIER_ID]) record.nodes[IMPLICIT_VERIFIER_ID].state = 'pending';
+    record.currentNode = 'x'; // `x` finished; the process died before `z` started
+    const { acquireLease, commit, releaseLease } = await import('../../kernel/store.js');
+    const crashed = acquireLease(record.runId, 'crashed-process');
+    commit(crashed, { record });
+    releaseLease(crashed);
+
+    const ran2: string[] = [];
+    const { kernel: kernel2 } = makeKernel({}, ran2);
+    await kernel2.resume(started.runId);
+    await kernel2.wait(started.runId);
+    expect(ran2).toEqual(['z']);
+  });
+
+  it('re-evaluates a router that finished before the crash, since its choice was not recorded', async () => {
+    const runId = await crashedAt('route', (r) => {
+      r.nodes.test.state = 'pending';
+    });
+    const { ran, kernel } = await resumeAndWait(runId);
+    await kernel.wait(runId);
+    expect(ran).toEqual(['test']);
+    expect(loadRun(runId)!.state).toBe('completed');
+  });
+
+  it('still parks again at a gate the run was waiting on', async () => {
+    const runId = await crashedAt('unblock', (r) => {
+      r.nodes.unblock.state = 'awaiting_human';
+      r.nodes.test.state = 'pending';
+    });
+    const { ran, record, kernel } = await resumeAndWait(runId);
+    expect(record.state).toBe('awaiting_human');
+    expect(record.currentNode).toBe('unblock');
+    expect(ran).toEqual([]);
+    kernel.cancel(runId);
+    await kernel.wait(runId);
+  });
+
+  it('restarts a finished run from the top rather than where it ended', async () => {
+    const { kernel } = makeKernel();
+    const started = await kernel.start(branched);
+    await kernel.wait(started.runId);
+
+    const ran: string[] = [];
+    const { kernel: kernel2 } = makeKernel({}, ran);
+    await kernel2.resume(started.runId, { restart: true });
+    await kernel2.wait(started.runId);
+    expect(ran).toEqual(['implement', 'test']);
+  });
+
+  it('returns a terminal run untouched', async () => {
+    const { kernel } = makeKernel();
+    const started = await kernel.start(linear);
+    await kernel.wait(started.runId);
+    const again = await kernel.resume(started.runId);
+    expect(again.state).toBe('completed');
+  });
+
+  it('throws for an unknown run', async () => {
+    const kernel = new RunKernel();
+    await expect(kernel.resume('nope')).rejects.toThrow(/not found/);
+  });
+});
+
+// #117. The run record survives a restart; the gate a parked run waits on and
+// the steer queue lived only in the process, so after a restart `approve` did
+// nothing and queued steers were gone.
+describe('after a restart', () => {
+  const gated: WorkflowSpec = {
+    name: 'gated',
+    nodes: [
+      { id: 'a', kind: 'agent', prompt: 'a' },
+      { id: 'gate', kind: 'human_gate', prompt: 'ok?' },
+      { id: 'b', kind: 'agent', prompt: 'b' },
+    ],
+  };
+
+  /** A checkpoint left by a process that died at `at`, with `events` in its log. */
+  async function crashed(at: 'gate' | 'b', events: Array<Record<string, unknown>> = []) {
+    const kernel = new RunKernel({ nodeTimeoutMs: 5000 });
+    kernel.setExecutor('agent', async () => ({ ok: true }));
+    kernel.setExecutor('human_gate', async () => ({ ok: true }));
+    kernel.setExecutor('verifier', async () => ({ ok: true, output: 'nothing declared' }));
+    const started = await kernel.start(gated);
+    await kernel.wait(started.runId);
+
+    const record = loadRun(started.runId)!;
+    record.endedAt = undefined;
+    if (record.nodes[IMPLICIT_VERIFIER_ID]) record.nodes[IMPLICIT_VERIFIER_ID].state = 'pending';
+    if (at === 'gate') {
+      record.state = 'awaiting_human';
+      record.nodes.gate.state = 'awaiting_human';
+      record.nodes.b.state = 'pending';
+    } else {
+      record.state = 'running';
+      record.nodes.b.state = 'running';
+    }
+    record.currentNode = at;
+    const ts = new Date().toISOString();
+    const { acquireLease, commit, releaseLease } = await import('../../kernel/store.js');
+    const lease = acquireLease(record.runId, 'crashed-process');
+    commit(lease, { record, events: events.map((e) => ({ ts, ...e })) as never });
+    releaseLease(lease);
+    return started.runId;
+  }
+
+  /** A fresh process: gates park, agents report the steers they were handed. */
+  function restarted() {
+    const kernel = new RunKernel({ nodeTimeoutMs: 5000 });
+    const got: Record<string, string[]> = {};
+    kernel.setExecutor('agent', async (node, ctx) => {
+      got[node.id] = ctx.takeSteer();
+      return { ok: true };
+    });
+    kernel.setExecutor('human_gate', async () => ({ ok: true, awaitHuman: true }));
+    kernel.setExecutor('verifier', async () => ({ ok: true, output: 'nothing declared' }));
+    return { kernel, got };
+  }
+
+  it('approves a gate whose run was parked by a process that is gone', async () => {
+    const runId = await crashed('gate');
+    const { kernel, got } = restarted();
+    expect(kernel.approve(runId, true)).toBe(false); // nothing live to answer
+    expect(await kernel.approveStored(runId, true)).toBe(true);
+    const done = await kernel.wait(runId);
+    expect(Object.keys(got)).toEqual(['b']);
+    expect(done!.state).toBe('completed');
+  });
+
+  it('rejects such a gate just as a live one', async () => {
+    const runId = await crashed('gate');
+    const { kernel } = restarted();
+    expect(await kernel.approveStored(runId, false)).toBe(true);
+    const done = await kernel.wait(runId);
+    expect(done!.state).toBe('failed');
+    expect(done!.error).toContain('human gate');
+  });
+
+  it('does not answer a run that is not parked', async () => {
+    const runId = await crashed('b');
+    const { kernel } = restarted();
+    expect(await kernel.approveStored(runId, true)).toBe(false);
+    expect(await kernel.approveStored('nope', true)).toBe(false);
+  });
+
+  it('delivers a steer that arrived before the crash and was never taken', async () => {
+    const runId = await crashed('gate', [{ type: 'steer', node: 'gate', text: 'use the other library' }]);
+    const { kernel, got } = restarted();
+    await kernel.approveStored(runId, true);
+    await kernel.wait(runId);
+    expect(got.b).toEqual(['use the other library']);
+  });
+
+  it('does not deliver a steer again once a finished node consumed it', async () => {
+    const runId = await crashed('gate', [
+      { type: 'steer', node: 'a', text: 'already used' },
+      { type: 'steer_consumed', node: 'a', count: 1 },
+      { type: 'steer', node: 'gate', text: 'still pending' },
+    ]);
+    const { kernel, got } = restarted();
+    await kernel.approveStored(runId, true);
+    await kernel.wait(runId);
+    expect(got.b).toEqual(['still pending']);
+  });
+
+  it('gives the retry the steers a node was holding when the process died', async () => {
+    // `b` took the steer and died before finishing, so nothing recorded it as consumed.
+    const runId = await crashed('b', [{ type: 'steer', node: 'gate', text: 'take this into account' }]);
+    const { kernel, got } = restarted();
+    await kernel.resume(runId);
+    await kernel.wait(runId);
+    expect(got.b).toEqual(['take this into account']);
+  });
+
+  it('records a steer as consumed when the node that took it finishes', async () => {
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async (_node, ctx) => {
+      ctx.takeSteer();
+      await new Promise((r) => setTimeout(r, 20));
+      return { ok: true };
+    });
+    const started = await kernel.start(linear);
+    kernel.steer(started.runId, 'noted');
+    await kernel.wait(started.runId);
+    const consumed = readEvents(started.runId).filter((e) => e.type === 'steer_consumed');
+    expect(consumed.map((e) => (e as { count: number }).count)).toEqual([1]);
+  });
+});
+
+describe('steer', () => {
+  it('hands queued text to the next agent node', async () => {
+    const prompts: string[] = [];
+    const kernel = new RunKernel();
+    kernel.setExecutor('agent', async (node, ctx) => {
+      const steer = ctx.takeSteer();
+      prompts.push([...steer, (node as { prompt: string }).prompt].join(' | '));
+      await new Promise((r) => setTimeout(r, 20));
+      return { ok: true };
+    });
+    const started = await kernel.start(linear);
+    kernel.steer(started.runId, 'use the other library');
+    await kernel.wait(started.runId);
+    expect(prompts.some((p) => p.includes('use the other library'))).toBe(true);
+  });
+
+  it('reports false for an unknown run', () => {
+    expect(new RunKernel().steer('nope', 'x')).toBe(false);
+  });
+});

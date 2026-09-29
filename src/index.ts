@@ -15,6 +15,7 @@ import { EmbeddedServer } from './embedded-server.js';
 import { sanitizeCwd, validateRegex } from './validation.js';
 import {
   ENGINE_TYPES,
+  EFFORT_LEVELS,
   type PluginConfig,
   type EffortLevel,
   type CouncilConfig,
@@ -23,6 +24,11 @@ import {
   type CustomEngineConfig,
 } from './types.js';
 import type { FanoutConfig } from './fanout.js';
+import { councilWorkflow, fanoutWorkflow, solveWorkflow, type SolveArgs } from './kernel/templates/index.js';
+import { readEvents as readKernelEvents } from './kernel/store.js';
+import { resolveSecretRefs } from './kernel/secrets.js';
+import type { RunState, WorkflowSpec } from './kernel/types.js';
+import { AUTOLOOP_TIMEOUT_SCHEMA, validateAutoloopTimeoutConfig } from './autoloop/types.js';
 
 // ─── Standalone Export ───────────────────────────────────────────────────────
 
@@ -33,6 +39,7 @@ export { PersistentCodexSession } from './persistent-codex-session.js';
 export { PersistentGeminiSession } from './persistent-gemini-session.js';
 export { PersistentAgySession } from './persistent-agy-session.js';
 export { PersistentCursorSession } from './persistent-cursor-session.js';
+export { PersistentGrokSession } from './persistent-grok-session.js';
 export { PersistentOpencodeSession } from './persistent-opencode-session.js';
 export { PersistentCustomSession } from './persistent-custom-session.js';
 export { Council, getDefaultCouncilConfig } from './council.js';
@@ -52,16 +59,25 @@ export * from './types.js';
 // ─── Plugin Entry ────────────────────────────────────────────────────────────
 
 /** OpenClaw Plugin SDK interface (minimal typing for what we use) */
+type ToolExecute = (toolCallId: string, params: Record<string, unknown>) => Promise<unknown>;
+
+interface ToolDefinition {
+  name: string;
+  label?: string;
+  description: string;
+  parameters: Record<string, unknown>;
+  execute: ToolExecute;
+}
+
+interface AgentToolResult {
+  content: unknown[];
+  details: unknown;
+}
+
 interface PluginAPI {
   pluginConfig: Record<string, unknown>;
   logger: { info(...args: unknown[]): void; error(...args: unknown[]): void; warn(...args: unknown[]): void };
-  registerTool(def: {
-    name: string;
-    label?: string;
-    description: string;
-    parameters: Record<string, unknown>;
-    execute: (toolCallId: string, params: Record<string, unknown>) => Promise<unknown>;
-  }): void;
+  registerTool(def: ToolDefinition): void;
   on(event: string, handler: (event: Record<string, unknown>, ctx?: unknown) => Promise<void>): void;
   registerHttpRoute(def: {
     path: string;
@@ -70,6 +86,26 @@ interface PluginAPI {
     handler: (...args: unknown[]) => Promise<boolean>;
   }): void;
   registerService(def: { id: string; start: () => void; stop: () => void }): void;
+}
+
+function isAgentToolResult(result: unknown): result is AgentToolResult {
+  return (
+    typeof result === 'object' &&
+    result !== null &&
+    'content' in result &&
+    Array.isArray(result.content) &&
+    'details' in result
+  );
+}
+
+function normalizeToolResult(result: unknown): AgentToolResult {
+  if (isAgentToolResult(result)) return result;
+
+  const text = JSON.stringify(result, (_key, value) => (typeof value === 'bigint' ? value.toString() : value), 2);
+  return {
+    content: [{ type: 'text', text: text ?? 'null' }],
+    details: result,
+  };
 }
 
 const CUSTOM_ENGINE_SCHEMA = {
@@ -127,10 +163,17 @@ const plugin = {
   id: 'claw-orchestrator',
   name: 'Claw Orchestrator',
   description:
-    'Run Claude Code, Codex, Gemini, Cursor Agent and custom coding CLIs as one unified runtime — persistent sessions, multi-agent council, worktree isolation, multi-model proxy',
+    'Run Claude Code, Codex, Antigravity, Grok Build, OpenCode and custom coding CLIs as one unified runtime — persistent sessions, multi-agent council, worktree isolation, multi-model proxy',
 
   register(api: PluginAPI): void {
     const rawConfig = (api.pluginConfig || {}) as Partial<PluginConfig>;
+
+    const registerTool = (definition: ToolDefinition): void => {
+      api.registerTool({
+        ...definition,
+        execute: async (toolCallId, params) => normalizeToolResult(await definition.execute(toolCallId, params)),
+      });
+    };
 
     // ─── Lazy Init ────────────────────────────────────────────────────────
     //
@@ -210,10 +253,10 @@ const plugin = {
 
     // ─── Tool: session_start ──────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_start',
       description:
-        'Start a persistent coding session. Supports multiple engines: claude (default) for Claude Code CLI, codex for OpenAI Codex CLI, gemini for Google Gemini CLI, agy for Google Antigravity CLI, cursor for Cursor Agent CLI, opencode for sst/opencode CLI, or custom for any user-configured coding agent CLI.',
+        'Start a persistent coding session. Engines: claude (default) for the Claude Code CLI, codex for the OpenAI Codex CLI, agy for the Google Antigravity CLI, grok for the xAI Grok Build CLI, opencode for the sst/opencode CLI, or custom for any user-configured coding agent CLI.',
       parameters: {
         type: 'object',
         properties: {
@@ -225,12 +268,12 @@ const plugin = {
             description:
               'Engine to use (default: claude). codex = `codex exec` per send (no /goal). codex-app = long-running `codex app-server` with /goal support. agy = Google Antigravity CLI (Gemini CLI successor; plain-text output, tokens estimated, conversation resume handled automatically). opencode = sst/opencode CLI (provider-agnostic; pass model as `provider/model`). Use "custom" with customEngine config for any CLI.',
           },
-          model: { type: 'string', description: 'Model to use (opus, sonnet, haiku, gemini-pro, o4-mini, etc.)' },
+          model: { type: 'string', description: 'Model to use (opus, sonnet, haiku, gpt-5.5, agy-pro, etc.)' },
           permissionMode: {
             type: 'string',
             enum: ['acceptEdits', 'bypassPermissions', 'default', 'manual', 'dontAsk', 'plan', 'auto'],
           },
-          effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max', 'auto'] },
+          effort: { type: 'string', enum: EFFORT_LEVELS },
           allowedTools: {
             type: 'array',
             maxItems: 200,
@@ -241,7 +284,11 @@ const plugin = {
           maxTurns: { type: 'number', description: 'Max agent loop turns' },
           maxBudgetUsd: { type: 'number', description: 'Max API spend (USD)' },
           systemPrompt: { type: 'string', description: 'Replace system prompt' },
-          appendSystemPrompt: { type: 'string', description: 'Append to system prompt' },
+          appendSystemPrompt: {
+            type: 'string',
+            description:
+              'Append to the system prompt. Claude Code and Grok take it natively; Codex, Antigravity and OpenCode have no such flag and receive it at the top of the first message of a conversation',
+          },
           agents: { type: 'object', description: 'Custom sub-agents JSON' },
           agent: { type: 'string', description: 'Default agent to use' },
           bare: { type: 'boolean', description: 'Minimal mode: skip hooks, LSP, auto-memory, CLAUDE.md' },
@@ -273,6 +320,16 @@ const plugin = {
             type: 'string',
             description:
               'Codex engine only. Named config profile from ~/.codex/config.toml, passed as `codex exec --profile`. Reasoning effort is mapped from the engine-agnostic `effort` param to `-c model_reasoning_effort` automatically.',
+          },
+          ignoreUserConfig: {
+            type: 'boolean',
+            description:
+              "Codex engine only. Run without loading $CODEX_HOME/config.toml (`codex exec --ignore-user-config`), so the session is decided by what the caller passed rather than by the machine's own Codex config. Auth still resolves from CODEX_HOME.",
+          },
+          restricted: {
+            type: 'boolean',
+            description:
+              'Claude engine only. Restricted mode (`--restricted`): removes the tools that run commands or code (Bash, PowerShell, the REPL) and WebFetch unless `tools` names them, and ignores user, project and local settings files, including CLAUDE.md and hooks. Separate from sandboxMode read-only, which maps to plan mode.',
           },
           noSessionPersistence: { type: 'boolean', description: 'Do not save session to disk' },
           betas: { type: ['string', 'array'], items: { type: 'string' }, description: 'Custom beta headers' },
@@ -367,7 +424,7 @@ const plugin = {
 
     // ─── Tool: session_send ───────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_send',
       description: 'Send a message to a persistent coding session and get the response',
       parameters: {
@@ -377,7 +434,7 @@ const plugin = {
           message: { type: 'string', description: 'Message to send' },
           effort: {
             type: 'string',
-            enum: ['low', 'medium', 'high', 'xhigh', 'max'],
+            enum: EFFORT_LEVELS.filter((level) => level !== 'auto'),
             description: 'Effort for this message',
           },
           plan: { type: 'boolean', description: 'Enable plan mode' },
@@ -414,9 +471,52 @@ const plugin = {
       },
     });
 
+    // ─── Tool: session_handoff ────────────────────────────────────────────
+
+    registerTool({
+      name: 'session_handoff',
+      description:
+        "Continue a session's conversation on another engine (or another model). Starts a new session on the target engine in the same working directory and carries the conversation into it as text, so the new agent picks up where the old one left off. The source session keeps running untouched — stop it yourself if you are done with it. Pass `message` to send the next instruction immediately; otherwise the history travels with whatever you send next via session_send.",
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'The session to hand off from' },
+          engine: {
+            type: 'string',
+            enum: ENGINE_TYPES,
+            description: 'Engine for the new session. May be the same engine with a different model.',
+          },
+          model: { type: 'string', description: 'Model for the new session (default: the engine default)' },
+          newName: { type: 'string', description: 'Name for the new session (default: `<name>-<engine>`)' },
+          message: {
+            type: 'string',
+            description: 'Send this as the first message now and return the reply (default: wait for session_send)',
+          },
+          maxChars: {
+            type: 'number',
+            description:
+              'Upper bound on the carried history, in characters (default 240000, minimum 4000). When the conversation is longer, the opening request and the newest turns are kept and the turns between them are left out.',
+          },
+          customEngine: CUSTOM_ENGINE_SCHEMA,
+        },
+        required: ['name', 'engine'],
+      },
+      execute: async (_id, args) => {
+        const result = await getManager().handoffSession(args.name as string, {
+          engine: args.engine as EngineType,
+          model: args.model as string | undefined,
+          newName: args.newName as string | undefined,
+          message: args.message as string | undefined,
+          maxChars: args.maxChars as number | undefined,
+          customEngine: args.customEngine as Parameters<SessionManager['handoffSession']>[1]['customEngine'],
+        });
+        return { ok: true, ...result };
+      },
+    });
+
     // ─── Tool: session_stop ───────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_stop',
       description: 'Stop a persistent coding session',
       parameters: {
@@ -432,7 +532,7 @@ const plugin = {
 
     // ─── Tool: session_list ───────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_list',
       description: 'List all active coding sessions',
       parameters: { type: 'object', properties: {} },
@@ -444,7 +544,7 @@ const plugin = {
 
     // ─── Tool: sessions_overview ──────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'sessions_overview',
       description:
         'Get an aggregate overview of all active coding sessions — readiness, busy/paused state, cost, context usage, and last activity for each. Use this for a dashboard view across all sessions. For single-session detail, use coding_session_status instead.',
@@ -465,7 +565,7 @@ const plugin = {
 
     // ─── Tool: coding_session_status ──────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'coding_session_status',
       description: 'Get detailed status of a coding session (context %, tokens, cost, uptime)',
       parameters: {
@@ -481,7 +581,7 @@ const plugin = {
 
     // ─── Tool: session_grep ───────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_grep',
       description: 'Search session history for events matching a regex pattern',
       parameters: {
@@ -506,7 +606,7 @@ const plugin = {
 
     // ─── Tool: session_compact ────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_compact',
       description: 'Compact a session to reclaim context window space',
       parameters: {
@@ -525,7 +625,7 @@ const plugin = {
 
     // ─── Tool: coding_agents_list ─────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'coding_agents_list',
       description: 'List agent definitions from .claude/agents/',
       parameters: {
@@ -540,7 +640,7 @@ const plugin = {
 
     // ─── Tool: team_list ──────────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'team_list',
       description: 'List teammates in an agent team session (requires enableAgentTeams)',
       parameters: {
@@ -556,7 +656,7 @@ const plugin = {
 
     // ─── Tool: team_send ──────────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'team_send',
       description: 'Send a message to a specific teammate in an agent team session',
       parameters: {
@@ -580,7 +680,7 @@ const plugin = {
 
     // ─── Tool: session_update_tools ───────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_update_tools',
       description:
         'Update allowedTools or disallowedTools for a running session. Restarts the session process with --resume to apply the new tool constraints while preserving conversation history. Rejects if the session is currently busy.',
@@ -620,7 +720,7 @@ const plugin = {
 
     // ─── Tool: session_switch_model ───────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_switch_model',
       description:
         'Switch the model for a running session immediately. Restarts the session process with --resume so the new model takes effect on the next message while preserving conversation history.',
@@ -628,7 +728,7 @@ const plugin = {
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Session name' },
-          model: { type: 'string', description: 'New model (opus, sonnet, haiku, gemini-pro, etc.)' },
+          model: { type: 'string', description: 'New model (opus, sonnet, haiku, gpt-5.5, agy-pro, etc.)' },
         },
         required: ['name', 'model'],
       },
@@ -640,7 +740,7 @@ const plugin = {
 
     // ─── Tool: project_purge (CLI 2.1.126) ────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'project_purge',
       description:
         'Delete Claude Code project state (transcripts, tasks, file history, config entry) via `claude project purge`. Defaults to dry-run for safety — pass dry_run=false to actually delete. Use all=true to purge every project.',
@@ -674,7 +774,7 @@ const plugin = {
 
     // ─── Tool: plugin_details (CLI 2.1.139) ─────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'plugin_details',
       description:
         "Show a plugin's component inventory (commands, hooks, MCP servers, agents, skills) plus the per-session token cost of loading it. Wraps `claude plugin details <name>` (CLI 2.1.139+).",
@@ -703,7 +803,7 @@ const plugin = {
     // normal session channel — there is no separate goal-state event to
     // intercept (unlike Codex). Engine must be "claude".
 
-    api.registerTool({
+    registerTool({
       name: 'claude_goal_set',
       description:
         'Set a goal condition on a claude session. Claude Code keeps working across turns until the condition is met, evaluating after each turn via Haiku. Sends `/goal <objective>`. Requires engine: "claude".',
@@ -728,7 +828,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'claude_goal_clear',
       description: 'Clear the active goal on a claude session. Sends `/goal clear`. Requires engine: "claude".',
       parameters: {
@@ -744,7 +844,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'claude_goal_status',
       description:
         'Query the active goal on a claude session (objective, elapsed, turns, tokens). Sends bare `/goal` and returns the assistant reply. Requires engine: "claude".',
@@ -763,7 +863,7 @@ const plugin = {
 
     // ─── Tool: codex_resume (Codex 0.119+) ──────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'codex_resume',
       description:
         'Resume a previously recorded Codex thread by UUID/name, or pick the most recent with last=true. Spawns `codex exec resume` with --json so the output is parsed into structured fields. Independent of session manager state — useful for cross-process continuity.',
@@ -793,7 +893,7 @@ const plugin = {
 
     // ─── Tool: codex_review ─────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'codex_review',
       description:
         'Run a non-interactive Codex code review (`codex review`). Pick exactly one diff scope: uncommitted (working-tree changes), base (vs branch), or commit (vs SHA). Output is plain text — Codex `review` does not emit JSON.',
@@ -841,7 +941,7 @@ const plugin = {
     // started with engine: "codex-app". Calls against any other engine
     // surface a clear error rather than silently no-op'ing.
 
-    api.registerTool({
+    registerTool({
       name: 'codex_goal_set',
       description:
         'Set a long-horizon objective on a codex-app session. Sends `/goal <objective>` via the app-server slash command. Requires engine: "codex-app".',
@@ -866,7 +966,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'codex_goal_get',
       description:
         'Read the cached goal state on a codex-app session (objective, status, tokensUsed, timeUsedSeconds, tokenBudget). Returns null if no goal is active. Pure read — does not send any turn.',
@@ -880,7 +980,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'codex_goal_pause',
       description: 'Pause goal pursuit on a codex-app session. Sends `/goal pause`.',
       parameters: {
@@ -896,7 +996,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'codex_goal_resume',
       description: 'Resume a paused goal on a codex-app session. Sends `/goal resume`.',
       parameters: {
@@ -912,7 +1012,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'codex_goal_clear',
       description: 'Clear the active goal on a codex-app session. Sends `/goal clear`.',
       parameters: {
@@ -930,7 +1030,7 @@ const plugin = {
 
     // ─── Codex app-server v2 RPC tools (codex-app engine, Codex 0.137) ────
 
-    api.registerTool({
+    registerTool({
       name: 'codex_interrupt',
       description: 'Cancel the in-flight turn on a codex-app session (`turn/interrupt`).',
       parameters: {
@@ -941,7 +1041,7 @@ const plugin = {
       execute: async (_id, args) => getManager().codexInterrupt(args.name as string),
     });
 
-    api.registerTool({
+    registerTool({
       name: 'codex_steer',
       description:
         'Add input to the in-flight turn on a codex-app session without restarting it (`turn/steer`). Falls back to a normal turn when idle.',
@@ -956,7 +1056,7 @@ const plugin = {
       execute: async (_id, args) => getManager().codexSteer(args.name as string, args.message as string),
     });
 
-    api.registerTool({
+    registerTool({
       name: 'codex_fork',
       description: 'Branch a codex-app thread into a new one (`thread/fork`); returns the forked thread id.',
       parameters: {
@@ -967,7 +1067,7 @@ const plugin = {
       execute: async (_id, args) => getManager().codexForkThread(args.name as string),
     });
 
-    api.registerTool({
+    registerTool({
       name: 'codex_rollback',
       description: 'Drop the last N turns from a codex-app thread (`thread/rollback`).',
       parameters: {
@@ -981,7 +1081,7 @@ const plugin = {
       execute: async (_id, args) => getManager().codexRollback(args.name as string, args.numTurns as number),
     });
 
-    api.registerTool({
+    registerTool({
       name: 'codex_models',
       description: 'List models available to a codex-app session (`model/list`), incl. supported reasoning efforts.',
       parameters: {
@@ -992,8 +1092,8 @@ const plugin = {
       execute: async (_id, args) => getManager().codexModels(args.name as string),
     });
 
-    api.registerTool({
-      name: 'codex_threads',
+    registerTool({
+      name: 'codex_thread_list',
       description: 'List Codex threads visible to a codex-app session (`thread/list`), with optional filters.',
       parameters: {
         type: 'object',
@@ -1019,7 +1119,7 @@ const plugin = {
 
     // ─── Tool: claude_agents_list (Claude CLI 2.1.x, claude engine) ───────
 
-    api.registerTool({
+    registerTool({
       name: 'claude_agents_list',
       description:
         'List Claude Code background agent sessions via `claude agents --json` (state/model/title/progress). One-shot, not tied to a managed session.',
@@ -1036,7 +1136,7 @@ const plugin = {
 
     // ─── Fan-out tools (parallel multi-engine task, no consensus) ─────────
 
-    api.registerTool({
+    registerTool({
       name: 'fanout_start',
       description:
         'Run one task across N engine/model agents IN PARALLEL and collect their answers (optional synthesis). Cross-engine best-of-N / diverse-perspective primitive. No rounds, votes, or worktrees — use council for isolated parallel edits. Runs in background; poll with fanout_status.',
@@ -1045,13 +1145,15 @@ const plugin = {
         properties: {
           task: {
             type: 'string',
-            description: 'The shared task/prompt sent to every agent (unless an agent overrides it).',
+            description:
+              'The shared task sent to every agent, after persona role instructions when supplied; a non-empty per-agent prompt replaces it.',
           },
           projectDir: { type: 'string', description: 'Working directory all agents run in.' },
           agents: {
             type: 'array',
             maxItems: 16,
-            description: 'Agent specs: { name, engine?, model?, prompt?, baseUrl?, permissionMode?, customEngine? }.',
+            description:
+              'Agent specs: { name, engine?, model?, effort?, prompt?, persona?, baseUrl?, permissionMode?, customEngine? }.',
             items: {
               type: 'object',
               properties: {
@@ -1061,7 +1163,16 @@ const plugin = {
                   enum: ENGINE_TYPES,
                 },
                 model: { type: 'string' },
-                prompt: { type: 'string' },
+                effort: { type: 'string', enum: EFFORT_LEVELS },
+                prompt: {
+                  type: 'string',
+                  description: 'Complete per-agent prompt that replaces the shared task when non-empty.',
+                },
+                persona: {
+                  type: 'string',
+                  description:
+                    'Per-agent role instructions prepended to the shared task when no non-empty prompt is supplied.',
+                },
                 baseUrl: { type: 'string' },
               },
               required: ['name'],
@@ -1084,7 +1195,7 @@ const plugin = {
         required: ['task', 'projectDir', 'agents'],
       },
       execute: async (_id, args) => {
-        const session = getManager().fanoutStart({
+        const session = await getManager().fanoutStart({
           task: args.task as string,
           projectDir: sanitizeCwd(args.projectDir as string)!,
           agents: args.agents as FanoutConfig['agents'],
@@ -1104,7 +1215,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'fanout_status',
       description: 'Poll a running or finished fan-out by id; returns per-agent results and any synthesis.',
       parameters: {
@@ -1115,7 +1226,7 @@ const plugin = {
       execute: async (_id, args) => ({ ok: true, ...getManager().fanoutStatus(args.id as string) }),
     });
 
-    api.registerTool({
+    registerTool({
       name: 'fanout_abort',
       description: 'Abort a running fan-out by id (already-started agents finish; synthesis is skipped).',
       parameters: {
@@ -1129,9 +1240,396 @@ const plugin = {
       },
     });
 
+    // ─── Tools: workflow_* (durable run kernel) ─────────────────────────
+
+    registerTool({
+      name: 'workflow_start',
+      description:
+        "Start a durable workflow run. Nodes: agent | fanout | council | verifier | human_gate | router | subflow. Every state transition is checkpointed to disk, so a run survives a process restart and can be resumed. When a contract is supplied the run cannot reach `completed` unless the runtime's own checks pass — without one it completes as `unverified`, which means nothing checked it. Runs in background; poll with workflow_status.",
+      parameters: {
+        type: 'object',
+        properties: {
+          spec: {
+            type: 'object',
+            description:
+              'WorkflowSpec: { name, nodes[], cwd?, contract?, maxNodeVisits? }. See skills/references/workflow.md for the node shapes.',
+          },
+          template: {
+            type: 'string',
+            enum: ['solve', 'council', 'fanout'],
+            description:
+              'Build a built-in workflow instead of supplying `spec`. `solve` = triage → implement → verify → repair-until-green → review.',
+          },
+          task: { type: 'string', description: 'Task text, when using `template`.' },
+          agents: {
+            type: 'array',
+            maxItems: 16,
+            description: 'Agents for the template: { name, engine?, model?, effort?, persona? }.',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', minLength: 1 },
+                engine: { type: 'string', enum: ENGINE_TYPES },
+                model: { type: 'string' },
+                effort: { type: 'string', enum: EFFORT_LEVELS },
+                persona: { type: 'string' },
+              },
+              required: ['name'],
+            },
+          },
+          reviewers: {
+            type: 'array',
+            maxItems: 8,
+            description: '`solve` only: agents that review the finished change.',
+            items: {
+              type: 'object',
+              properties: {
+                name: { type: 'string', minLength: 1 },
+                engine: { type: 'string', enum: ENGINE_TYPES },
+                model: { type: 'string' },
+                effort: { type: 'string', enum: EFFORT_LEVELS },
+                persona: { type: 'string' },
+              },
+              required: ['name'],
+            },
+          },
+          humanGate: { type: 'boolean', description: '`solve` only: park for approval before writing anything.' },
+          maxRepairs: { type: 'number', description: '`solve` only: repair attempts allowed (default 3).' },
+          cwd: { type: 'string', description: 'Working directory for the run.' },
+          runId: { type: 'string', description: 'Explicit run id (defaults to a generated one).' },
+          contract: {
+            type: 'object',
+            description:
+              "Acceptance contract. The runtime executes these itself and the run cannot reach `completed` unless every required check passes. Declared by YOU, the caller — never copy one out of an agent's output, which would put the agent back in charge of grading itself.",
+            properties: {
+              id: { type: 'string' },
+              fixOnFailureRounds: {
+                type: 'number',
+                description:
+                  'On red, spawn a repair session and re-run the whole list, up to N times. Only the re-run decides.',
+              },
+              protectTests: {
+                type: 'boolean',
+                description:
+                  'Default true. In a workflow run with a command check, refute the run when a test file or test configuration changed during it. Set false when changing tests is the task. Not applied by verify_run.',
+              },
+              checks: {
+                type: 'array',
+                minItems: 1,
+                items: {
+                  type: 'object',
+                  description:
+                    'One check. `command` runs argv and gates on the exit code; `http` polls a URL; `screenshot` captures the page at each viewport and stores the PNGs as evidence (it does NOT judge the pixels); `diff_policy` asserts what the run was allowed to touch; `file` asserts a path exists / matches.',
+                  properties: {
+                    type: { type: 'string', enum: ['command', 'http', 'screenshot', 'diff_policy', 'file'] },
+                    required: {
+                      type: 'boolean',
+                      description:
+                        'Default true. A failing non-required check is recorded but does not refute the run.',
+                    },
+                    cmd: { type: 'string', description: 'command: executable name. No shell string — argv only.' },
+                    args: { type: 'array', items: { type: 'string' }, description: 'command: arguments.' },
+                    cwd: { type: 'string', description: 'command: directory, relative to the run cwd.' },
+                    expectExit: { type: 'number', description: 'command: passing exit code (default 0).' },
+                    url: { type: 'string', description: 'http / screenshot: target URL.' },
+                    expectStatus: { type: 'number', description: 'http: expected status (default 200).' },
+                    viewports: {
+                      type: 'array',
+                      description: 'screenshot: [{ width, height, label? }].',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          width: { type: 'number' },
+                          height: { type: 'number' },
+                          label: { type: 'string' },
+                        },
+                        required: ['width', 'height'],
+                      },
+                    },
+                    maxFiles: { type: 'number', description: 'diff_policy: cap on changed files.' },
+                    forbidPaths: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      description: 'diff_policy: paths that must not be touched.',
+                    },
+                    requirePaths: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      description: 'diff_policy: at least one change must land under one of these.',
+                    },
+                    path: { type: 'string', description: 'file: path relative to the run cwd.' },
+                    exists: { type: 'boolean', description: 'file: default true; false asserts absence.' },
+                    matches: { type: 'string', description: 'file: regex the contents must match.' },
+                    timeoutMs: { type: 'number', description: 'Per-check wall clock.' },
+                  },
+                  required: ['type'],
+                },
+              },
+            },
+            required: ['checks'],
+          },
+        },
+        required: [],
+      },
+      execute: async (_id, args) => {
+        const cwd = sanitizeCwd(args.cwd as string | undefined);
+        let spec = args.spec as WorkflowSpec | undefined;
+        if (!spec) {
+          const template = (args.template as string) || 'solve';
+          const task = args.task as string;
+          if (!task) throw new Error('workflow_start needs `spec`, or `template` with `task`');
+          const agents = (args.agents as SolveArgs['scouts']) ?? [{ name: 'agent' }];
+          if (template === 'council') {
+            spec = councilWorkflow({ task, cwd, agents });
+          } else if (template === 'fanout') {
+            spec = fanoutWorkflow({ task, cwd, agents, synthesize: agents.length >= 2 });
+          } else {
+            spec = solveWorkflow({
+              task,
+              cwd,
+              scouts: agents,
+              reviewers: args.reviewers as SolveArgs['reviewers'],
+              humanGate: args.humanGate as boolean | undefined,
+              maxRepairs: args.maxRepairs as number | undefined,
+            });
+          }
+        }
+        const record = await getManager().workflowStart(spec, {
+          cwd,
+          runId: args.runId as string | undefined,
+          contract: args.contract,
+        });
+        return {
+          ok: true,
+          runId: record.runId,
+          workflow: record.workflow,
+          state: record.state,
+          nodes: Object.keys(record.nodes),
+          note: 'Workflow running in background. Poll with workflow_status.',
+        };
+      },
+    });
+
+    registerTool({
+      name: 'workflow_status',
+      description:
+        'Poll a workflow run. Returns state, per-node status, and the outcome: `verified` (a contract passed), `refuted` (it failed), or `unverified` (none was declared — nothing checked the work).',
+      parameters: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string' },
+          events: { type: 'number', description: 'Also return the last N events from the run log.' },
+        },
+        required: ['runId'],
+      },
+      execute: async (_id, args) => {
+        const record = getManager().workflowStatus(args.runId as string);
+        const limit = args.events as number | undefined;
+        return {
+          ok: true,
+          runId: record.runId,
+          workflow: record.workflow,
+          state: record.state,
+          outcome: record.outcome,
+          currentNode: record.currentNode,
+          evidenceId: record.evidenceId,
+          costUsd: record.costUsd,
+          error: record.error,
+          nodes: record.nodes,
+          consensusVotes: record.consensusVotes,
+          events: limit ? readKernelEvents(record.runId, limit) : undefined,
+        };
+      },
+    });
+
+    registerTool({
+      name: 'workflow_list',
+      description: 'List workflow runs on this machine, newest first. Survives restarts.',
+      parameters: {
+        type: 'object',
+        properties: {
+          workflow: { type: 'string' },
+          state: {
+            type: 'string',
+            enum: ['pending', 'running', 'awaiting_human', 'verifying', 'completed', 'failed', 'cancelled'],
+          },
+          limit: { type: 'number' },
+        },
+      },
+      execute: async (_id, args) => ({
+        ok: true,
+        runs: getManager().workflowList({
+          workflow: args.workflow as string | undefined,
+          state: args.state as RunState | undefined,
+          limit: (args.limit as number | undefined) ?? 25,
+        }),
+      }),
+    });
+
+    registerTool({
+      name: 'workflow_resume',
+      description:
+        'Re-attach to a workflow whose process died. Nodes already marked succeeded are not re-run; the node that was in flight is retried, because a half-finished node left no result to trust.',
+      parameters: {
+        type: 'object',
+        properties: {
+          runId: { type: 'string' },
+          agentCustomEngineRefs: {
+            type: 'object',
+            description:
+              'Per-agent custom-engine credentials, by name: { "<agent>": "<REF>" }. The orchestrator resolves each REF from CLAWO_CUSTOM_ENGINE_<REF> on its own host — the credentials themselves are never persisted with the run and never travel here. Required to resume a run whose agents used a custom engine.',
+            additionalProperties: { type: 'string' },
+          },
+        },
+        required: ['runId'],
+      },
+      execute: async (_id, args) => {
+        const refs = args.agentCustomEngineRefs as Record<string, string> | undefined;
+        const record = await getManager().workflowResume(args.runId as string, {
+          secrets: refs ? { agentCustomEngines: resolveSecretRefs(refs) } : undefined,
+        });
+        return { ok: true, runId: record.runId, state: record.state, currentNode: record.currentNode };
+      },
+    });
+
+    registerTool({
+      name: 'workflow_cancel',
+      description: 'Cancel a running workflow. The current node is asked to stop; the run ends in `cancelled`.',
+      parameters: { type: 'object', properties: { runId: { type: 'string' } }, required: ['runId'] },
+      execute: async (_id, args) => ({ ok: true, ...getManager().workflowCancel(args.runId as string) }),
+    });
+
+    registerTool({
+      name: 'workflow_steer',
+      description:
+        "Queue a correction for a running workflow. The text is prepended to the next agent node's prompt — corrections belong before the task, not after it.",
+      parameters: {
+        type: 'object',
+        properties: { runId: { type: 'string' }, text: { type: 'string' } },
+        required: ['runId', 'text'],
+      },
+      execute: async (_id, args) => ({
+        ok: true,
+        ...getManager().workflowSteer(args.runId as string, args.text as string),
+      }),
+    });
+
+    registerTool({
+      name: 'workflow_approve',
+      description:
+        'Answer a workflow parked at a human_gate node. A run parked before a server restart is resumed with the answer attached.',
+      parameters: {
+        type: 'object',
+        properties: { runId: { type: 'string' }, approved: { type: 'boolean' } },
+        required: ['runId', 'approved'],
+      },
+      execute: async (_id, args) => ({
+        ok: true,
+        ...(await getManager().workflowApprove(args.runId as string, args.approved as boolean)),
+      }),
+    });
+
+    registerTool({
+      name: 'verify_run',
+      description:
+        'Run an acceptance contract against a directory and return the evidence bundle. Use it to check work that did not come through a workflow — a plain session that edited a repo, say. The contract is yours; nothing is taken from agent output.',
+      parameters: {
+        type: 'object',
+        properties: {
+          cwd: { type: 'string', description: 'Directory to check.' },
+          baseSha: {
+            type: 'string',
+            description: 'Commit to measure the change against. Without it, diff_policy sees untracked files only.',
+          },
+          label: { type: 'string', description: 'Name for the stored evidence (defaults to a generated one).' },
+          contract: {
+            type: 'object',
+            description:
+              "Acceptance contract. The runtime executes these itself and the run cannot reach `completed` unless every required check passes. Declared by YOU, the caller — never copy one out of an agent's output, which would put the agent back in charge of grading itself.",
+            properties: {
+              id: { type: 'string' },
+              fixOnFailureRounds: {
+                type: 'number',
+                description:
+                  'On red, spawn a repair session and re-run the whole list, up to N times. Only the re-run decides.',
+              },
+              protectTests: {
+                type: 'boolean',
+                description:
+                  'Default true. In a workflow run with a command check, refute the run when a test file or test configuration changed during it. Set false when changing tests is the task. Not applied by verify_run.',
+              },
+              checks: {
+                type: 'array',
+                minItems: 1,
+                items: {
+                  type: 'object',
+                  description:
+                    'One check. `command` runs argv and gates on the exit code; `http` polls a URL; `screenshot` captures the page at each viewport and stores the PNGs as evidence (it does NOT judge the pixels); `diff_policy` asserts what the run was allowed to touch; `file` asserts a path exists / matches.',
+                  properties: {
+                    type: { type: 'string', enum: ['command', 'http', 'screenshot', 'diff_policy', 'file'] },
+                    required: {
+                      type: 'boolean',
+                      description:
+                        'Default true. A failing non-required check is recorded but does not refute the run.',
+                    },
+                    cmd: { type: 'string', description: 'command: executable name. No shell string — argv only.' },
+                    args: { type: 'array', items: { type: 'string' }, description: 'command: arguments.' },
+                    cwd: { type: 'string', description: 'command: directory, relative to the run cwd.' },
+                    expectExit: { type: 'number', description: 'command: passing exit code (default 0).' },
+                    url: { type: 'string', description: 'http / screenshot: target URL.' },
+                    expectStatus: { type: 'number', description: 'http: expected status (default 200).' },
+                    viewports: {
+                      type: 'array',
+                      description: 'screenshot: [{ width, height, label? }].',
+                      items: {
+                        type: 'object',
+                        properties: {
+                          width: { type: 'number' },
+                          height: { type: 'number' },
+                          label: { type: 'string' },
+                        },
+                        required: ['width', 'height'],
+                      },
+                    },
+                    maxFiles: { type: 'number', description: 'diff_policy: cap on changed files.' },
+                    forbidPaths: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      description: 'diff_policy: paths that must not be touched.',
+                    },
+                    requirePaths: {
+                      type: 'array',
+                      items: { type: 'string' },
+                      description: 'diff_policy: at least one change must land under one of these.',
+                    },
+                    path: { type: 'string', description: 'file: path relative to the run cwd.' },
+                    exists: { type: 'boolean', description: 'file: default true; false asserts absence.' },
+                    matches: { type: 'string', description: 'file: regex the contents must match.' },
+                    timeoutMs: { type: 'number', description: 'Per-check wall clock.' },
+                  },
+                  required: ['type'],
+                },
+              },
+            },
+            required: ['checks'],
+          },
+        },
+        required: ['cwd', 'contract'],
+      },
+      execute: async (_id, args) => {
+        const bundle = await getManager().verifyRun({
+          cwd: sanitizeCwd(args.cwd as string)!,
+          contract: args.contract,
+          baseSha: args.baseSha as string | undefined,
+          label: args.label as string | undefined,
+        });
+        return { ok: true, ...bundle };
+      },
+    });
+
     // ─── Tool: council_start ────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'council_start',
       description:
         'Start a multi-agent council that collaborates on a task using git worktree isolation, round-based execution, and consensus voting. Agents can use different engines (Claude, Codex) and models.',
@@ -1159,7 +1657,7 @@ const plugin = {
                 customEngine: { type: 'object', description: 'Custom engine config (when engine="custom")' },
                 effort: {
                   type: 'string',
-                  enum: ['low', 'medium', 'high', 'xhigh', 'max', 'auto'],
+                  enum: EFFORT_LEVELS,
                   description: 'Per-agent reasoning effort.',
                 },
                 ultracode: {
@@ -1172,7 +1670,7 @@ const plugin = {
           },
           maxRounds: { type: 'number', description: 'Max collaboration rounds (default 15)' },
           agentTimeoutMs: { type: 'number', description: 'Per-agent timeout in ms (default 1800000)' },
-          maxTurnsPerAgent: { type: 'number', description: 'Max tool turns per agent per round (default 30)' },
+          maxTurnsPerAgent: { type: 'number', description: 'Max tool turns per agent per round (default 50)' },
           maxBudgetUsd: { type: 'number', description: 'Max API spend per agent (USD)' },
           defaultPermissionMode: {
             type: 'string',
@@ -1198,7 +1696,7 @@ const plugin = {
           defaultPermissionMode: args.defaultPermissionMode as CouncilConfig['defaultPermissionMode'],
         };
 
-        const session = getManager().councilStart(args.task as string, config);
+        const session = await getManager().councilStart(args.task as string, config);
         return {
           ok: true,
           ...session,
@@ -1210,7 +1708,7 @@ const plugin = {
 
     // ─── Tool: council_status ───────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'council_status',
       description: 'Get the status of a running council session',
       parameters: {
@@ -1227,7 +1725,7 @@ const plugin = {
 
     // ─── Tool: council_abort ────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'council_abort',
       description: 'Abort a running council, stopping all agent sessions',
       parameters: {
@@ -1243,7 +1741,7 @@ const plugin = {
 
     // ─── Tool: council_inject ───────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'council_inject',
       description:
         'Inject a user message into the next round of a running council. The message will be appended to all agent prompts in the next round.',
@@ -1263,7 +1761,7 @@ const plugin = {
 
     // ─── Tool: council_review ──────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'council_review',
       description:
         'Review a completed council session. Returns a structured report of all changed files, branches, worktrees, plan.md status, review files, and agent summaries. Does not modify any state — purely informational. Use this before deciding to accept or reject.',
@@ -1280,7 +1778,7 @@ const plugin = {
 
     // ─── Tool: council_accept ──────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'council_accept',
       description:
         'Accept and finalize council work. Cleans up all council scaffolding: removes worktrees, deletes council/* branches, removes plan.md and reviews/ directory. Only call after reviewing with council_review.',
@@ -1297,7 +1795,7 @@ const plugin = {
 
     // ─── Tool: council_reject ──────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'council_reject',
       description:
         'Reject council work and provide feedback. Rewrites plan.md with rejection feedback and commits it. Does NOT delete any worktrees or branches — the council can be restarted to retry. Use this when the council output is incomplete or broken.',
@@ -1320,7 +1818,7 @@ const plugin = {
 
     // ─── Tool: session_send_to ────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_send_to',
       description:
         'Send a cross-session message from one session to another. If the target is idle, the message is delivered immediately. If busy, it is queued in the inbox for later delivery. Use "*" as target to broadcast to all other sessions.',
@@ -1347,7 +1845,7 @@ const plugin = {
 
     // ─── Tool: session_inbox ──────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_inbox',
       description: 'Read inbox messages for a session. Returns unread messages by default.',
       parameters: {
@@ -1369,7 +1867,7 @@ const plugin = {
 
     // ─── Tool: session_deliver_inbox ──────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'session_deliver_inbox',
       description:
         'Deliver all queued inbox messages to an idle session. Call this when a session finishes a task to process waiting messages.',
@@ -1386,7 +1884,7 @@ const plugin = {
 
     // ─── Tool: ultraplan_start ──────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'ultraplan_start',
       description:
         'Start an Ultraplan session: a dedicated Opus planning session that explores your project for up to 30 minutes and produces a detailed implementation plan. Runs in background.',
@@ -1401,7 +1899,7 @@ const plugin = {
         required: ['task'],
       },
       execute: async (_id, args) => {
-        const result = getManager().ultraplanStart(args.task as string, {
+        const result = await getManager().ultraplanStart(args.task as string, {
           cwd: sanitizeCwd(args.cwd as string | undefined),
           model: args.model as string | undefined,
           timeout: args.timeout as number | undefined,
@@ -1412,7 +1910,7 @@ const plugin = {
 
     // ─── Tool: ultraplan_status ─────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'ultraplan_status',
       description: 'Get the status of an Ultraplan session. Returns the plan text when completed.',
       parameters: {
@@ -1429,10 +1927,10 @@ const plugin = {
 
     // ─── Tool: ultrareview_start ────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'ultrareview_start',
       description:
-        'Start an Ultrareview: a fleet of bug-hunting agents (5-20) that review your codebase from different angles in parallel. Each agent specializes in a different area (security, performance, logic, types, etc.). Runs in background.',
+        'Start an Ultrareview: 1-20 read-only reviewer agents (default 5) that review your codebase in parallel, each from a different angle (security, performance, logic, types, etc.), merged into one report by a read-only synthesis pass. Runs in background.',
       parameters: {
         type: 'object',
         properties: {
@@ -1443,18 +1941,18 @@ const plugin = {
           focus: { type: 'string', description: 'Review focus area (default: bugs + security + quality)' },
           engines: {
             type: 'array',
-            // 'custom' is deliberately excluded: ultrareview spawns reviewer
-            // sessions without a customEngine config, so a custom reviewer
-            // would fail at session start.
-            items: { type: 'string', enum: ENGINE_TYPES.filter((e) => e !== 'custom') },
+            // Excluded: 'custom', because ultrareview spawns reviewers without a
+            // customEngine config; and 'grok', because reviewers run read-only
+            // and grok refuses a read-only session rather than approximate one.
+            items: { type: 'string', enum: ENGINE_TYPES.filter((e) => e !== 'custom' && e !== 'grok') },
             description:
-              'Engines to round-robin reviewers across (default ["claude"]). Reviewers fan out in parallel; per-agent failures are isolated.',
+              'Engines to round-robin reviewers across (default ["claude"]). Every reviewer runs read-only (sandboxMode read-only), so grok and custom are not accepted. Reviewers fan out in parallel; per-agent failures are isolated.',
           },
         },
         required: ['cwd'],
       },
       execute: async (_id, args) => {
-        const result = getManager().ultrareviewStart(sanitizeCwd(args.cwd as string)!, {
+        const result = await getManager().ultrareviewStart(sanitizeCwd(args.cwd as string)!, {
           agentCount: args.agentCount as number | undefined,
           maxDurationMinutes: args.maxDurationMinutes as number | undefined,
           model: args.model as string | undefined,
@@ -1467,7 +1965,7 @@ const plugin = {
 
     // ─── Tool: ultrareview_status ───────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'ultrareview_status',
       description: 'Get the status of an Ultrareview. Returns all findings when completed.',
       parameters: {
@@ -1488,7 +1986,7 @@ const plugin = {
     // Starting a run only launches the Planner — Coder and Reviewer are
     // spawned later by the Planner once the user approves the plan (S3).
 
-    api.registerTool({
+    registerTool({
       name: 'autoloop_start',
       description:
         'Start a v2 autoloop run in chat mode. Planner, Coder, and Reviewer default to Claude (opus/sonnet/sonnet) but each role can use a different engine/model. Coder and Reviewer are spawned later by the Planner after plan approval. Returns a run_id and the Planner session name.',
@@ -1505,12 +2003,14 @@ const plugin = {
             type: 'string',
             description: 'Planner model (default: opus for Claude; engine default otherwise)',
           },
+          planner_effort: { type: 'string', enum: EFFORT_LEVELS, description: 'Fixed Planner reasoning effort' },
           planner_custom_engine: CUSTOM_ENGINE_SCHEMA,
           coder_engine: { type: 'string', enum: ENGINE_TYPES, description: 'Default Coder engine (default: claude)' },
           coder_model: {
             type: 'string',
             description: 'Default Coder model (default: sonnet for Claude; engine default otherwise)',
           },
+          coder_effort: { type: 'string', enum: EFFORT_LEVELS, description: 'Fixed Coder reasoning effort' },
           coder_custom_engine: CUSTOM_ENGINE_SCHEMA,
           reviewer_engine: {
             type: 'string',
@@ -1521,25 +2021,48 @@ const plugin = {
             type: 'string',
             description: 'Default Reviewer model (default: sonnet for Claude; engine default otherwise)',
           },
+          reviewer_effort: { type: 'string', enum: EFFORT_LEVELS, description: 'Fixed Reviewer reasoning effort' },
           reviewer_custom_engine: CUSTOM_ENGINE_SCHEMA,
-          send_timeout_ms: { type: 'number', description: 'Per-message wall-clock cap (default 600000 = 10 min)' },
+          send_timeout_ms: {
+            ...AUTOLOOP_TIMEOUT_SCHEMA.sendTimeoutMs,
+            description: 'Per-agent send wall-clock cap in milliseconds (default 600000; inclusive range 5000–7200000)',
+          },
+          activity_lease_ms: {
+            ...AUTOLOOP_TIMEOUT_SCHEMA.activityLeaseMs,
+            description:
+              'Inactivity lease in milliseconds, renewed by qualified progress (default 1800000; inclusive range 60000–7200000)',
+          },
+          autoloop_hard_timeout_ms: {
+            ...AUTOLOOP_TIMEOUT_SCHEMA.autoloopHardTimeoutMs,
+            description:
+              'Absolute non-renewable run deadline in milliseconds (default 86400000; inclusive range 600000–259200000)',
+          },
         },
         required: ['run_id', 'workspace'],
       },
       execute: async (_id, args) => {
+        const timeoutConfig = {
+          sendTimeoutMs: args.send_timeout_ms as number | undefined,
+          activityLeaseMs: args.activity_lease_ms as number | undefined,
+          autoloopHardTimeoutMs: args.autoloop_hard_timeout_ms as number | undefined,
+        };
+        validateAutoloopTimeoutConfig(timeoutConfig);
         const result = await getManager().autoloopStart({
           runId: args.run_id as string,
           workspace: sanitizeCwd(args.workspace as string)!,
           plannerEngine: args.planner_engine as EngineType | undefined,
           plannerModel: args.planner_model as string | undefined,
+          plannerEffort: args.planner_effort as EffortLevel | undefined,
           plannerCustomEngine: args.planner_custom_engine as CustomEngineConfig | undefined,
           coderEngine: args.coder_engine as EngineType | undefined,
           coderModel: args.coder_model as string | undefined,
+          coderEffort: args.coder_effort as EffortLevel | undefined,
           coderCustomEngine: args.coder_custom_engine as CustomEngineConfig | undefined,
           reviewerEngine: args.reviewer_engine as EngineType | undefined,
           reviewerModel: args.reviewer_model as string | undefined,
+          reviewerEffort: args.reviewer_effort as EffortLevel | undefined,
           reviewerCustomEngine: args.reviewer_custom_engine as CustomEngineConfig | undefined,
-          sendTimeoutMs: args.send_timeout_ms as number | undefined,
+          ...timeoutConfig,
         });
         return {
           ok: true,
@@ -1551,7 +2074,7 @@ const plugin = {
 
     // ─── Tool: autoloop_chat ─────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'autoloop_chat',
       description:
         "Send a chat message to the Planner of a v2 autoloop run. Returns the Planner's natural-language reply. Blocking: resolves after the Planner finishes its turn.",
@@ -1571,7 +2094,7 @@ const plugin = {
 
     // ─── Tool: autoloop_status ───────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'autoloop_status',
       description: 'Get current state of a v2 autoloop run (status, iter, push count, subagents_spawned).',
       parameters: {
@@ -1588,7 +2111,7 @@ const plugin = {
 
     // ─── Tool: autoloop_list ─────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'autoloop_list',
       description: 'List all v2 autoloop runs in this manager process.',
       parameters: { type: 'object', properties: {} },
@@ -1600,7 +2123,7 @@ const plugin = {
 
     // ─── Tool: autoloop_reset_agent ──────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'autoloop_reset_agent',
       description:
         'Reset a single subagent (Coder or Reviewer) on a v2 run. Stops its persistent session; the next directive/review_request will re-prime from the system prompt + ledger artifacts. Use when an agent has drifted (repeated rejects, hallucinated context, token bloat). Planner reset requires force=true because it discards chat history with the user.',
@@ -1633,7 +2156,7 @@ const plugin = {
 
     // ─── Tool: autoloop_stop ─────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'autoloop_stop',
       description: 'Terminate a v2 autoloop run. Stops Planner (and Coder/Reviewer once spawned).',
       parameters: {
@@ -1653,7 +2176,7 @@ const plugin = {
 
     // ─── ultraapp (read-only) ─────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_list',
       description:
         'List all ultraapp runs (interview/build/done) with title, mode, and timestamps. Read-only — to start a new run, open the Forge dashboard tab.',
@@ -1665,7 +2188,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_get',
       description: 'Get the AppSpec, chat history, and state for one ultraapp run. Pass `runId` from ultraapp_list.',
       parameters: {
@@ -1685,7 +2208,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_status',
       description: 'Get the run state (mode, failure reason if any) for one ultraapp run. Cheap; no chat or spec data.',
       parameters: {
@@ -1702,7 +2225,7 @@ const plugin = {
 
     // ─── ultraapp (write) ─────────────────────────────────────────────────
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_new',
       description:
         'Start a new ultraapp run. Spawns the interview Claude Opus session; the first question lands on the SSE stream / next ultraapp_get call. Returns the runId.',
@@ -1714,7 +2237,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_answer',
       description:
         'Submit an answer to the current interview question. Either pick `value` (one of the option values from the latest question) or pass `freeform` text — both can be used together for "selected X with caveat".',
@@ -1737,7 +2260,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_add_file',
       description:
         'Reference a local example file by absolute path (under $HOME or /tmp; symlinks and dotfiles rejected). Use this to attach reference inputs the interview can extract metadata from. For binary uploads from a browser, use the dashboard.',
@@ -1759,7 +2282,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_spec_edit',
       description:
         'Manually edit the AppSpec via a JSON Patch (RFC 6902). Use sparingly — the interview engine produces and updates the spec automatically. Useful to correct a slot before clicking build.',
@@ -1782,7 +2305,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_build_start',
       description:
         'Enqueue a build for the run. Builds run serially. Watch ultraapp_status for transitions: queued → building → build-complete (or → deploying → done if a router is wired).',
@@ -1798,7 +2321,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_build_cancel',
       description:
         'Cancel a queued or in-flight build. Best-effort for in-flight; the worker is expected to honour its own cancellation signal (v0.2 only emits the event).',
@@ -1814,7 +2337,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_feedback',
       description:
         'Submit a done-mode feedback message (after the run reaches `done`). The text is classified by Haiku into cosmetic / spec-delta / structural and routed: cosmetic runs the patcher (Opus diff + validate + auto-revert + version snapshot); spec-delta flips the run back to `interview` with a focused bootstrap; structural posts a "start fresh" suggestion.',
@@ -1833,7 +2356,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_promote_version',
       description:
         "Atomically swap which previously-built version is currently deployed. Stops the old container, starts the target version's container, updates the router map. Requires a router to be wired (see clawo serve).",
@@ -1852,7 +2375,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_start_container',
       description:
         'Start the deployed container for a run (e.g., after `ultraapp_stop_container` or after orchestrator restart with a stopped container). Re-registers the slug on the router.',
@@ -1868,7 +2391,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_stop_container',
       description:
         'Stop the deployed container and deregister the slug from the router. URL returns 404 until ultraapp_start_container.',
@@ -1884,7 +2407,7 @@ const plugin = {
       },
     });
 
-    api.registerTool({
+    registerTool({
       name: 'ultraapp_delete',
       description:
         'Delete a run completely: stops the container, removes the image, deregisters the slug, and removes the on-disk run dir at ~/.claw-orchestrator/ultraapps/<runId>/. Irreversible.',

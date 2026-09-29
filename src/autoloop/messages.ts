@@ -56,6 +56,16 @@ export interface ReviewVerdictPayload {
   decision: 'advance' | 'hold' | 'rollback';
   metric: number | null;
   audit_notes: string;
+  /**
+   * Set only when an acceptance contract ran and passed. This is what makes
+   * `on_target_hit` fireable: before it existed the policy key was declared,
+   * defaulted and whitelisted for updates, but had no firing site anywhere —
+   * autoloop had no way to notice it had succeeded, only ways to notice it was
+   * failing. Absent means no contract was configured, not that it failed.
+   */
+  accepted?: boolean;
+  /** Evidence bundle id backing `accepted`. */
+  evidence_id?: string;
 }
 
 export interface IterDonePayload {
@@ -98,6 +108,23 @@ export interface PhaseErrorPayload {
   error: string;
 }
 
+/**
+ * Recoverable record emitted when an agent turn reaches its configured send
+ * deadline. The dispatch identity is stable for the original logical message,
+ * so a later resume can refer to this exact turn without guessing or replaying
+ * it implicitly.
+ */
+export interface SendTimeoutPayload {
+  status: 'awaiting_resume';
+  dispatch_id: string;
+  agent: 'planner' | 'coder' | 'reviewer';
+  message_id: string;
+  message_type: AutoloopMessageType;
+  iter: number;
+  timeout_ms: number;
+  error: string;
+}
+
 // ─── Discriminated union ─────────────────────────────────────────────────────
 
 export type AutoloopMessageType =
@@ -112,7 +139,8 @@ export type AutoloopMessageType =
   | 'pause'
   | 'resume'
   | 'terminate'
-  | 'phase_error';
+  | 'phase_error'
+  | 'send_timeout';
 
 type PayloadMap = {
   chat: UserChatPayload;
@@ -127,6 +155,7 @@ type PayloadMap = {
   resume: ResumePayload;
   terminate: TerminatePayload;
   phase_error: PhaseErrorPayload;
+  send_timeout: SendTimeoutPayload;
 };
 
 export type PayloadFor<T extends AutoloopMessageType> = PayloadMap[T];
@@ -157,6 +186,9 @@ const ALLOWED_ROUTES: ReadonlyArray<readonly [AutoloopRole, AutoloopRole, Autolo
   ['coder', 'runner', 'phase_error'],
   ['reviewer', 'runner', 'phase_error'],
   ['planner', 'runner', 'phase_error'],
+  ['coder', 'runner', 'send_timeout'],
+  ['reviewer', 'runner', 'send_timeout'],
+  ['planner', 'runner', 'send_timeout'],
 ];
 
 export class AutoloopRoutingError extends Error {
@@ -221,6 +253,8 @@ export const Msg = {
   terminate: (iter: number, payload: TerminatePayload) => envelope(iter, 'planner', 'runner', 'terminate', payload),
   phaseError: (iter: number, payload: PhaseErrorPayload) =>
     envelope(iter, payload.agent, 'runner', 'phase_error', payload),
+  sendTimeout: (iter: number, payload: SendTimeoutPayload) =>
+    envelope(iter, payload.agent, 'runner', 'send_timeout', payload),
 };
 
 // ─── Wire serialisation (for InboxManager transport) ─────────────────────────

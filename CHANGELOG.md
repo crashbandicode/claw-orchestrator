@@ -5,6 +5,1585 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.6.0-memento.1] - 2026-09-29
+
+### Changed
+
+- Merge upstream 7.6.0 and its durable workflow kernel while preserving Memento lifecycle events, council identity, native Windows launch helpers, lightweight installation, and zero-as-unlimited session capacity.
+- Add explicit Cursor routes for Grok 4.7, Composer 2.5 (standard/fast), and Gemini 3.8 Flash High. Preserve complete NVIDIA gateway IDs when routing to OpenCode.
+
+### Fixed
+
+- Send Codex app-server session and turn reasoning effort through its native protocol, including none/minimal/max/ultra.
+- Select Cursor effort from its installed model catalog; fail clearly when the requested family/effort is unavailable.
+- Expose OpenCode provider-specific effort variants, including default, with a checked gateway configuration reference. Use native Anthropic Messages for adaptive Claude thinking and OpenAI Responses for reasoning models.
+- Emit Memento terminal workflow status when the upstream kernel actually finishes a run; retain child identity and unlimited fanout behavior.
+
+
+## [7.6.0] - 2026-09-29
+
+### Added
+
+- **Unified optional reasoning-effort bindings for orchestrated agents.** Fan-out agents and
+  built-in workflow agents/reviewers now accept per-agent `effort`, matching Council's existing
+  support. Autoloop accepts fixed `planner_effort`, `coder_effort`, and `reviewer_effort`; these
+  survive durable resume and role reset, and Planner engine/model overrides cannot replace them.
+  Omitting effort preserves existing defaults and older stored runs remain compatible.
+
+### Fixed
+
+- **Fan-out personas no longer replace the shared task.** Agents can now receive optional
+  `persona` role instructions composed before the common task, while a non-empty per-agent
+  `prompt` retains its documented full-override behavior. Both fields remain distinct in the
+  durable workflow spec, so resumed fan-outs reproduce the same message.
+
+### Changed
+
+- **The `sonnet` alias resolves to Claude Sonnet 5.5.** Claude Code 2.1.284 made `claude-sonnet-5-5`
+  the model `--model sonnet` runs, so the alias moved with it and the model is registered at its
+  published rates ($2/$10 per Mtok, $0.20 cache reads, 1M-token context). These match Sonnet 5, so
+  no cost figure changes; sessions started with `sonnet` now report the model they really run.
+  `claude-sonnet-5` stays selectable by id.
+- Tested with Claude Code 2.1.284, Codex 0.159.0, agy 1.2.13, grok 1.0.44 and OpenCode 1.18.33.
+
+## [7.5.6] - 2026-09-26
+
+### Fixed
+
+- **An agy turn that started a background task no longer fails as a timeout.** Since agy 1.2.9 a
+  headless run whose agent started a background task — a dev server, a watcher — stays open until
+  its `--print-timeout` deadline, and prints the reply only when it exits. The wrapper set that
+  deadline 5s after its own timer, so it killed the run first and reported a finished turn as a
+  timeout. agy's deadline is now set just inside the send timeout, so agy ends the background task
+  and delivers the reply. A run that reaches the deadline while the agent is still working is
+  reported as a timeout: agy marks it `SUCCESS` with a partial reply and says otherwise only on
+  stderr.
+- **An effort-qualified agy model is priced as its base model.** A session on
+  `gemini-3.1-pro-high` was not found in the model registry and fell back to the Gemini Flash rates;
+  it is now priced as `gemini-3.1-pro`.
+
+### Changed
+
+- Tested with Claude Code 2.1.283, Codex 0.157.1 and agy 1.2.11.
+
+## [7.5.5] - 2026-09-24
+
+### Fixed
+
+- **A resumed workflow continues at the node it was on.** Resume picked the first `pending` node in
+  declaration order, and a node on a branch the run never took stays `pending` for good — so a run
+  that died inside one node could come back at a contingency `human_gate` declared above it, park
+  there, and re-run earlier nodes once approved. The resume point now comes from the run record: the
+  node that was running or waiting at a gate; the successor of a node that finished just before the
+  process died (a router is evaluated again, since its choice is not recorded); and the first node
+  for a run that has not started, or one restarted with `restart`. Reported by @dhroco in #117.
+- **Approving a gate works after a restart.** A run parked at a `human_gate` is on disk but not live
+  once the server restarts, and `workflow_approve` returned `{ answered: false }` without doing
+  anything until the run was resumed by hand. The answer is now attached to the gate the run was
+  parked at and the run is resumed; it takes the answer when it reaches that gate. (#117)
+- **Steers survive a restart.** The steer queue lived in memory, so a steer that had arrived but not
+  been taken was lost on a restart, although the run's log recorded it. A node now records how many
+  steers it held when it finishes, and on resume every steer no finished node consumed is queued
+  again — including one held by a node that died, which goes to that node's retry. (#117)
+
+## [7.5.4] - 2026-09-24
+
+### Fixed
+
+- **Ultrareview reviewers are read-only on every engine.** They were started with `permissionMode:
+'plan'`, which constrains Claude only, so a reviewer assigned to another engine through `engines`
+  ran under that engine's default sandbox — for Codex, one that can write — in the project directory
+  it was reviewing. Reviewers now also get `sandboxMode: 'read-only'`, which reaches the session
+  through the fan-out, and `ultrareview_start` refuses `grok`, which declines a read-only session
+  rather than approximating one.
+- **A grok session on the OpenAI-compatible endpoint is replayed like the other resuming engines.**
+  A grok session whose first turn failed before grok returned a session id counted as live, so the
+  next turn went out without the conversation before it. It now waits for the id, as codex, agy
+  and opencode already did.
+- **Browsers can send `X-Session-Id` and `X-Session-Reset` cross-origin.** The CORS preflight now
+  allows both headers, which the OpenAI-compatible endpoint uses to key and reset a conversation.
+- **`session_start` declares `restricted` and `ignoreUserConfig`**, so a host that builds calls from
+  the tool schema can pass them.
+- **The ACP model selector labels Grok Build and no longer offers the legacy Cursor engine.**
+- **Tool and CLI descriptions match the code:** they list the current engines, `council_start`
+  gives `maxTurnsPerAgent`'s real default (50), and `ultrareview_start` says 1–20 reviewers.
+- **The reference docs match the code.** Among the corrections: the embedded server has
+  authentication on by default; the ultraapp tools take `runId`; `clawo session-start` lists only
+  flags it has; the rate limit is 300 requests per minute; ultrareview is a fan-out of read-only
+  reviewers rather than a council; `maxTurnsPerAgent` for a council defaults to 50; the autoloop
+  quick start targets `clawo serve`; and an autoloop acceptance contract is library-level only.
+
+### Changed
+
+- **Autoloop's email fallback runs the script named by `AUTOLOOP_EMAIL_SCRIPT`**, as
+  `bash "$AUTOLOOP_EMAIL_SCRIPT" -s "<subject>"` with the body on stdin. Unset, the email tier is
+  skipped like the WeChat and WhatsApp tiers; set to a missing file, it logs a warning.
+
+## [7.5.3] - 2026-09-23
+
+### Changed
+
+- **Registered Claude Opus 5.5, GPT-6 Sol and GPT-6 Luna, and moved the `opus` alias.** Claude Code
+  2.1.280 made Opus 5.5 the model `--model opus` resolves to (confirmed against the binary), and
+  Codex 0.156.1 added both new GPT-6 tiers. Opus 5.5 breaks the flat Opus pricing this registry had
+  relied on: $4/$20 per Mtok against Opus 5's $5/$25, and its cache reads are 5% of input rather
+  than the usual 10%. Every alias session — the autoloop Planner, the ultraplan default — was being
+  priced at the older, higher rate, which is the number `maxBudgetUsd` gates on. All figures come
+  from the vendors' published price tables, and each has a reverse assertion in the tests.
+
+### Fixed
+
+- **An Autoloop left idle no longer fails its next message.** Past `sessionTtlMinutes` the manager
+  evicts the role sessions while the dispatcher still believed them started, so the next message
+  failed with "Session not found". The Planner, Coder and Reviewer are now started again under the
+  same name, which resumes the persisted conversation. From @caoxuandungecom in #110.
+
+- **Stopping a one-shot session on Windows ends the whole process tree.** `kill` ended only the
+  process it was given and left the engine CLI's own children running. Session cleanup, and an
+  Antigravity turn killed by its timeout, now use `taskkill /T /F`, bounded at five seconds so a
+  hung taskkill cannot stall the server, with `kill` as the fallback. (#110)
+
+- **Autoloop runs that are not running in this process say so.** `GET /autoloop/<id>/state`
+  returns `live`. An event stream for a run that has already ended closes at once instead of
+  staying open with nothing left to send, and tells `EventSource` not to reconnect.
+  `POST /autoloop/<id>/chat` to a stored but idle run names `POST /autoloop/<id>/resume`, while an
+  unknown id stays plain "not found". The dashboard marks such a run inactive, disables its input,
+  and offers Resume — for a paused run, only when it is paused on a timed-out send, the one pause
+  resume acts on. (#110)
+
+## [7.5.2] - 2026-09-22
+
+### Fixed
+
+- **Antigravity empty-response errors now name the denied tools.** When a turn fails with an
+  empty response after a tool permission denial, the error message includes the denied tool
+  names parsed from the log. A name is echoed only when it is shaped like a tool identifier; the
+  generic message is kept when none is, so the error still carries no free text from agy's log.
+
+- **`appendSystemPrompt` now reaches Codex, Antigravity and OpenCode sessions.** None of the three
+  CLIs has a system-prompt flag, and the option was dropped for them without a word — on the
+  `session_start` tool, and for every council seat on those engines, whose whole charter travels
+  this way: identity, persona, the claim protocol, the report format, and "never push". It now leads
+  the first message of a conversation, and is not repeated on later turns or on a resumed
+  conversation, which already carries it. A user turn binds less firmly than a system prompt; it is
+  the strongest channel these CLIs offer. `codex-app` does the same on a fresh thread. Claude Code
+  (`--append-system-prompt`) and Grok (`--rules`) are unchanged.
+
+- **Council no longer writes `.claude/CLAUDE.md` into its worktrees.** Each seat's identity and
+  workspace boundary lived in a generated `<worktree>/.claude/CLAUDE.md` — a file only Claude Code
+  reads, which replaced a project's own `.claude/CLAUDE.md` inside the worktree, and which an agent's
+  `git add -A` could commit into the project. The workspace boundary is now part of the charter
+  (`configs/council-system-prompt.md`, with a new `{{projectDir}}` placeholder), which reaches every
+  engine.
+
+## [7.5.1] - 2026-09-20
+
+Weekly engine sweep: Claude Code 2.1.274 → 2.1.278, Codex 0.154.0 → 0.155.1, Antigravity 1.2.5 →
+1.2.7; Grok Build and OpenCode were already current. Every live turn passed through the real
+wrapper, the ACP and MCP handshakes are clean, and the model registry matched both vendors'
+published prices (26 models, no drift). No engine's flag surface changed.
+
+### Fixed
+
+- **A resumed Claude session no longer charges its whole history to the next turn.** Claude Code
+  2.1.277 made a headless process started with `--resume` restore the totals the resumed session
+  saved at exit, where it used to begin at zero. The wrapper reads `total_cost_usd` as a running
+  total and advances spend by the difference, so with no earlier figure to subtract it billed the
+  first report of a resumed process in full. Measured on 2.1.278: a turn reported $0.363044, and
+  the same session resumed in a new process reported $0.386463 for a turn whose own usage was
+  $0.023419 — a 16x over-report, on every model switch and every session recovered after a
+  restart, against the number `maxBudgetUsd` gates on. A resumed process's first report is now
+  taken as a baseline, and the turn carrying it keeps the registry estimate.
+
+### Changed
+
+- **Antigravity's headless timeout is now entirely ours to set.** 1.2.6 changed the default for a
+  `-p` run from five minutes to unlimited. The wrapper already derives `--print-timeout` from the
+  send timeout, so no behaviour changes here — but that flag is now the only bound on a stuck turn
+  rather than a tightening of one agy would have applied anyway.
+
+## [7.5.0] - 2026-09-17
+
+Weekly engine sweep: Claude Code 2.1.271 → 2.1.274, Antigravity 1.2.2 → 1.2.5, Grok Build 1.0.30 →
+1.0.34; Codex and OpenCode were already current. Every live turn passed through the real wrapper and
+the model registry matched both vendors' published prices. Most of this release fixes accounting and
+concurrency that the run ledger and the session cap had been getting wrong, and it adds protection for
+the tests an acceptance contract runs.
+
+### Added
+
+- **Protected tests.** In a workflow run, a contract with a `command` check now refutes the run when
+  something that decides what its tests do changed during it — a loosened assertion, a deleted test,
+  a `conftest.py` added beside existing tests, or a script the checks run pointed at something that
+  exits 0. The run records its tests when it starts by hashing their bytes, and the required check
+  `protected-tests` compares against that record before the other checks run, so a developer's
+  uncommitted test edits stay theirs and a test that restores itself is still caught. Adding tests,
+  packages and unrelated scripts stays allowed, installed dependencies are not considered, and
+  `"protectTests": false` opts out when changing tests is the task. Tests inside source files, test
+  settings in general config files, files hidden by `.gitignore`, and source that special-cases the
+  test environment are not caught.
+
+### Fixed
+
+- **The session cap held only for sessions started one at a time.** It was checked against the live
+  sessions, and a session joins them once its process is up, so every start launched together — a
+  fan-out's agents, a council round — passed the check: eight agents meant eight engine processes
+  whatever `maxConcurrentSessions` said. A start in flight now holds its slot. Fan-out and Council run
+  no more agents at once than there are free slots and queue the rest, so a run wider than the cap
+  waits rather than failing. Because queued agents take longer in total, `fanout` and `council` nodes
+  gained `agentTimeoutMs`, and `fanout_start`, `ultrareview_start` and `council_start` size the node
+  timeout for the worst case instead of reusing one agent's timeout, which had also been cutting
+  multi-round councils short; the built-in `fanout`, `council` and `solve` workflows get the same
+  bounds. An aborted or timed-out fan-out starts none of the agents still waiting, and a timed-out
+  council — including UltraApp's synthesis council, which a cancelled build now reaches — opens no
+  further round.
+- **Claude Code tool calls were reported twice.** Each `tool_use` block arrives on
+  `content_block_start` with an empty input and again as an `assistant` event with its input, and both
+  were counted and emitted: `toolCalls` doubled, and ACP clients received two `tool_call` updates per
+  call, the first without arguments. A call is now reported once, with its input. The same applied to
+  persistent custom engines.
+- **Claude Code `toolErrors` was always 0.** Tool results arrive inside `user` messages rather than as
+  top-level events; failed results are counted from there.
+- **A turn the session did not send could be returned as the reply to the next send.** When a
+  background workflow finishes, or a message from another Claude Code session arrives, the CLI runs a
+  turn of its own, and its result resolved whichever send was waiting. Each message now carries an id
+  that the CLI echoes on the result answering it, so a result resolves only its own send — including a
+  message the CLI folds into a turn it started itself — and neither the reply to a message sent
+  without waiting nor a late reply to a send that timed out is handed to the next one. Without ids, a
+  result tagged with a non-human `origin` resolves none. Such turns do not count toward
+  `turnsSucceeded`; their cost does. The `ultracode` docs now say a workflow's send returns at
+  launch, and no longer claim the CLI rejects `--effort ultracode`.
+- **Ledger rows.** A Claude Code session with no explicit model recorded `model: "default"`; it now
+  records the model named in the CLI's `init` event, and never the placeholder. `turn` is now the
+  index of the send — it was Claude Code's count of `user` events, which advances once per tool-result
+  batch. `getRunLedger` with both `verified` and `limit` applied the limit first and could return
+  fewer rows than asked while matching rows existed.
+- **Claude Code's `[1m]` model suffix** (`claude-opus-5[1m]`, `opus[1m]`) is read as the model itself
+  for pricing and as a 1M window, instead of falling back to Sonnet pricing with a warning on every
+  lookup.
+- **A child process that exits without reading its input no longer crashes the orchestrator**, and
+  output is decoded as a stream, so a multi-byte character split across chunks is no longer
+  corrupted.
+- **The test suite wrote into the real home directory**: ledger rows, council transcripts, and the
+  persisted-session and PID files a running orchestrator restores from. Every test file now runs
+  with a private `HOME`, and test workers run with a bounded heap.
+- **The weekly sweep could pass without knowing the upstream version.** Its Codex lookup scanned the
+  newest 15 GitHub releases, which Codex's prereleases had filled, so the upstream column read "?" and
+  the run still passed. It now reads a full page, takes Grok Build's upstream from its updater's
+  check-only mode, and treats an empty lookup as a regression.
+
+## [7.4.1] - 2026-09-15
+
+Weekly engine sweep: Claude Code 2.1.269 → 2.1.271, OpenCode 1.18.30 → 1.18.31. Every live turn
+passed through the real wrapper, the model registry matched both vendors' published prices, and no
+engine's flag surface changed.
+
+### Fixed
+
+- **`SessionConfig.agents` accepts every field the CLI does.** The type named only `description` and
+  `prompt`, while Claude Code's `--agents` schema also takes `tools`, `model`, `maxTurns`,
+  `background`, `memory`, `isolation`, `effort`, and — from 2.1.271 — `omitClaudeMd`, which runs a
+  subagent without the user, project and local CLAUDE.md files. Definitions were always handed to the
+  CLI verbatim, so tool and MCP callers could already pass them; TypeScript callers could not. The
+  new `AgentDefinition` names `omitClaudeMd` and passes the rest through, and a test pins the
+  verbatim hand-over so a field the CLI adds next is not dropped on the way.
+- **`gpt-4.1` is registered** (`2 / 0.5 / 8`, 1,047,576-token window). It is priced by OpenAI and
+  reachable from Codex under API-key auth, and was being priced as the Sonnet fallback with a 200K
+  window.
+- **The sweep's missing-model check never ran.** Added in 7.1.1 to flag a model that a vendor prices
+  and an engine can select but this registry does not know, it resolved the engine binary against the
+  working directory instead of `PATH`, found no binary, and reported nothing — which reads exactly
+  like "no new models". It now resolves through `PATH`, covers Claude as well as Codex (a new Claude
+  model would otherwise have gone unnoticed until someone asked whether it had shipped), skips rows
+  the vendor marks retired, and reports a binary it cannot scan as a regression rather than an empty
+  result. Its first real run found `gpt-4.1`.
+
+## [7.4.0] - 2026-09-13
+
+Antigravity turns that did nothing no longer pass as successes, and Autoloop's Planner writes its
+plan, goal and spawn as one step. Thanks to @ajmtrz (#105).
+
+### Fixed
+
+- **Antigravity no longer treats an exit-0 empty response as a successful
+  turn.** The invariant applies at the adapter boundary, so Autoloop and every
+  other SessionManager caller now reject missing, blank, and whitespace-only
+  replies while keeping a captured conversation id available for an explicit
+  retry. agy 1.1.26 can produce this shape when plan mode soft-denies a tool
+  confirmation; a narrow marker from the freshly cleared current-turn log adds
+  a fixed sanitized diagnosis without exposing the log. Recovery does not
+  retry automatically or widen the Planner beyond `--mode plan`. agy 1.2.2 can
+  report the same denial with `status: SUCCESS` and a non-empty reply; refused
+  tool names now flow through `SendResult.permissionDenials` without dropping
+  that reply.
+- **Autoloop Planner control batches are in-band-only and failure-atomic for
+  artifacts.** The dispatcher prevalidates the complete fenced-control batch,
+  rejects duplicate plan/goal/spawn controls, stages exact `plan.md` and
+  `goal.json` bytes as one rollback-capable replacement, and materializes both
+  before at most one subagent spawn. A malformed block or artifact failure now
+  leaves prior files unchanged and emits neither spawn nor an initial
+  directive; the Planner's existing read-only isolation is unchanged.
+
+### Added
+
+- **A real-subprocess agy 1.1.26 Planner regression fixture** reproduces the
+  first-turn soft denial and blank result, then verifies that the resumed
+  conversation returns fenced plan/goal/spawn controls, exact artifacts exist
+  before the single spawn, and no failed-turn effect leaks through.
+
+## [7.3.0] - 2026-09-13
+
+### Added
+
+- **`session_handoff` — continue a conversation on another engine.** Starts a new session on the
+  target engine (or the same engine with another model) in the source's working directory, and
+  carries the conversation into it, so the new agent picks up where the old one stopped. The source
+  keeps running untouched; the two go separate ways from there.
+  - No engine can resume another's session, and each keeps its history in its own undocumented
+    on-disk format, so the conversation travels as text: a `<conversation_history>` block in front
+    of the new session's first message, after which the new engine holds it itself. Nothing is
+    written into either engine's session store, and it works across every engine, custom ones
+    included. Every turn in the block is fenced against the block's own tags.
+  - What was said is recorded per session as it is sent and answered. The engine's history buffer
+    is not used for this: it is capped by event count, and on a long session the opening request is
+    the first thing it drops.
+  - When the conversation is longer than `maxChars` (default 240,000 characters), the opening
+    request is kept, the newest turns fill the rest, and one line records how many turns in
+    between were left out.
+  - The new session inherits the engine-neutral settings — permission and sandbox mode, effort,
+    spend cap, system prompts, extra directories — and none that were written for the source
+    engine. A second handoff carries the whole conversation, not only the part the middle session
+    saw. A first send that fails on the new engine keeps the history for the retry.
+  - Verified end to end over MCP against the installed engines: a fact planted in a Claude session
+    was recalled by Codex after a handoff, and again by Claude after a second handoff back, which
+    also named Codex as the engine it had taken over from.
+
+## [7.2.0] - 2026-09-13
+
+Weekly engine sweep. Five engines upgraded in place, every live turn through the real wrapper,
+registry 25 models with no drift.
+
+### Added
+
+- **`SendResult.permissionDenials` — the tool calls the engine refused during a turn.** A refused
+  call does not fail the turn. Measured on Claude Code 2.1.269 with `--permission-prompts none`,
+  which a session gets whenever no prompt tool is configured: asked to write a file, the turn ended
+  `subtype: 'success'` with `is_error: false`, the Bash call listed as denied in the result event, and
+  no file on disk. It counted in `turnsSucceeded` and set no `error`. `sendMessage` — the one path
+  every caller goes through — dropped that event, so council agents, autoloop roles, and MCP callers
+  all saw a clean success. The field is present only when something was refused, and it reaches
+  `session_send` and every other caller unchanged.
+
+### Changed
+
+- Tested versions: Claude Code 2.1.260 → 2.1.269, Codex 0.153.2 → 0.154.0, Antigravity
+  1.1.25 → 1.2.2, Grok Build 1.0.13 → 1.0.30, OpenCode 1.18.27 → 1.18.30.
+- Codex 0.154.0's `--worktree` is deliberately not passed. Measured: edits land in a
+  Codex-managed worktree on a detached HEAD rather than in the session's working directory, and the
+  event stream does not report where. Acceptance contracts and evidence read the session's working
+  directory, so they would verify an untouched tree.
+
+## [7.1.1] - 2026-09-04
+
+The weekly sweep now checks the model registry, and its first run found two more wrong prices.
+
+### Fixed
+
+- **`o4-mini` was priced at half its real cost.** OpenAI publishes four identically shaped tables
+  per model — Standard, Batch, Flex, Fast — and this entry had been copied from the Batch column:
+  `0.55 / 4.4` against a Standard `1.1 / 4.4`. Every run on it under-reported spend by 2x.
+- **`o3` and `o4-mini` had no cached rate**, so cached reads were billed into the report at the
+  full input price instead of a quarter of it.
+
+### Added
+
+- **The sweep diffs `src/models.ts` against both vendors' published price tables.** Until now it
+  only checked engines, so a repriced model was invisible to it: a wrong cost does not crash, it
+  just stays wrong. Both vendors publish their tables as markdown, so this needs no model to read
+  them. A model is reported as missing only when the vendor prices it _and_ the engine binary can
+  select it, which is the same test used by hand to keep `gpt-5.6-pro` and `gpt-5.6-cyber` out.
+  A price source that cannot be fetched is reported as a regression rather than skipped — an
+  unverified pass is what let a spent Grok quota carry a pin for a week.
+
+## [7.1.0] - 2026-09-04
+
+Weekly engine sweep. Five engines, zero regressions, every live turn through the real wrapper.
+
+### Fixed
+
+- **The GPT-5.6 tiers were priced at their launch rates.** OpenAI repriced all three after launch
+  and this registry kept the old numbers, so reported cost was wrong for every run on them — Luna
+  by 5x. Now Sol/bare `4 / 0.4 / 20`, Terra `2 / 0.2 / 12`, Luna `0.2 / 0.02 / 1.2`, cross-checked
+  against both the pricing table and each model's own docs page. The test that was supposed to
+  catch this pinned the launch literals; it now asserts bare `gpt-5.6` equals `gpt-5.6-sol`, which
+  is the actual invariant and survives the next repricing.
+
+### Added
+
+- **`gpt-6-astra`** — 1,050,000-token window, `10 / 1 / 50`. Absent from Codex 0.153.0 and present
+  in 0.153.2, so baselining the sweep on the installed binary rather than on upstream would have
+  hidden it for another week.
+
+### Changed
+
+- Tested versions: Claude Code 2.1.259 → 2.1.260, Codex 0.153.0 → 0.153.2. Antigravity 1.1.25,
+  Grok 1.0.13, and OpenCode 1.18.27 unchanged. Grok's live turn passed this week — last week it
+  could only be carried unverified, because a spent free tier hangs silently instead of erroring.
+- Deliberately still unregistered: `gpt-5.6-pro` (in the Codex binary, no docs page and no pricing
+  row) and `gpt-5.6-cyber` (documented, but no engine here can select it).
+
+## [7.0.0] - 2026-09-04
+
+Two contributed fixes for defects that were invisible from inside the project, plus the
+follow-ups they surfaced. Thanks to @ajmtrz for both, and for finding them by running this
+orchestrator's own autoloop against the repository.
+
+### Fixed
+
+- **Tool results reaching an OpenClaw host were empty.** Every handler returned its raw payload,
+  but the host reads `result.content`, so tools ran — with their side effects — and the model was
+  handed nothing back. All 77 registrations now pass through one adapter that emits text content
+  plus the original structured value in `details`, serializes BigInt safely, preserves an
+  already-wrapped result, and lets handler errors propagate unchanged.
+- **MCP tool results no longer carry the payload twice.** With handlers now normalized, the MCP
+  bridge's own `JSON.stringify` would have shipped the data once escaped inside a text block and
+  again under `details`. It forwards the content blocks instead.
+- **An autoloop node no longer dies at 30 minutes.** The kernel's generic default node timeout
+  applied to autoloop nodes, which are built to run for hours or days. Autoloops now own their
+  timeout policy; an explicitly configured node timeout is still honoured.
+- **A timed-out agent send is recoverable instead of fatal.** Sends gained a bounded per-message
+  deadline, a renewable inactivity lease, and an absolute run lifetime cap. A genuine send
+  deadline parks the run in `awaiting_resume` with the pending dispatch identity, so a resume can
+  raise the deadline and continue rather than restart. Explicit stop and hard-timeout terminal
+  states win races against a late timeout.
+- **The retained dispatch cache is bounded.** Deduplicating logical dispatches for a run's whole
+  lifetime meant holding every iteration's full diff in memory, on runs allowed to last 72 hours.
+  Settled entries are evicted past a cap; in-flight ones never are, so coalescing still holds.
+- **A request may describe a custom engine without being refused as one.** The HTTP guard matched
+  any object under a custom-engine key, so a `tools` array — JSON Schema, including this package's
+  own `autoloop_start` declaration — tripped it, and every tool-bearing turn through
+  `/v1/chat/completions` failed with a 400 while a tool-free request passed. The guard now tests
+  what makes an inline config dangerous: a `bin`/`binEnv` that resolves to an executable. Actual
+  inline configs are refused exactly as before.
+
+### Changed
+
+- **BREAKING: the Codex thread-listing tool is now `codex_thread_list`.** `codex_threads`
+  collided with the identically named tool in `@openclaw/codex`, and neither plugin reported a
+  diagnostic — the two silently shadowed each other. Callers using `codex_threads` must update.
+- Autoloop start and resume accept `send_timeout_ms`, `activity_lease_ms`, and
+  `autoloop_hard_timeout_ms` over the tools, HTTP, and CLI surfaces. Runs that omit them keep the
+  previous behaviour.
+
+## [6.5.0] - 2026-09-03
+
+Claude Code 2.1.258 → 2.1.259, Codex 0.152.1 → 0.153.0, Antigravity 1.1.22 → 1.1.25, OpenCode
+1.18.26 → 1.18.27; Grok Build unchanged at 1.0.13. This is the first sweep run by the new script
+rather than by hand, and it found one real regression that the by-hand method would have missed.
+
+### Added
+
+- **`scripts/sweep.ts` — the weekly engine sweep as a deterministic script.** Installed version
+  against the CLAUDE.md pin and upstream; the flags each wrapper passes against what its binary's
+  `--help` lists; one live turn per core engine **through the real wrapper class**, so the wrapper's
+  own defaults are what is tested; and the ACP + MCP handshakes. Exit 1 on a regression. No LLM in
+  it — the thing that says a wrapper is broken must not share the wrapper's failure modes.
+  `scripts/sweep-workflow.json` wraps it as a kernel run: verifier → router → an agent that drafts
+  the alignment on a `sweep/<date>` branch → a human gate. Neither ships in the package.
+- **`--permission-prompts none` on every Claude session without a prompt tool** (CLI 2.1.259+).
+  This spawn shape has no TTY and, without `permissionPromptTool`, nobody to answer a permission
+  prompt — a tool call the permission mode did not already decide sat waiting until the turn
+  timeout. It is now denied instead; the model sees the denial and can adapt, and the permission
+  mode still decides everything else. Verified against 2.1.259 with `acceptEdits`: a clean turn, no
+  denials recorded.
+- **`gemini-3.8-flash`** registered for the Antigravity engine at its current $0.75/$3.75 list rate
+  (promotional through 2026-12-31; the scheduled rate is deliberately not priced).
+
+### Fixed
+
+- **The Antigravity default model no longer exists on agy 1.1.25.** `gemini-3.5-flash` was dropped
+  from `agy models`; a session asking for it gets `status: ERROR` with an empty response and nothing
+  on stderr, while 3.7 and 3.8 complete normally. This wrapper always passes `--model`, so every
+  Antigravity session with no explicit model was failing. The default and the `agy-flash` alias
+  moved to `gemini-3.8-flash`, verified with a live turn. The 3.5 entry stays registered — it is
+  still a real API model — but no longer carries the alias. The wrapper's claim that an unknown
+  model "silently falls back" was true on 1.0.16 and is not true now; the comment says so.
+
+  The by-hand sweep exercised agy with a minimal argv and no `--model`, so it passed on agy's own
+  default and never saw this. The script's first version did the same and passed too. The live turn
+  now goes through the wrapper, which is what users run.
+
+### Notes
+
+- Help-text diffing is advisory, not a verdict. The script's first run reported four Claude flags as
+  removed (`--max-turns` among them); all four are still accepted — claude omits hidden options from
+  `--help`, and passes an unknown option straight through to help with exit 0, so there is no free
+  way to ask. Such flags are listed as "not advertised" and do not fail the sweep.
+- Grok on a spent free tier can hang `-p` silently rather than error, in any directory, with or
+  without its leader process. The sweep caps grok at 90 seconds and names a zero-turn result as a
+  silent hang. Grok could not be re-verified this week; its pin stays at 1.0.13.
+
+## [6.4.0] - 2026-09-03
+
+### Added
+
+- **ZCode community engine preset**, the first one, contributed by @bwndlct. It points at the
+  contributor-maintained `@bwndlct/zcode-claw-adapter` package and carries provenance for ZCode
+  0.16.5 with a published two-turn context smoke record. The protocol translation lives in that
+  package, which is the split the community tier exists to make possible.
+- **`clawo engines`** lists the bundled presets with each one's provenance — who attested it,
+  against which engine version, on what date. Read from the installed package rather than over HTTP,
+  so it works with no server running.
+- **`clawo session-start --custom-engine <preset-id>`.** `-e custom` was offered by the CLI and
+  could not be satisfied by it: there was no option to supply the engine, so the path failed with
+  "customEngine config is required". Found by @bwndlct, twice — first while preparing the ZCode
+  preset, then in a follow-up PR to correct the guide. The contribution path's first outside user
+  walked straight into it, which is roughly the point of having one.
+
+### Changed
+
+- **The HTTP guard now refuses inline custom-engine configs specifically, rather than the whole
+  field.** Its reason has always been that a custom engine names an executable to spawn — but
+  `engine: 'codex'` spawns one too and is accepted, so spawning was never the line; arbitrary argv
+  is. A preset id cannot carry any: it selects one of the descriptions this package ships. Inline
+  configs remain local-only, and a preset id is now the supported way to reach a custom engine from
+  the CLI. Verified both directions against a running server: an inline config carrying
+  `/bin/sh -c "touch …"` is refused and writes nothing, while a preset id reaches the spawn.
+
+### Fixed
+
+- **The smoke script in CONTRIBUTING.md named a command that does not exist.** It used
+  `clawo session start` (the command is `session-start`) and a `--custom-engine` option that had not
+  been implemented. It was written without being run. It now matches the CLI, starts from
+  `clawo engines` to confirm the preset loads at all, and says why the preset — not an inline config
+  — is what has to be smoked.
+
+## [6.3.0] - 2026-09-02
+
+### Added
+
+- **A contribution path for third-party engines.** `customEngine` now accepts the id of a preset
+  bundled in `configs/engines/` as well as an inline config, so a third-party CLI can be described
+  once and shipped rather than retyped by every caller.
+
+  Engines sit in three tiers, and the line between them is verification, not code quality. **Core**
+  engines are wrapped in this repo, exercised with a live turn every week, and pinned to a version
+  someone here actually ran — which requires that a maintainer can obtain and run the binary.
+  **Community** presets are shipped as data: the schema is validated here, and whether the engine
+  runs is its maintainer's claim, against a named version, on a named date. **Legacy** engines stay
+  wired and untracked.
+
+  The middle tier is deliberately not gated on a maintainer running it. Most of the CLIs worth
+  supporting are behind credentials this project does not hold, so that bar would keep the tier
+  permanently empty — and an empty tier is indistinguishable from never having done the work.
+  Requiring an attributable, dated, falsifiable attestation keeps the door open without anyone here
+  claiming to have tested what they have not. CI enforces the parts that can be checked without the
+  engine's credentials, and a preset that passes CI has not been shown to work.
+
+  A preset never carries protocol translation. A CLI that speaks its own wire format needs an
+  adapter binary in its author's own package, with the preset pointing `bin` at it — the split
+  `@enderfga/dsh-clawo` already uses. Keeping the translation out of this repo is what makes a
+  preset shippable without owning a protocol that cannot be tested here.
+
+  A preset id is refused over HTTP exactly as an inline config is: naming a shipped description is
+  tamer than arbitrary argv, but it is still a remote caller causing a process to spawn.
+
+  See [CONTRIBUTING.md](CONTRIBUTING.md#contributing-an-engine) for the two contribution shapes and
+  the smoke script that produces the attestation.
+
+## [6.2.1] - 2026-09-02
+
+Claude Code 2.1.251 → 2.1.258, Codex 0.151.0 → 0.152.1, OpenCode 1.18.25 → 1.18.26; Antigravity and
+Grok Build unchanged. Exactly one item across all of it is AI-facing — the rest is TUI, settings,
+auto-mode and gateway behaviour. Codex's `exec` flag set and model list are byte-identical across the
+bump, OpenCode's `run` flags likewise, and both ran a live turn at their new version.
+
+### Fixed
+
+- **Registered Claude Fable 5.1, and moved the `fable` alias onto it.** `claude-fable-5-1` is the new
+  default Fable model, and the CLI's own `fable` resolves to it — verified by reading
+  `modelUsage.canonicalModel` back from a real turn against 2.1.258 rather than taking the release
+  note's word for it. An alias left pointing at the previous generation is the drift that has hit
+  this registry once per generation (Opus 5, Sonnet 5) and never fails loudly; it just prices at the
+  wrong model. `claude-mythos-5-1` is registered alongside it, as Mythos is the same model under
+  limited availability.
+- **Priced 5.1's cache reads at their own rate.** Fable 5.1 and Mythos 5.1 read cache at **0.025x
+  base input** — $0.25 per Mtok against a $10 input price — where every other Claude model is 0.1x.
+  Copying Fable 5's $1, or deriving the number from the input rate, over-reports those two by 4x.
+  Cache _writes_ keep the usual 1.25x / 2x multipliers, so only the read is exceptional. A test
+  asserts the exception together with the rule it breaks, so a blanket edit in either direction
+  fails.
+
+## [6.2.0] - 2026-08-31
+
+Weekly engine sweep: Claude Code 2.1.246 → 2.1.251, Codex 0.149.1 → 0.151.0, Antigravity 1.1.21 →
+1.1.22, Grok Build 1.0.5 → 1.0.13, OpenCode 1.18.23 → 1.18.25. Each ran a live turn at its new
+version, and the ACP and MCP entry points were smoke-tested alongside them.
+
+No registry drift this week — the first time in several. Today was also the last day of the window
+Sonnet 5's $2/$10 was announced under, and Anthropic's pricing page now states that price is standard
+and the scheduled increase will not happen, which is what this project already had.
+
+### Added
+
+- **Grok now receives the session options it has been ignoring.** 1.0.13 grew a programmatic surface
+  for nine options this project already had, every one of which the wrapper was dropping on the
+  floor: `appendSystemPrompt` → `--rules`, `allowedTools` → `--tools`, `disallowedTools` →
+  `--disallowed-tools`, `jsonSchema` → `--json-schema`, `agent` → `--agent`, `agents` → `--agents`,
+  `dangerouslySkipPermissions` → `--always-approve`, `customSessionId` → `--session-id`, and
+  `forkSession` → `--fork-session`. `--session-id` names a new conversation, so it is withheld on a
+  plain resume and passed on a forked one, which is the only combination grok accepts. Note that grok
+  validates neither tool list: a name that does not exist is ignored rather than rejected, so a typo
+  in a denylist silently leaves the tool enabled.
+- **`restricted` (Claude Code).** Maps to `--restricted`, added in CLI 2.1.249: the command- and
+  code-running tools and `WebFetch` are removed from the session rather than denied on request. It is
+  deliberately not folded into `sandboxMode: 'read-only'` — measured against 2.1.251, plan mode alone
+  already refused a direct write, a shell write and a delegated subagent write, and `--restricted`
+  also drops the caller's user, project and local settings files, taking their CLAUDE.md and hooks
+  with them. That is not something to switch on behind a caller's back.
+
+### Changed
+
+- **Grok's read-only refusal is now a measured finding rather than a cautious one.** The obvious
+  construction — a `--tools` allowlist of read-only built-ins plus `--permission-mode plan` — refuses
+  a direct write and a shell write against 1.0.13, then loses to the third prompt in the matrix:
+  asked to delegate, the session spawned a subagent and the file appeared. The subagent does not
+  inherit the parent's tool restriction, which is the same load-bearing hole found in OpenCode, where
+  denying the write tools without denying `task` left the delegation path open. grok ships
+  `--no-subagents` and that is the obvious next probe; it is not wired up, because the run that would
+  have confirmed it hit the account's free-tier usage limit, and a probe that fails for lack of quota
+  writes no file either. Reading that as a pass is how an unproven boundary ships. The thrown error
+  now names what was measured.
+- `-p` is the short form of grok's `--single` since 1.0.13, renamed from `--print`. This wrapper
+  passes the short form, so the rename is invisible here.
+
+## [6.1.1] - 2026-08-27
+
+Both defects surfaced while connecting `clawo-mcp` to an MCP host for the first time.
+
+### Fixed
+
+- **The commands in `package.json#bin` were not executable.** `tsc` writes 0644 and the build never
+  restored the bit. A published install hides this — npm sets the mode itself when it links a bin —
+  but a `npm link` checkout points straight at these files, so after a build the commands sit on
+  PATH and refuse to run with "permission denied", while `command -v` reports them as missing
+  because it only considers executables. `clawo` had therefore only ever worked when invoked as
+  `node $(which clawo)`, and `clawo-mcp` / `clawo-acp` could not be run at all. `scripts/postbuild.mjs`
+  now marks all three executable.
+- **The MCP server reported the wrong version to every host.** It read
+  `process.env.npm_package_version`, which npm sets only for a process npm itself started; an MCP
+  host spawns the binary directly, so the variable was never present and the hard-coded fallback —
+  `3.7.0`, the version current when that line was written — was what got sent every time. It now
+  reads the package manifest, the way `bin/cli.ts` already did.
+
+### Fixed (test harness)
+
+- **A lock holder spawned by the test suite could outlive the run that made it.** `holdLock` waits
+  on a release marker the test writes, and that was its only way out, so a run that crashed, timed
+  out, or was interrupted left the child process holding memory and a lock file until reboot. Two
+  calls in that file had also been written against older signatures and neither failed: one passed
+  a duration where an options object was expected, leaving the marker path undefined and the child
+  waiting on `existsSync(undefined)` — false forever; the other dropped a required owner id, so the
+  takeover a test describes went in under `undefined`. The holder now also exits on an absolute
+  deadline or when its parent goes away, and an unusable marker path throws at the call rather than
+  leaking silently. `tsconfig.test.json` plus `npm run typecheck:tests` closes the blind spot that
+  hid both calls — tests are excluded from the build so that they stay out of `dist/`, which also
+  meant nothing type-checked them. It is a diagnostic, not a CI gate; its header explains why.
+
+## [6.1.0] - 2026-08-27
+
+Engine sweep: Claude Code 2.1.237 → 2.1.246, Codex 0.148.0 → 0.149.1, Antigravity 1.1.15 → 1.1.21,
+OpenCode 1.18.18 → 1.18.23, Grok Build unchanged at 1.0.5. Each engine ran a live turn at its new
+version, and the ACP stdio entry point was smoke-tested alongside them. Chasing what the CLIs now
+report turned up four ways this project was measuring their turns wrong.
+
+### Fixed
+
+- **Every Claude turn's tokens were counted twice.** The CLI reports one turn's usage on the
+  streaming `message_delta` and again on the terminal `result`, and both were added to the running
+  totals. Measured against 2.1.246 on a live turn: the engine reported `in=2 / out=4 /
+cache_read=47371` and `getStats()` returned `4 / 8 / 94742`. A turn's usage is now folded in once —
+  streamed deltas apply provisionally so a long turn still moves, and the authoritative `result`
+  replaces rather than repeats them. A turn spanning several assistant messages (one per tool round)
+  keeps every message, since each carries its own delta series.
+- **Cost estimates left out cache writes, which is most of what a cached turn pays for.** The formula
+  priced input, cached reads and output, and nothing else. On a turn with 31,435 one-hour cache
+  writes the CLI reported `$0.322428` while the formula produced `$0.016` — a 20x under-report, on
+  the figure `maxBudgetUsd` gates against. Claude sessions now take the engine's own
+  `total_cost_usd`, which is cache-aware; it is a session running total rather than a per-turn
+  figure, so spend advances by the difference between turns and picks up again from zero when a
+  resume replaces the CLI process. Proxy sessions keep the estimate, because there the CLI prices
+  another provider's tokens as Opus. The estimate itself, still used when no engine figure arrives,
+  now prices cache writes from the 5-minute / 1-hour split the engine reports.
+- **Subtracting cached reads out of input tokens is only correct on one engine.** `codex` counts
+  cached reads inside `input_tokens` (`total 19704 = input 19699 + output 5`); `grok`, `opencode` and
+  `claude` report them alongside it (`total 30034 = input 19393 + output 17 + read 10624`). Doing the
+  subtraction on the latter removes tokens that were never there and prices them at the cached rate.
+  It failed silently and without bound: after two opencode turns the running cached total exceeds the
+  running input total, the `Math.max(0, …)` clamp reaches zero, and the whole session's input bills
+  at the cached rate. Engines now declare which convention they follow.
+- **`contextPercent` read a nearly-full context as empty.** It was computed from `input_tokens`,
+  which on a resumed conversation excludes the history — that arrives as cached reads. A Claude turn
+  carrying a 47k prompt reported 2 input tokens and the metric read 0%; `onContextHigh` could
+  likewise never fire. It is now the whole prompt (input + cached reads + cache writes) over the
+  window the engine reports for the model it actually ran (`modelUsage[*].contextWindow`), with the
+  registry as fallback — the same thing the codex-app session already did. A one-shot engine with no
+  model set also measures against its own default model's window instead of the registry's catch-all
+  200K, which reported a half-full grok session as full.
+- **Reasoning effort was being clamped to levels the engines had outgrown.** `max` folded to `xhigh`
+  on Codex, which now has a real `max` and an `ultra` above it; `xhigh` folded to `high` on Grok,
+  which accepts `xhigh` natively. Both cost callers a tier they had asked for. All three Codex levels
+  were exercised against 0.149.1 and completed turns.
+- **OpenCode ignored `effort` entirely.** Its knob is `--variant`, which the wrapper never passed, so
+  every caller's setting was dropped. OpenCode does not validate the value: a level its provider does
+  not offer runs at the default rather than failing.
+- **Model registry drift.** `gemini-3.7-flash` and `gemini-3.6-flash` — both offered by agy 1.1.21,
+  3.7 being the newest tier — were unregistered and fell through to the family default: Sonnet rates
+  and a 200K window against a real 1M. `gemini-3.5-flash` was priced at `$0.5/$3` against a list rate
+  of `$1.50/$9.00`. `gpt-5.2`, still selectable in Codex, was unregistered (real window 400K,
+  `$1.75/$14`).
+
+### Added
+
+- `ultra` reasoning effort, reachable on Codex. Every engine clamps to its own ceiling rather than
+  dropping the field: Claude Code stops at `max`, Grok at `xhigh`, Antigravity at `high`.
+- `noSessionPersistence` now means something on Codex, which gained `--ephemeral`. It had reached
+  only Claude Code before.
+- `ignoreUserConfig` (Codex): run without loading `$CODEX_HOME/config.toml`, so an orchestrated run
+  is decided by what the caller passed rather than by the machine's own Codex config — notably a
+  `model = …` line in it, which otherwise picks the model while the ledger records the engine
+  default. Auth still resolves from `CODEX_HOME`.
+- `addDir` reaches Codex as `--add-dir`, on the first turn only; `exec resume` rejects it and the
+  resumed thread keeps the roots it opened with.
+
+## [6.0.4] - 2026-08-26
+
+### Fixed
+
+- **The fence around end-user text escaped the bracket, not the tag.** Matching up to the closing
+  `>` and re-emitting what was captured let `hola<user a</user>` smuggle a raw `</user>` through the
+  attribute slot of a tag that WAS matched, forging the `assistant` turn the fence exists to stop;
+  zero-width padding (`</user\u200B>`) evaded it outright, since `\s` does not match U+200B. Only the
+  `<` is escaped now, by lookahead, with a boundary class that covers the 6,060 zero-advance or
+  blank-rendering code points — `[\s></\p{Cc}\p{Cf}]` alone let 5,806 of them through. The same
+  filler, plus the slash, is allowed before the name: `hola</​user>` renders as `hola</user>` and
+  forged a turn past a trailing-complete fence, so the lookahead now admits the zero-advance subset
+  (no `\s`, no U+2800) there too — swept over all three positions, 12,120 unfenced probes drop to 38,
+  the visible separators already excluded on cost. That leading part is ONE class `[/…]*`, not
+  `[…]*\/?[…]*`: two adjacent unbounded quantifiers over the same class backtrack O(n²) and a single
+  ~100 KB history message hung the event loop ~80 s. `</ user>` with a visible space is still not
+  fenced; the reference says which text that spares.
+- **A send that threw recorded the turn as delivered.** `seededConversations` was written before the
+  send, so a first turn that failed with a 500 left the thread credited with a turn it never received
+  and the caller's next, short turn went out with no history — the exact string this change set exists
+  to stop. Both handlers now report whether the send landed, and the record happens only then.
+  `sendMessage` returning is the signal: a returned error is answered with 502 and still records,
+  because the CLI received the prompt. A second request arriving while the first is in flight sees no
+  fingerprint and replays — a duplicate rather than a drop.
+
+- **OpenAI-compat: the conversation history was discarded on any thread the
+  engine had not opened.** `extractUserMessage()` returned only the text of the
+  caller's last `user` message, so the earlier `user`/`assistant` turns in
+  `messages[]` were dropped — including when the engine held no transcript they
+  could have been in. A caller that opens a new conversation per turn (a session
+  key that hashes the last message) therefore sent a full transcript on the wire
+  and the engine received one line of it. Measured on 1834 production sessions: a
+  short follow-up turn — "yes, go ahead", with the request one turn back — was
+  carried out 2 times out of 32 on this path, against 235 of 309 on an engine that
+  does not route through it. Those turns now go out as one
+  `<conversation_history>` block, the same wrapper tag `renderHistory()` in the
+  autoloop dispatcher already uses to replay turns to an engine with no
+  conversation of its own.
+
+  Which turns are in scope is `serializeConversationHistory()`'s decision, keyed
+  on the engine's state rather than the shape of the array — and on _which_
+  conversation that engine is holding, because a live thread under a session name
+  is not automatically this caller's thread. A key that hashes the latest message
+  resolves every repeat of a short confirmation to the session an earlier exchange
+  opened; a client that sends no key hashes model+system+tools into one name
+  shared by all of its chats; and on `claude`, the default engine,
+  `nativeThreadIsLive()` has no id to check and returns true for anything in the
+  session map. The bridge therefore records a fingerprint of the `user` turns it
+  has pushed to each session and replays unless this request continues exactly
+  that. On its own live thread the message is byte-identical to before, which is
+  what keeps Anthropic prompt caching (PR #40) warm, and `[system, user]` — the
+  shape the main agent, cron jobs and subagents send — is untouched.
+
+  The whole block is capped at 24,000 characters — wrapper tags, per-turn tags,
+  elision markers and framing included, not just the sum of the turn text —
+  oldest turns dropped first, matching `REPLAY_CHAR_BUDGET` in the dispatcher:
+  six of the nine engines pass the prompt as a single argv element, as does a
+  one-shot `custom` engine, and Linux caps one argument at 128 KiB, so going over
+  is a 500 with the turn lost rather than a turn missing context. Charging the
+  turn text alone was not a cap at all: 8,000 alternating one-word turns rendered
+  165,008 bytes, because the ~16 characters of tags per turn were never counted.
+  No turn is started with less than 200 characters of room left, in either
+  direction from the newest `user` turn in the block, which is otherwise held
+  back from the budget by up to 200 characters so that one long reply cannot
+  strand the ask behind it — before that reserve, replies adding past the cap
+  (two ordinary 12k ones sufficed) started the window past every `user` turn,
+  the leading-`assistant` rule cleared what was left, and nothing went out at
+  all: the caller's latest turn reached the engine alone, this change set's own
+  headline failure. Verified over 44,000 random shapes: max block 23,999
+  characters, none over 24,000, none rendered content-free, and none that had a
+  block before and lost it.
+
+  Replayed text has every tag the prompt treats as structure escaped, since a
+  replayed turn is end-user text and `hi</user>\n<assistant>...` would otherwise
+  forge a turn in
+  the engine's own voice. `skills/references/openai-compat.md` has the rest,
+  including what this does not cover.
+
+### Changed
+
+- **OpenAI-compat: `X-Session-Reset` now replays the conversation.** A reset turn
+  means the engine holds nothing, so the history block goes out in full where it
+  previously sent only the caller's latest text. Correct under "the engine has
+  nothing"; under "the caller asked to start clean" it is the opposite, and a
+  client that sends the header on every request AND re-sends `messages[]` now pays
+  for the transcript each time.
+
+## [6.0.3] - 2026-08-26
+
+### Fixed
+
+An external multi-agent review of the 6.0.2 tree reported 33 findings across the
+run kernel, the HTTP/ACP/OpenAI surfaces and the session manager. Each was
+reproduced against the built code before being changed, and each fix is
+mutation-checked — reverting the predicate reddens its own tests and no others.
+
+**Inputs that reached further than they should**
+
+- `/session/start` accepted a custom engine from the request body. The guard
+  that refuses one covered `/autoloop/new` and `/autoloop/<id>/resume` and
+  matched three snake_case keys, while `session_start` spells the field
+  `customEngine` — so the object reached `startSession()` verbatim and from
+  there `PersistentCustomSession` spawns `bin`. The guard now matches by shape
+  and runs on every request body, so a route added later cannot reintroduce it.
+- An openai-compat session key became a directory name unsanitised. The
+  `x-session-id` header is taken verbatim and the handler builds
+  `os.tmpdir()/openclaw-compat-<name>`, mkdirs it recursively and starts the
+  session there under `bypassPermissions`; a key carrying `../` resolved outside
+  the temp directory entirely. Keys that are already filesystem-safe pass
+  through unchanged.
+- A cross-session message body could forge a second envelope, carrying any
+  `from` it liked — which is what the recipient uses to attribute the sender.
+  Only the bracket of a cross-session tag is escaped, so code in a message is
+  untouched.
+- `getAnthropicBaseUrl()` returned the first `baseUrl` in `openclaw.json`
+  rather than the `anthropic` one, sending Anthropic passthrough — the
+  `x-api-key` header and the whole prompt body — to another provider's host.
+
+**Work done twice, or on the wrong thing**
+
+- The `solve` template repaired runs that were already green. Its two chained
+  routers read as "loop while verify is red AND budget remains", but a router
+  whose routes all miss falls through to the next node, so the budget check
+  matched on its own: a first-try green run made four implement/review/verify
+  cycles instead of one. Router conditions gained `and`, and the two routers
+  are now one.
+- Council selected worktrees to force-remove by testing whether the path
+  contained the string `council`, which matched a user's own worktree at
+  `~/council-notes` and missed council's at `.worktrees/agent-A`. Selection is
+  containment under `{projectDir}/.worktrees/`; `git worktree list` gained
+  `--porcelain`, so a path with a space is no longer truncated.
+- An abort that landed while `setupWorktrees` was still running left every
+  worktree on disk, because cleanup was gated on a map that is not populated
+  until setup returns.
+- A subflow could outlive the cancel meant to stop it, and started without the
+  parent's secrets.
+- The verdict-staleness check re-measured the tree at the run's cwd while the
+  verifier had measured at its own, so a verifier declaring `cwd` had its
+  passing verdict compared against an unrelated tree.
+- Evidence bundles collided across repair passes: the id was keyed on the
+  per-visit retry counter, which restarts at 1 on every visit, so each pass
+  overwrote the previous bundle. Ids carry the visit now.
+- `session/cancel` tore the session down whether or not a turn was in flight,
+  dropping the engine's native conversation id and forking the history.
+- A parked council did not block ordinary follow-up prompts, so a second
+  council started over the worktrees the parked one still held.
+
+**Answers that were wrong, or missing**
+
+- Fanout published a failed synthesis turn as the answer: `sendMessage` reports
+  a turn-level failure by returning `{error}`, not by throwing, so the catch
+  never ran and `synthesisError` stayed undefined.
+- Broadcast reported `delivered`/`queued` as each other's negation, which
+  cannot encode a broadcast that did both.
+- Streaming dropped the reply for engines with no delta channel (opencode,
+  agy, the per-send codex/cursor wrappers, one-shot custom engines): the role
+  chunk and the stop chunk went out with nothing between them.
+- The streaming branch of the Anthropic passthrough piped the upstream body
+  without checking `resp.ok`, so a 401/429/500 arrived as HTTP 200 with SSE
+  headers — an empty stream to any SSE parser.
+- Text a model emitted after a tool call was discarded, though
+  `text → tool_use → text` is one valid Anthropic turn.
+- An HTTP check could outlive its declared timeout by two orders of magnitude:
+  the deadline was enforced only between poll iterations and the request
+  carried no signal, so a server that never sends headers parked it until the
+  transport default.
+- `noSessionPersistence` reached the engine but not this orchestrator's own
+  session registry, so `session-start x --skip-persistence` twice reattached to
+  the first conversation.
+- The openai-compat session fingerprint hashed a tool's name and description
+  but not its parameters, so a changed schema landed on the session holding the
+  old one.
+- `switchModel` validated against a frozen prefix list and rejected `grok-4.6`,
+  `composer-*`, `o3`, `o4-mini` and `codex-mini-latest`.
+- The orphan reaper's list of CLI binaries was missing `grok`, so an orphaned
+  grok CLI was never cleaned up; TTL cleanup did not forget the PID it stopped,
+  leaving dead PIDs on disk for that reaper to probe.
+- `_ensureProxyServer` checked its port synchronously and assigned it several
+  awaits later, so concurrent starts each bound a server and only the last was
+  closed on shutdown.
+- `hasConsensusMarker` knew three of the five vote formats the parser reads.
+- `replayRun` counted a retry as a visit; `_absorb` replaced a node's artifact
+  list rather than merging; the truncation notice cited an unsanitised path;
+  `SIDE_EFFECT_KINDS` listed four of the ten node kinds; the run state stayed
+  `verifying` after a mid-chain verifier; three SSE endpoints wrote to the
+  response with no disconnect guard; and `workflow show` cast its response as
+  `Record<string, never>`.
+
+### Changed
+
+- Router conditions accept `{ type: 'and', all: [...] }`. Closed and
+  depth-capped like the rest of the vocabulary — see
+  `skills/references/workflow.md`.
+- Evidence bundle ids are `<node>-v<visit>-<attempt>`, so a repair loop keeps
+  every pass.
+- `noSessionPersistence` now also keeps the session out of this orchestrator's
+  resume registry, which is what "do not save session to disk" was always
+  documented to mean.
+
+## [6.0.2] - 2026-08-24
+
+### Fixed
+
+- **OpenAI-compat: tool results were discarded on any thread the engine had not
+  opened.** `extractUserMessage()` decided whether to send the caller's tool
+  results by reading the SHAPE of the messages array — "is the last non-system
+  message a `tool` role?" — to answer a question about the ENGINE's state: "does
+  its transcript already hold them?". The two come apart whenever there is no
+  transcript. A `[..., tool, user]` or `[..., tool, assistant]` array sent to a
+  session whose native conversation did not exist yet had every result dropped,
+  and the turn was answered without them while the request still returned 200. The decision is now `serializeToolResults()`'s alone, keyed on
+  `threadHasHistory` — the parameter that already described the engine. Requests
+  carrying no tool results are untouched.
+
+  The `latestRoundOnly` scoping is unchanged, and so is the condition it rests
+  on, now asserted rather than assumed: it slices from the array's last
+  `assistant` message, so it bounds a tool loop to one round per hop only for a
+  client that echoes the `tool_calls` turn it is answering. An array with no
+  `assistant` message anywhere gives `lastIndexOf()` `-1` and `slice(0)` — the
+  whole array — so on that array `latestRoundOnly` is a no-op: the serialized
+  block is byte-identical with the flag set and unset, and the client re-sends the
+  entire loop on every hop, before this change as after it. Same for a turn with
+  no live conversation, where nothing is scoped by design. So "the duplication is
+  bounded to one round" holds only where the scoping actually runs.
+  `skills/references/openai-compat.md` documents each case.
+
+- **Docs: `X-Session-Reset` is not honored on a request that ends in a `tool`
+  result.** No behaviour change here — the header is parsed after the branch that
+  handles a trailing `tool` role returns, so on that one shape the reset stops no
+  session and creates no conversation, and the turn is treated as a resumed one.
+  `skills/references/openai-compat.md` said a reset turn always stops the session
+  and starts a new one; it now carries the exception.
+
+- **A refused request is drained before it is answered.** The 415 for a wrong
+  `Content-Type` ended the response without reading the body it was refusing, so the
+  connection could be torn down while the peer was still writing — `write ECONNRESET` on
+  the client, and a non-zero process exit in a test run where every test still reported
+  passing. Reported from a real run. It is not covered by a test: neither a 4 MB body nor
+  a staged write reproduces the reset on macOS, and a test that passes with the fix
+  deleted would be worse than none.
+
+### Testing
+
+- **Two lock-contention tests no longer race a wall clock.** They spawned a holder that
+  released on its own 150 ms timer while the acquisition waits
+  `DEFAULT_LOCK_WAIT_MS = 250` — a 100 ms margin, reported flaking 8 runs out of 8 on a
+  loaded 16-core box, and passing 4 of 4 on the same box unloaded. The holder now reports
+  when it actually holds the lock and releases on the test's signal, so contention is
+  established rather than assumed and the release is not a timer racing a deadline. The
+  second test is now deterministic: the holder does not let go until after the run has
+  ended, so the write it must fail cannot succeed by timing.
+
+  The `setTimeout(60)` they replaced was the worse half: it assumed the child had already
+  taken the lock, so on a slow spawn the test contended with nothing and passed anyway —
+  a silent second failure mode next to the loud one. Both mutation-checked: making the
+  lock fail on sight reddens the first, and removing both claim-handover paths reddens
+  the second.
+
+## [6.0.1] - 2026-08-24
+
+### Fixed
+
+- **`pricingOverrides` now applies however the session spelled its model.** The runtime
+  override map was keyed by whatever string the user typed, while `getModelPricing()`
+  stripped the vendor prefix before looking it up and never resolved aliases — so an
+  override could silently miss the session it was written for, in both directions:
+  - An override on `claude-opus-5` was found by a `claude` session (which canonicalises
+    `options.model` in `start()`, `src/persistent-session.ts:178-181`), but an override
+    written as `opus` was dead for every `claude` session.
+  - For the eight engines that never canonicalise, the reverse held — and because
+    `_persistSession()` stores the canonical id (`src/session-manager.ts:2011`), the same
+    session priced by its raw spelling on a first run and by the canonical id after a
+    resume, so an override could start or stop applying with no config change.
+  - A prefixed key (`openai/gpt-5.4`) could never be reached from either spelling.
+
+  Reads and writes now share one canonical key (prefix strip, then `resolveAlias`), and
+  the merge base is computed from that same key so a partial override on a prefixed id no
+  longer stores `output: 0`.
+
+- **A session with no explicit model gets its configured price.** `getModelPricing()`
+  returned the registry rate before consulting the override map whenever `model` was
+  absent, which is the normal case for codex and agy — and for non-Claude autoloop roles
+  it is deliberate (`src/session-manager.ts:494-496`). The engine default and the
+  unknown-model fallback now go through the map like an explicit model does, so the
+  flat-rate case the field exists for is actually covered.
+
+- **A partial override on an unregistered model id says so.** There is no list price to
+  merge onto, so the unspecified fields become 0 — free tokens. That is a legitimate idiom
+  and a very common typo, and they are indistinguishable at that point, so
+  `overrideModelPricing()` now warns instead of resolving it silently. Previously the
+  override also suppressed the unknown-model warning at `src/models.ts:512`, so a
+  misspelled id went from noisy to silent.
+
+### Added
+
+- **`pricingOverrides` is declared in the plugin config schema.** The capability was
+  already wired — `api.pluginConfig` reaches the `SessionManager` constructor
+  (`src/index.ts:138`, `:159`) and `overrideModelPricing()` has been there all along — but
+  the field was absent from `openclaw.plugin.json`, so on the surface most users actually
+  configure it was invisible and unvalidated.
+
+  ```json
+  { "pricingOverrides": { "gpt-5.5": { "input": 0, "output": 0, "cached": 0 } } }
+  ```
+
+  The per-model object is closed (`additionalProperties: false`), so a misspelled field
+  name such as `{"cache": 0}` is rejected instead of silently doing nothing, and keys must
+  be non-empty — `""` validated before and could never be read, since `''` is falsy and
+  `src/models.ts` returns on the absent-model branch first.
+
+- **The config schema is asserted against `PluginConfig`.** `tool-registration.test.ts`
+  compared only `manifest.contracts.tools`; nothing checked `configSchema`, which is how
+  the field could be missing in the first place. Keys are now compared with
+  compile-time exhaustiveness, and the two enums are compared by value — which caught
+  `defaultPermissionMode` still offering `delegate` (removed from `PermissionMode` in
+  4.7.0 because the CLI rejects it at spawn) and omitting `manual`, and `defaultEffort`
+  omitting `xhigh`. Both are fixed: with the host validating the manifest, the previously
+  valid `defaultPermissionMode: "manual"` failed validation and the plugin did not load.
+
+### Changed
+
+- **Zeroing a model's pricing disables `maxBudgetUsd` for it**, and
+  `skills/references/observability.md` now says so next to the recipe that recommends it.
+  The cap reads the session's accrued cost, so a zeroed model never trips it wherever that
+  cost is pricing-derived. Two engines are outside that: `engine: 'claude'` keeps the CLI's
+  own `--max-budget-usd` (`src/persistent-session.ts:216`), accounted independently, and
+  `engine: 'grok'` passes through the engine's own `total_cost_usd` into `_stats.costUsd`
+  without consulting the registry (`src/persistent-grok-session.ts:202-203`), so its cap
+  keeps biting on a zeroed model. No other engine has a native cap.
+
+  Because the fixes above route the engine default through the override map, the recipe
+  now also reaches `cursor` and `opencode` default sessions, which both declare
+  `defaultModel: 'claude-sonnet-4-6'` — zeroing a Claude subscription zeroes those too.
+  Documented on the same page.
+
+- **Overrides that silently did nothing now take effect**, so `costUsd` will move for
+  anyone whose override was keyed by an alias or a vendor prefix. No test covered the old
+  behaviour; the existing override tests all use bare, unprefixed keys.
+
+## [6.0.0] - 2026-08-23
+
+Two things this runtime could not previously do: survive its own process dying,
+and check an agent's work. This release adds both, and they arrive together
+because a verifier is a node in the thing that survives.
+
+### Added
+
+- **Durable run kernel (`src/kernel/`).** A declarative `WorkflowSpec` over ten
+  node kinds — `agent`, `fanout`, `council`, `verifier`, `human_gate`, `router`,
+  `subflow`, and the three whose executors are injected because their engines
+  need more than the kernel has any business knowing (`autoloop`,
+  `ultraapp_synth`, `ultraapp_deploy`) — with retry, per-node timeout, cancel,
+  steer, human gates, and
+  bounded loops. Every state transition is checkpointed to
+  `~/.claw-orchestrator/wf/<runId>/` before the next step begins, so a run
+  survives a restart and `workflow_resume` re-attaches at the node boundary:
+  nodes already succeeded are not re-run, and the one that was in flight is
+  retried, because a half-finished node left no result to trust. The immutable
+  spec is stored apart from the mutable checkpoint, so a torn `run.json` is
+  recovered by replaying `events.jsonl` rather than lost.
+  Four built-in templates ship as ordinary specs: `solve`, `council`, `fanout`,
+  `ultraapp`.
+
+  Two limits stated plainly rather than glossed. Node execution is
+  **at-least-once**: there is no idempotency key, attempt lease, or side-effect
+  commit marker, so a node that wrote files and died before its checkpoint runs
+  again from the top. And the boundaries are node boundaries: a node that dies
+  half-way is retried whole, because a half-finished node left no result worth
+  trusting.
+
+- **Verification plane (`src/verify/`).** Acceptance contracts the runtime runs
+  itself: `command` (argv, gated on exit code), `http`, `screenshot`,
+  `diff_policy`, `file`. A run carrying a contract cannot reach `completed`
+  unless every required check passes. Each attempt writes an evidence bundle —
+  verdict, per-check output tails, the patch, screenshots — that outlives the
+  process. Contracts come from the caller or a mode default and are never read
+  from agent output; unrecognised fields are dropped before anything executes,
+  and there is no shell string anywhere to inject into.
+- **`RunOutcome`: `verified` | `refuted` | `unverified`.** Finishing and being
+  right are now different questions. A run with no contract completes as
+  `unverified` — it says it does not know, which is not the same as success, and
+  the read surfaces keep the three apart rather than collapsing them into
+  pass/fail.
+- **Eight tools**: `workflow_start`, `workflow_status`, `workflow_list`,
+  `workflow_resume`, `workflow_cancel`, `workflow_steer`, `workflow_approve`,
+  `verify_run` (77 total). Matching HTTP routes under `/workflow/*` including an
+  SSE event stream, and `clawo workflow` / `clawo verify` on the CLI.
+- **Baseline capture.** The change set a run produced, measured against the
+  commit recorded when it started, covering tracked changes ∪ untracked files.
+  Nothing in the project could previously answer that question correctly.
+- Ledger rows gain `verified`, `evidenceId`, `contractId`, `nodeKind`,
+  `repoLang`, `taskKind`, and `clawo runs` gains a `VERIFIED` column plus
+  `--verified` / `--refuted`. All optional; rows written before 6.0.0 stay
+  readable and nothing is backfilled.
+
+### Changed
+
+- **A fixer is told its input is data.** The fix-on-red loop hands an agent
+  running under `bypassPermissions` the raw output of a check that ran against
+  code an agent wrote — untrusted text, to a privileged reader. UltraApp's own
+  fixer framed it as diagnostic data and the kernel's generic one did not, so
+  moving UltraApp's build stage onto the generic verifier would have quietly
+  dropped the mitigation. The framing is now in the kernel, so every verifier
+  gets it, and it is asserted end to end — which UltraApp's own tests for that
+  module never did. The superseded module is gone.
+
+- **UltraApp's build pipeline is a kernel workflow.** It was the last thing
+  running its own lifecycle: a mode enum in its own store, a call straight into
+  `new Council().run()`, and nothing checkpointed between the stages. So a crash
+  threw away a finished council — the most expensive thing in the run — and
+  started it again from nothing, and the run appeared in no listing.
+
+  It is now a three-node `WorkflowSpec`: synthesise by council, run the build
+  contract (the ordinary `verifier` node, fix-on-red loop and all), deploy and
+  check the deployed thing. `RunMode` survives as a projection of the kernel
+  record — every reader keeps working — but it is no longer a second source of
+  truth, and the projection is serialised per run so a late event handler cannot
+  write a stale mode over a newer one.
+
+  Two stages are UltraApp-specific node kinds (`ultraapp_synth`,
+  `ultraapp_deploy`) with injected executors, exactly as `autoloop` is: the
+  engine behind them needs a store, a router and a deploy strategy, and none of
+  that belongs in the kernel. The stage between them needed no new kind at all.
+
+  Two consequences the wiring has to honour, or the move buys nothing. A build
+  the durable queue re-enqueues after a restart **resumes** its checkpoint
+  instead of starting over, so the crash-recovery this was for actually reaches
+  the product path — only an explicit rebuild takes a new incarnation. And
+  cancelling a build cancels the workflow, not just the queue entry: a dispatched
+  build used to carry on through verification and deploy while the user had been
+  told it had stopped.
+
+  The interview and the done-mode conversation deliberately stay where they are.
+  They are user-driven and open-ended; expressing them as a workflow would mean a
+  router self-loop fighting the visit bound, or one fake node with a state
+  machine hidden inside it — unification as theatre. What moved is what is
+  actually a pipeline.
+
+- **Every orchestration mode runs on the kernel.** `council_start`,
+  `fanout_start`, `ultraplan_start`, `ultrareview_start` and `autoloop_start`
+  each create a durable run. Tool signatures and result shapes are unchanged —
+  `CouncilSession`, `FanoutSession`, `UltraplanResult`, `UltrareviewResult` and
+  `AutoloopState` are projected from the run record instead of held in memory —
+  and the engines that do the work are untouched. What they lost is ownership of
+  a lifecycle. Deleted: five result maps, four 30-minute eviction timers, a
+  5-second poller, the two `Set`s fencing an autoloop start against a delete, and
+  both cross-process enumerators (a regex over council markdown transcripts, and
+  `autoloop-registry.jsonl` with its four bespoke read/write helpers).
+
+  Three bugs went with them. A fan-out's results vanished 30 minutes after it
+  finished, because the only copy was in a `Map`. An ultraplan still running when
+  its TTL fired was rewritten as `error: 'Timed out (TTL expired)'` and deleted,
+  so a long plan could be destroyed by its own eviction timer. And ultrareview's
+  correctness depended on the fan-out's TTL: evict first and its poll threw, the
+  interval was cleared, and the review stayed `running` forever.
+
+  `autoloop_status` for a run not live in this process previously returned an
+  all-zero stub labelled `reconstructed from registry`; it now returns the last
+  state the loop published.
+
+- **Breaking:** `councilStart`, `fanoutStart`, `ultraplanStart` and
+  `ultrareviewStart` are async. Tool and HTTP callers are unaffected; direct
+  TypeScript callers need an `await`.
+- **`council_review` / `accept` / `reject` work after a restart.** They act on
+  the git state a finished council left behind, so they now run against a
+  `Council` rebuilt from the run record rather than requiring the instance that
+  produced it.
+- **Council consensus is advisory.** A council used to end when a regex found
+  `[CONSENSUS: YES]` in every agent's prose. Votes are still collected and are
+  now recorded on the run with their parse source, but they no longer decide
+  whether the work is acceptable — a contract does. Without a contract, council
+  behaves exactly as before and the run completes `unverified`.
+- **UltraApp's build contract now runs `npm run smoke`.** §4 of the
+  architectural conventions has always told the council that the smoke test
+  gates build success. It was not in the step list, so the claim was false. A
+  generated codebase without a working `scripts.smoke` now fails its build,
+  which is what the brief said.
+- **UltraApp's §7g frontend gate is captured by the runtime.** Both viewports are
+  screenshotted against the deployed URL and stored as evidence, so whether a
+  capture happened is a file on disk rather than an agent's claim. It captures
+  and stores; it does not compare pixels. Advisory by default so a host without
+  Chrome does not lose a working app —
+  `CLAWO_ULTRAAPP_VISUAL_GATE=strict` makes a failed capture block the deploy.
+- **Autoloop accepts a contract**, which holds a Reviewer's `advance` unless the
+  checks pass. The Reviewer's prompt asks it to re-derive the metric
+  independently, but its sandbox contains the iteration's artifacts and no code,
+  so it never could; a contract can.
+- `fanout`'s per-agent `ok` reads the engine's terminal verdict
+  (`turnsSucceeded`) instead of "the call did not throw", so an engine that ran,
+  failed, and reported the failure cleanly is no longer recorded as a success.
+- `council_review` measures against the merge-base of `HEAD` and the first
+  `council/*` branch instead of a hardcoded `HEAD~20` window that returned
+  nothing on shallow history, and reports files the agents created.
+- `CouncilChangedFile.status` is optional and left undefined until a reviewer
+  assesses the file. It was hardcoded to `'clean'` for every entry, which read as
+  "reviewed and found fine" when nothing had looked at it. The new `change` field
+  carries git's own account.
+- **UltraApp's build queue is durable.** Its own comment claimed a restart
+  mid-build "is marked failed and the user can rerun"; nothing was marked — the
+  pending list vanished with the process, along with any queued build the user
+  was waiting on. It is persisted and restored now, with an in-flight build
+  re-queued at the front rather than resumed, because each build starts from a
+  fresh worktree.
+- `ultraapp/fix-on-failure.ts` is now an adapter over `src/verify/`; its public
+  signature is unchanged.
+- One child-process wrapper, one atomic-write helper, one append-JSONL helper,
+  and one start→send→stop agent lifecycle replace the four, four, three and five
+  near-duplicates that had accumulated.
+- The duplicate local `SendOptions` in `session-manager.ts` is gone in favour of
+  the canonical one in `types.ts`.
+
+### Fixed
+
+- **A verdict cannot outlive the work.** A node that overruns its timeout is
+  abandoned, not killed — JS offers no way to kill it — so a run used to stamp
+  `completed / verified` and then have the abandoned attempt write to the
+  workspace afterwards: evidence that was accurate when taken and wrong seconds
+  later, with nothing recording it. Abandoned attempts are now tracked, and a run
+  about to claim `verified` waits briefly for them; if any is still running it
+  reports `unverified` with the reason instead of vouching for a tree that may
+  yet change. The wait is short and only happens when there is a verdict at
+  stake, so one stuck node cannot hold a run open.
+- **Resuming with a custom engine works in a fresh process.** `autoloopResume`
+  asked the caller to re-supply the credentials the spec deliberately does not
+  carry, then dropped them into a map the executor no longer read — so the
+  original process succeeded by accident, on secrets still in its memory, and a
+  genuine restart got none of them. They go through the run's secret bag now, and
+  `workflowResume` accepts them too, which is what makes a custom-engine council
+  or fan-out resumable at all.
+- Polling `resume` on a finished run no longer mints a lease nobody releases.
+  The claim was taken before the terminal check, so a status poll could block the
+  next process from restarting it.
+- **Resuming a custom-engine run works from the product entry points.** The
+  credentials are never persisted, so a crashed run could only be resumed by a
+  caller that still had them in memory — which excluded the dashboard and every
+  remote caller. `workflow_resume` and the HTTP autoloop resume now take a secret
+  _reference_: a name the orchestrator resolves from its own environment
+  (`CLAWO_CUSTOM_ENGINE_<REF>`). The name is not sensitive, the value never
+  crosses the wire, and an unknown name is an error rather than a silent start
+  without credentials.
+- **The dashboard's Resume button can resume a custom-engine run.** It sent an
+  empty body unconditionally, so the one caller with a button for this was the
+  one caller that could not do it. It now asks
+  `GET /autoloop/<id>/resume-requirements` which roles used a custom engine and
+  prompts for one reference name each.
+- Readiness deferreds, live-run handles, the starting marker, and `delete` are
+  keyed by the identity of a particular start, not by run id. A run id is reused when a failed start frees
+  it, and keying on the id let a dying start clear the retry's deferred — the
+  retry then waited forever for a signal with nowhere to land.
+- **One execution, one identity.** `Council` and `Fanout` minted their own ids
+  and stamped those on every ledger row's `parentRunId`, so the ledger could not
+  be grouped by the kernel run a turn belonged to. They take the run id now.
+- A cancelled run is `cancelled`, whatever the node returned. A runner that never
+  looked at the signal and reported success carried the run to `completed`, so
+  "I cancelled it" and "it completed" could both be true. Cancelling also reaches
+  the live `Council` / `Fanout` and calls their `abort()`, instead of setting a
+  flag and waiting out the node timeout.
+- A subflow's child run id is recorded when the child starts, not when it
+  finishes — which is to say, it is now recorded in the only window where
+  cancelling the parent needs it.
+- A workflow spec is validated before it runs: duplicate node ids, `next` and
+  router targets naming nodes that do not exist, and negative retry or visit
+  bounds are refused up front instead of failing halfway through.
+- A contract with no recognised checks is refused. It used to normalise to
+  nothing, leaving the run with no contract at all — so a caller who asked to be
+  checked was told nothing had checked it, and never saw why.
+- Acceptance checks have a timeout. The predecessor pipeline had none, so a
+  wedged `npm test` hung a build indefinitely. A check that overruns is killed —
+  its whole process group, with SIGKILL — and recorded as failed.
+- `steps[].required` is honoured. The field was declared on the old step list and
+  never read, so every step was fatal.
+- Autoloop's per-iteration `diff.patch` includes files the Coder created. It was
+  captured with a bare `git diff`, which lists tracked modifications only, while
+  the `git add -A` two lines later committed the new files anyway — so the
+  Reviewer audited a picture that structurally could not show them. `files_changed`
+  is also taken from git unconditionally; it previously preferred the Coder's own
+  claim despite the comment above it saying otherwise.
+- `on_target_hit` fires. The push-policy key was declared, defaulted, and
+  whitelisted for runtime updates with zero firing sites anywhere — autoloop had
+  four ways to notice it was failing and none to notice it had succeeded. A
+  passing contract is the signal.
+- A `setTimeout` in the ultrareview error path was missing `.unref()`, holding
+  the event loop open for 30 minutes after a fan-out that failed to start.
+- A node that overran its timeout reported the whole run as `cancelled` rather
+  than `failed`, because the timeout and a user cancel shared one signal.
+
+### Execution guarantees
+
+These describe how the new subsystem behaves. Nothing here is an advisory about
+an earlier release: the run kernel, its spec files and its per-agent adapters are
+all new in this version, so none of these paths exist in 5.x or before.
+
+- **A read-only mode is read-only all the way down.** `ultrareview` builds a
+  bespoke prompt and `permissionMode: 'plan'` for each reviewer, and the fan-out
+  spec now mirrors the legacy shape field for field so every one of them reaches
+  the session. The synthesis pass is held to the same rule: it shares the project
+  directory, so a writable synthesiser would undo the read-only agents one step
+  later. Asserted by driving a fake session that writes a file whenever its
+  permission mode allows it — "was the flag forwarded" is not the question, "did
+  the agent get to write" is.
+- **Custom-engine credentials never reach disk.** `CustomEngineConfig.env` is for
+  environment variables, tokens included. They travel through an in-memory side
+  channel that is not part of the checkpoint, and the spec is scrubbed on the way
+  out as a second line, so a future field cannot leak by omission. A resume in
+  another process is given them again by name — see the secret references above —
+  rather than reading them back.
+- **One owner per run, and one way to write.** Executing a run means holding a
+  `RunGuard`, which names the run's `incarnationId`, the owning kernel's
+  `ownerId`, that owner's `acquisitionId`, and a `fence`. Without it, two
+  processes each execute a run's nodes — every side effect twice, two writers to
+  one checkpoint, one event log interleaving two timelines.
+
+  It is a capability, not a convention:
+  - **`commit(guard, batch)` is the only way to change anything durable.**
+    Checkpoints, events and node artifacts all go through it, inside one `O_EXCL`
+    critical section that verifies the guard first, and the raw writers are no
+    longer exported — so there is no path around it. The rule previously lived in
+    a comment while the engine wrote checkpoints directly from `start`, `resume`,
+    `publish`, `setChild` and the whole result-absorbing path, and a rule
+    enforced by a comment is not a rule.
+  - **A batch lands whole.** It is staged in a scratch directory and published by
+    one atomic directory rename, which is the commit point; what follows is
+    replayable application of an already-committed transaction, finished by the
+    next reader if the owner died in between. Application is idempotent — the
+    manifest records the event log's length from before the batch, so recovery
+    truncates and re-appends instead of duplicating. Before this, `committed`
+    meant "most of it was attempted": the event append swallowed its own errors,
+    so a finished checkpoint could land with its events silently dropped, and a
+    batch that failed partway left behind the artifacts it had already written.
+  - **Creating a run and claiming it are one step.** The run directory is made
+    with a non-recursive `mkdir`, which _is_ the claim. Asking `runExists()` and
+    then creating with `{ recursive: true }` is a check-then-write race, and it
+    lost routinely: two processes creating the same id 80 times both "succeeded"
+    76 times, leaving one workflow executing under another's `spec.json`, or a
+    lease belonging to an incarnation that had already been overwritten.
+  - **The lock's wait is bounded on every path.** Two of the retry paths out of
+    the acquisition loop continued past the deadline check without yielding, so a
+    lock that could neither be taken nor broken became a hot loop with no exit —
+    not a failure, not a return, just a burnt core. The deadline is checked once
+    per iteration now, before anything can continue past it. Found by running the
+    suite on CI for the first time, where it presented as a job that went silent
+    for fourteen minutes after finishing a test file.
+  - **Contention is not a takeover.** `commit` reports `committed`, `superseded`
+    or `blocked`, and only `superseded` is permanent. The lock waits briefly
+    rather than failing on sight, and an owner that still cannot write stops
+    _and hands its claim back_ — because a live local pid is never judged stale,
+    so a lease left behind by a stopped run could never be taken over and the run
+    was lost for good. One boolean for both failures is what let a millisecond of
+    contention wedge a run permanently.
+  - **Copy-on-write.** A change is applied to a clone, committed, and adopted
+    only if the disk accepted it. A superseded owner therefore does not merely
+    fail to persist: the record it hands back to its own caller stops advancing
+    too. Refusing the write while returning a record that says `completed`, with
+    the output, the cost and a passing verdict on it, is the same claim one layer
+    up — and the record is what callers read.
+  - **A deleted run id is a new run.** The fence lives in `incarnation.json`,
+    which survives releasing the lease (so the counter never restarts while the
+    run exists) and dies with the run directory (so the next run under the same
+    id gets a fresh random incarnation). Without that, deleting a run and reusing
+    its id reset the fence to 1 and an abandoned attempt still holding fence 1
+    became valid a second time — an ABA, and not a hypothetical one, because a
+    timed-out attempt outlives its run by construction.
+  - **Re-acquiring supersedes.** A second claim, even by the same owner, mints a
+    new acquisition id and kills the previous guard.
+  - **Owner identity is not the pid.** Two `RunKernel`s in one process — two
+    SessionManagers is not exotic — share a pid, and treating that as
+    re-entrancy let both execute the same run. Each kernel has its own owner id.
+  - **Atomic acquisition.** The check and the write happen inside the lock,
+    because read-then-write let two racers both conclude they had it.
+  - **An independent heartbeat**, not only at checkpoints: a run executing one
+    long node makes none, and must not look abandoned for it. On the same host a
+    live pid is the authority and is never judged stale for going quiet.
+
+  In-process, starting a run whose id is already live retires the previous run
+  first — the same rule, applied where a lease cannot see.
+
+  The UltraApp build queue takes an equivalent claim, with the same corrections
+  applied to the same places: read-and-claim happens in one `O_EXCL` critical
+  section (two processes starting with no state file both saw "free", and nothing
+  wrote an owner until the first enqueue), the owner is an id of its own rather
+  than a pid, **every** state write re-checks the claim inside the lock it writes
+  in, and that check has the same three outcomes as the run store's. Checking
+  only at construction was not ownership — the heartbeat is the same write, so a
+  queue that had lapsed and been taken over would stamp itself back in as owner
+  on its next persist, clobber the new owner's pending list and run its builds a
+  second time. And answering "could not take the lock" with the same `false` as
+  "I have been superseded" meant `enqueue` and dispatch carried on through it,
+  running a build whose queue state on disk already named a different owner. A
+  queue that finds it has been superseded stands down: it stops heartbeating,
+  drops its pending list, and refuses `enqueue` and dispatch. A queue that merely
+  cannot get the lock refuses the enqueue and re-tries the dispatch, bounded, and
+  fails the build with the reason rather than starting it.
+
+- Run ids are validated as a single path segment before any path is derived from
+  them. They can be supplied by the caller — including through a tool call — and
+  every path in the run store came from `path.join(root, runId)`, with delete
+  implemented as a recursive `rmSync`. `../` in an id resolved outside the store,
+  so `workflow_delete` could remove an unrelated directory. Reusing an existing
+  run id is refused as well: overwriting `spec.json` discarded one run's
+  definition while its event log kept growing, leaving a log describing two runs
+  and a replay that reconstructed neither.
+- A passing verdict no longer survives later edits to the tree it describes.
+  Evidence records a digest of the working tree's **content** — HEAD, the full
+  `git diff HEAD`, and the bytes of every untracked file — and a
+  workspace-touching node running after the verdict causes it to be recomputed at
+  the end of the run; if it moved, the outcome drops to `unverified` with the
+  reason recorded. (The first attempt hashed `git status --porcelain`, which
+  reports a file's _state_, not its bytes: a file already `M` before the checks
+  and rewritten afterwards produced an identical digest, so the commonest case —
+  an agent editing a file it had already edited — was exactly the one it missed.)
+  The `solve` template's reviewer fan-out has moved ahead of the gate — it shared
+  the project directory, so reviewers could edit a tree the verifier had already
+  signed off while the run still reported `verified`.
+- Agent nodes name their session per attempt. A timed-out attempt is abandoned
+  rather than killed, and its teardown would otherwise stop the retry's session.
+- Cancelling an autoloop run tears the loop down instead of leaving its three
+  persistent agents running with their session names claimed — which surfaced
+  much later, and far from its cause, as `session name already in use`.
+- `autoloopResume` no longer hangs forever on a terminated run. `kernel.resume`
+  left terminal runs untouched while the caller awaited a readiness signal that
+  was never coming; resuming an autoloop now restarts it, and readiness is raced
+  against the run ending.
+- The `node:fs` mock in the SessionManager tests no-op'd **every** write in the
+  process to keep two files out of the developer's home directory. It now names
+  those two files and passes everything else through.
+
+### Testing
+
+- **`src/__tests__/invariants.test.ts`** drives the real public APIs through the
+  real kernel, the real node executors and the real `Council` / `Fanout`, with a
+  fake engine session as the only seam. No mode assertion in it replaces a node
+  executor.
+
+  This exists because the alternative failed. Every other mode test replaces the
+  executor and asserts on the spec that reached it, which proves the spec's shape
+  and nothing about what ran: that is how a read-only review that could write,
+  and a credential written to disk, both shipped with the whole suite green. The
+  harness asserts what the runtime actually did — each legacy field arriving at
+  the session, a reviewer being unable to write (the fake writes a file whenever
+  its permission mode allows it), no secret in any run file, cancel never
+  yielding `completed`, a verdict expiring when an already-dirty file changes
+  again, and — with a real child process and a real `SIGKILL` — recovery that
+  re-runs only the node that was in flight, with a second owner refused.
+
+  Its ownership section is written as races rather than as descriptions of
+  races, because the earlier version's names were stronger than its coverage.
+  UltraApp's pipeline gets the two assertions the move was made for: the build
+  is listed in the run store as a workflow with per-stage node records and a
+  build evidence bundle, and a build whose checkpoint says it died after the
+  council is resumed without running the council a second time.
+
+  Two real processes create the same forty run ids at the same instant and the
+  assertion is that no id was created by both and every id was created by one.
+  A real other process holds the lock file while a run tries to write, briefly in
+  one test (the run must get through) and past the wait in another (the run must
+  stop _and_ give the claim back, so a second kernel can resume it). A batch that
+  cannot be staged leaves no artifact, no event and no checkpoint behind, and a
+  transaction committed but not applied is finished by the next reader without
+  duplicating its events. And an ultraapp queue that hits the lock while a new
+  owner is inside it runs nothing.
+  Two real processes wait for the same instant and then contend for a claim for a
+  fixed window, so neither can win by outliving the other, and the assertion is
+  that exactly one ever holds it and exactly one ever commits. Two processes
+  contend for an **empty** ultraapp queue — the state that actually broke, which
+  a pre-seeded owner never reached — and the assertion is that exactly one build
+  runs, not "at most one", which zero also satisfies. A superseded owner really
+  attempts a commit, and a takeover is performed by the real acquisition path
+  rather than by hand-writing its result. The fresh-process custom-engine resume
+  runs `SessionManager.autoloopResume` in a process that never held the config,
+  once without the reference and once with it, and asserts the reference is what
+  changed the outcome. And the reused-run-id case fires the loser's late cleanup
+  while the winner's start is still in flight, rather than after it.
+
+### Removed
+
+- `listCouncilsFromDisk`, `appendAutoloopRegistry`, `upsertAutoloopRegistry`,
+  `listAutoloopsFromRegistry`, `removeAutoloopFromRegistry` and the
+  `AutoloopRegistryEntry` type. Cross-process listing is `listRuns()`.
+- `RESULT_TTL_MS`, `ULTRAREVIEW_POLL_INTERVAL_MS` and `GIT_LOG_DEPTH` — the
+  eviction, polling and magic-window constants have nothing left to configure.
+- No tools were removed. All 69 previous tools keep their behaviour, and a caller
+  that declares no contract sees the same completion semantics as 5.1.0.
+
+## [5.1.0] - 2026-08-23
+
+### Added
+
+- **`engine: 'grok'` — xAI Grok Build.** `grok -p <msg> --output-format json` per send.
+  Two things make it unlike the other one-shot engines. Its result object reports
+  `total_cost_usd`, so the wrapper passes the engine's own spend straight through
+  instead of multiplying tokens by a rate in `models.ts` — the run ledger and the
+  `maxBudgetUsd` gate both read what xAI actually charged, and grok's two price
+  tiers never have to be modelled. And it reports the model that answered, which
+  the router-style engines do not. Conversation continuity is `--resume <sessionId>`,
+  confirmed with a two-turn recall test; usage and cost are per-turn, checked by
+  resuming and reading turn 2 rather than assumed. `sandboxMode: 'read-only'` is
+  **refused**, not approximated: grok's plan mode is model-cooperative and its deny
+  rules have not been through the adversarial matrix, so a read-only session throws
+  rather than running writable under a read-only label.
+- `grok-4.6` in the model registry (500,000-token window, base tier $2/$0.50/$6),
+  registered for the context window and an indicative breakdown — not to price turns.
+
+### Changed
+
+- Every reference doc that enumerated engines now lists `grok` and drops `cursor`
+  from the offered set — `tools.md`'s `engine` parameter, `sessions.md`, `cli.md`,
+  `observability.md`, `openai-compat.md`, `autoloop.md`, `getting-started.md`, `acp.md`.
+  Mentions of Cursor as an **MCP or ACP host** are unchanged; that is a different role.
+  While there, `autoloop.md` no longer claims Cursor and OpenCode lack native multi-turn
+  conversation — both resume by id, and `engineHasNativeConversation` has said so since
+  4.12.2.
+
+- **`engine: 'cursor'` is now legacy**, the same treatment `gemini` has: the wrapper
+  still works and existing callers are not broken, but it is no longer a documented
+  option, is not version-tracked, and gets no new work. Note what this is not —
+  Cursor has not been discontinued; Anysphere was acquired by SpaceX (closed
+  2026-08-15) and the CLI has shipped since. What pushed it out of the tracked set is
+  that Cursor never reports which model actually ran (its init event says
+  `"model": "Auto"`), so every cost row is attributed to a hardcoded proxy rate.
+
+### Fixed
+
+- **The `cursor` engine resolved its binary as the bare name `agent`, which is no
+  longer unambiguous.** xAI's Grok installer symlinks `agent` to its own binary, so on
+  a machine with both, a Cursor session spawned Grok and failed the turn with
+  `error: unexpected argument '--force' found`. The wrapper now resolves
+  `cursor-agent`, the name Cursor owns; `CURSOR_BIN` still overrides.
+
 ## [5.0.0-memento.6] - 2026-09-29
 
 ### Fixed
@@ -47,7 +1626,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   engine, whatever their outcome". `turnsSucceeded` counts only the ones the
   engine reported as successful, and the predicate is the engine's own terminal
   verdict rather than the exit code: `codex` fails a turn that emits
-  `turn.failed` while exiting 0, `agy` requires `SUCCESS` *and* a zero exit,
+  `turn.failed` while exiting 0, `agy` requires `SUCCESS` _and_ a zero exit,
   `gemini` succeeds on exit 53 (its turn limit resolves), `codex-app` requires
   `status: 'completed'`, and `opencode` refuses a turn on purpose when read-only
   enforcement did not load. On the one-shot engines the counter and that turn's
@@ -59,13 +1638,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two counters is the failure count on the one-shot engines only.** On `claude`
   and a persistent `custom`, `turns` counts `user` events and the CLI emits one
   per tool-result batch as well as the prompt echo — a send that used eight tools
-  counts nine. `turnsSucceeded` *is* one-per-send everywhere, so compare it
+  counts nine. `turnsSucceeded` _is_ one-per-send everywhere, so compare it
   against sends there, not against `turns`. Measured against claude-code
   stream-json, not inferred.
 
   Exposed as `turns_succeeded` on `/v1/sessions` (openai-compat sessions) and in
   `health().details`.
-
 
 - Registry entries for `claude-mythos-5` (Fable 5 parity) and for the 4.5
   generation, `claude-sonnet-4-5` and `claude-opus-4-5` — still served, and
@@ -77,7 +1655,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   counter, a turn the engine declined to count as succeeded — an interrupted
   `codex-app` turn, a non-SUCCESS `agy` turn — resolves without throwing, so
   `ok` is `false` while `error` is absent. Those rows now read `not counted as
-  succeeded`, and `observability.md` says that `error` is not guaranteed on a
+succeeded`, and `observability.md` says that `error` is not guaranteed on a
   failed row.
 
 ### Fixed
@@ -108,7 +1686,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status is now recorded sticky-on-failure and the exit code stays in the
   outcome expression, so a turn whose promise rejects is never counted as one
   that succeeded.
-
 
 - **Claude Sonnet 5 was priced 50% too high.** The registry carried $3/$15 per
   Mtok on purpose: $2/$10 had been announced as introductory pricing through
@@ -144,7 +1721,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than silently substituted.
 
 - **An `agy` turn that agy itself rejected surfaced as `Antigravity exited with
-  code 1`.** agy reports a rejected invocation as a stream-json `result` event
+code 1`.** agy reports a rejected invocation as a stream-json `result` event
   carrying `error` and prints nothing on stderr, so the specific message — which
   names the values it will accept — was discarded. It is now surfaced as the
   turn's error, including when agy exits 0 while reporting one.
@@ -163,7 +1740,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   logged and swallowed, never allowed to break the turn it describes.
 - **`clawo runs`** — query the ledger from the CLI:
   `clawo runs [--since 30m|24h|7d|<ISO>] [--session <name>] [--engine <engine>]
-  [--parent <run id>] [-n <limit>] [--json]`. Also exposed as `GET /runs`
+[--parent <run id>] [-n <limit>] [--json]`. Also exposed as `GET /runs`
   (query string or JSON body) and `manager.getRunLedger()`, both returning rows
   plus a summary with a per-engine cost breakdown.
 - **Dashboard 24-hour spend indicator**, fed by the same endpoint.
@@ -267,7 +1844,7 @@ rather than lingering.
 
 ## [4.13.0] - 2026-08-17
 
-MCP gives tools *to* an agent; ACP makes you *be* the agent. Every agent in the
+MCP gives tools _to_ an agent; ACP makes you _be_ the agent. Every agent in the
 Agent Client Protocol ecosystem is a single agent — this one is a fleet.
 
 ### Added
@@ -355,7 +1932,7 @@ conversation reached the engine without the caller's system prompt. Reported in
 - **`cursor` and `opencode` claimed a live conversation they might not have.**
   4.12.0 moved them to the native-conversation side of the bridge without giving
   them a case in `nativeThreadIsLive()`, so they fell through to its `default:
-  true` — the "session is in the manager's map" signal that predicate exists to
+true` — the "session is in the manager's map" signal that predicate exists to
   replace. A session whose first turn died before the engine announced an id was
   then indistinguishable from a healthy one, and lost the caller's system prompt
   and tool schemas on every subsequent turn rather than just once. Both engines
@@ -458,7 +2035,7 @@ all could; the wrappers just never used it.
   the entire tool schema block, every tool result, and the system prompt every
   turn. Those three savings, added in 4.11.0 for codex/agy, now apply here too.
 - **Antigravity reports real token usage.** agy grew `--output-format
-  stream-json`, whose `result` event carries input/output/cache-read tokens; the
+stream-json`, whose `result` event carries input/output/cache-read tokens; the
   wrapper had been estimating ~4 chars per token from the message text, which
   under-counted a real turn by more than two orders of magnitude (a short prompt
   measured 27 estimated tokens against ~15k actual). Cost for this engine was a
@@ -650,6 +2227,7 @@ attempting an actual adversarial write against the installed CLI, not by trustin
 flag or the model's self-report.
 
 ### Fixed
+
 - **Cursor read-only is now genuinely enforced.** `sandboxMode: 'read-only'` previously
   relied on `--mode plan`, which Cursor documents as steering "rather than enforcing
   permissions" — an adversarial prompt could still make edit-tool calls write files.
@@ -665,10 +2243,11 @@ flag or the model's self-report.
   re-verified field-by-field).
 - **OpenCode read-only fails closed.** If the injected `clawo-readonly` enforcement agent
   fails to load, OpenCode 1.17.15 prints a warning and silently runs the default,
-  *writable* agent. A read-only session now detects that fallback and refuses the turn
+  _writable_ agent. A read-only session now detects that fallback and refuses the turn
   rather than returning output produced without its sandbox.
 
 ### Changed
+
 - Tested-engine pins updated to Cursor Agent **2026.07.09-a3815c0** and OpenCode
   **1.17.15**. OpenCode's `run --format json` event schema, token field path
   (`step_finish.part.tokens`), and agent-permission config were diffed at both tags and
@@ -678,11 +2257,13 @@ flag or the model's self-report.
 ## [4.8.0] - 2026-07-12
 
 ### Added
+
 - **Per-role Autoloop engines** (closes #72). Planner, Coder, and Reviewer can independently use any built-in engine; a custom engine may additionally be supplied by a local caller. Existing runs keep the Claude defaults (`opus` for Planner, `sonnet` for Coder/Reviewer); non-Claude roles use their engine's default model when no model is supplied. Planner `spawn_subagents` can override Coder/Reviewer engine and model without accepting custom configuration data.
 - **Conversation replay for engines without native multi-turn.** Claude (persistent process), Codex (thread resume) and Antigravity (`--conversation`) carry context themselves; Gemini, Cursor, OpenCode and one-shot custom engines spawn a fresh process per send, so the dispatcher now replays the role's transcript in-band (`<conversation_history>`, oldest turns dropped past a character budget). Without this a non-Claude Planner forgot the plan it had just proposed on every turn.
 - **`sandboxMode: 'read-only'` is now enforced on every engine that accepts it**, not just Codex: Claude maps it to plan mode, Gemini to `--approval-mode plan` **plus an admin policy denying `exit_plan_mode`** (plan mode alone is model-cooperative and can be escaped), Antigravity/Cursor to their plan modes, and OpenCode to a generated `clawo-readonly` agent whose permissions deny `edit`/`bash`/`external_directory` (its built-in `plan` agent is a user-overridable preset that denies neither). A custom engine that cannot express read-only now refuses to start rather than silently running write-enabled.
 
 ### Changed
+
 - Built-in non-Claude Autoloop roles receive their role protocol in-band. Non-Claude Planners start in their engine's read-only/plan mode.
 - Autoloop registry entries retain each role's effective engine/model selection, including successful `spawn_subagents` overrides, and are now written as an upsert — a run keeps one row instead of accumulating one per start, spawn and resume.
 - `spawn_subagents` rejects engine/model changes after the corresponding session starts, rolls back a newly started Coder if Reviewer startup fails, and drops a prior model when switching to a different engine without an explicit replacement. If a rollback stop fails, the role stays marked as started so a later engine change is rejected rather than silently reusing the old engine's process.
@@ -691,11 +2272,13 @@ flag or the model's self-report.
 - Tested-engine pins updated to Claude Code **2.1.207**, Codex **0.144.1**, Gemini **0.43.0**, Antigravity **1.1.1**, Cursor Agent **2026.04.08-a41fba1**, and OpenCode **1.1.40**.
 
 ### Notes
+
 - **Custom engines are local-only by design.** A custom engine names an executable to spawn (plus argv and env), so it may only be configured by a local caller — the MCP tool or the `SessionManager` API. The HTTP API (`POST /autoloop/new`, `POST /autoloop/<id>/resume`) accepts built-in engines only and rejects a `*_custom_engine` body field with a 400. The embedded server is often reverse-tunnelled and its token is a monitoring credential; it is not a channel for choosing what binary the host runs.
 
 ## [4.7.0] - 2026-07-10
 
 ### Added
+
 - **First-class Google Antigravity engine (`engine: 'agy'`).** Wraps the `agy` CLI —
   Google's successor to Gemini CLI (consumer Gemini CLI tiers stopped serving
   2026-06-18) — as a built-in one-shot engine, replacing the custom-engine recipe.
@@ -726,6 +2309,7 @@ flag or the model's self-report.
   rejects it for that auth type), so 5.6 is opt-in via `model`.
 
 ### Changed
+
 - **stderr secret redaction unified across engines** (`src/sanitize.ts`). The claude,
   gemini, cursor, opencode, custom, and agy engines now share one sanitizer whose
   patterns are the union of the previous per-engine copies (Bearer tokens incl.
@@ -738,6 +2322,7 @@ flag or the model's self-report.
   `max` applies to Bedrock GPT-5.6 models only), so the `max`→`xhigh` mapping stays.
 
 ### Removed
+
 - `delegate` removed from `PermissionMode` and the tool schemas: current Claude Code
   CLIs reject it at spawn (verified against 2.1.206), so it could only produce a
   session that fails to start.
@@ -745,6 +2330,7 @@ flag or the model's self-report.
 ## [4.6.0] - 2026-07-03
 
 ### Added
+
 - **Claude Fable 5** registered in the model registry (`src/models.ts`): the first Claude 5-family
   model, in a tier above Opus. Standard $10/$50-per-Mtok pricing (cache read $1.00), full 1M-token
   context at standard rates (no long-context surcharge). New `fable` alias resolves to it. (Claude
@@ -752,6 +2338,7 @@ flag or the model's self-report.
   `mythos`-named model strings are still routed to Anthropic.)
 
 ### Changed
+
 - Anthropic-model detection heuristics (`isClaudeModel`, `resolveProvider` fallback) now recognize
   `fable` and `mythos` model strings.
 - Tested Claude Code CLI pin updated to **2.1.199** (2.1.198–199 are subagent/background-agent
@@ -760,6 +2347,7 @@ flag or the model's self-report.
 ## [4.5.1] - 2026-07-01
 
 ### Changed
+
 - CI now publishes to npm via **trusted publishing (OIDC)** instead of a long-lived `NPM_TOKEN`
   secret — no credential to rotate and nothing that expires. No change to the published package
   contents or runtime behavior.
@@ -767,12 +2355,14 @@ flag or the model's self-report.
 ## [4.5.0] - 2026-07-01
 
 ### Added
+
 - **Claude Sonnet 5** registered in the model registry (`src/models.ts`): native 1M-token context
   window, standard $3/$15-per-Mtok pricing (cached $0.30). It is the new Claude Code default as of
   CLI 2.1.197. (Anthropic runs a launch promo of $2/$10 through 2026-08-31; we price the standard
   rate so cost estimates never under-report.)
 
 ### Changed
+
 - The `sonnet` alias now resolves to `claude-sonnet-5` (was `claude-sonnet-4-6`), matching the Claude
   CLI's own `sonnet` default so cost tracking and context-window estimates stay accurate. The older
   `claude-sonnet-4-6` remains selectable by its full id.
@@ -791,6 +2381,7 @@ No behavior changes for normal use; the focus is failure-path correctness, resou
 and input validation. All 802 unit tests pass; build/lint/format clean.
 
 ### Fixed
+
 - **Subprocess I/O (all engines):** `persistent-session` / `persistent-custom-session` now attach a
   readline `error` handler (an stdout stream fault used to crash the monitor process), check
   `stdin.writable` and pass a write error callback (silent write failures left `waitForComplete`
@@ -831,22 +2422,26 @@ and input validation. All 802 unit tests pass; build/lint/format clean.
 - **Dependencies:** refreshed the lockfile (advisory count 30 → 5, none high/critical).
 
 ### Added
+
 - `AutoloopConfig.maxDispatchDepth` — configurable per-drain message ceiling (default 64) for
   legitimately deep workflows.
 
 ### Docs
+
 - Corrected the registered-tool count (39 → 63) and the documented opencode/cursor invocation flags
   to match the actual wrappers.
 
 ### Tests
+
 - Added InboxManager coverage (idle/busy delivery, broadcast, queue flush, error fallback) and
   `getAnthropicBaseUrl` env-layer/memoization coverage; plus a regression test for the autoloop
   terminated final-state contract.
 
 ### Notes
+
 - The remaining audit-reported dependency advisories (esbuild, and protobufjs/tar nested under the
   `openclaw` peer dependency) are not present in this package's published tarball; the only `npm audit
-  fix --force` path downgrades the `openclaw` peer to a stub, so it is intentionally not applied.
+fix --force` path downgrades the `openclaw` peer to a stub, so it is intentionally not applied.
 
 ## [4.3.0] - 2026-06-16
 
@@ -1196,7 +2791,7 @@ The fix moves the role boundary from soft (prompt rule) to hard
 (tool gating):
 
 - **Planner session now passes `disallowedTools: ['Write', 'Edit',
-  'MultiEdit', 'NotebookEdit']` to Claude Code.** Read / Glob / Grep /
+'MultiEdit', 'NotebookEdit']` to Claude Code.** Read / Glob / Grep /
   Bash stay enabled so the Planner can still discover and audit the
   workspace.
 - **New autoloop tools `write_plan` and `write_goal`** replace
@@ -1213,7 +2808,7 @@ The fix moves the role boundary from soft (prompt rule) to hard
   boundaries remain prompt-only (their roles need Write/Edit to function;
   Reviewer's cwd-isolation continues to provide soft sandboxing).
 - `PlannerToolEffects.commitPlanFile` renamed to `writePlanFile(file,
-  content, commitMessage?)` — the new contract takes content.
+content, commitMessage?)` — the new contract takes content.
 
 This is a behavioural breaking change for anyone driving the Planner with
 custom prompts that reference the old tool names; the orchestrator surfaces
@@ -1231,7 +2826,7 @@ fetch resolved into the error branch.
 
 - HTTP `POST /autoloop/<id>/chat` is now fire-and-forget: validates the run
   is alive in memory, dispatches the message, returns **202** `{ ok, queued:
-  true }` immediately. The Planner's reply streams back via `/events` as a
+true }` immediately. The Planner's reply streams back via `/events` as a
   `planner_reply` event — the dashboard already subscribes to it.
 - New `planner_error` SSE event so runtime failures inside the Planner
   surface to the dashboard instead of hanging the "thinking…" indicator.
@@ -1312,7 +2907,7 @@ and switchable via Promote.
   consensus by 3-way YES vote (uses the existing `Council` class).
 - **Fix-on-failure helper** (`src/ultraapp/fix-on-failure.ts`): purpose-
   built ~50-line loop that drives `npm install / build / test / docker
-  build` and spawns a Claude Opus fixer session on red, up to N rounds.
+build` and spawns a Claude Opus fixer session on red, up to N rounds.
   Replaces the original autoloop adapter (different problem shape).
 - **Build queue** (`src/ultraapp/build.ts`): global serial FIFO with 11
   `BuildEvent` variants and live position reporting.
@@ -1352,9 +2947,9 @@ and switchable via Promote.
   `ultraapp_start_container`, `ultraapp_stop_container`, `ultraapp_delete`.
   All declared in `openclaw.plugin.json`.
 - **HTTP routes:** `/ultraapp/{list, new, <id>, <id>/answer,
-  <id>/spec-edit, <id>/files, <id>/events (SSE), <id>/build,
-  <id>/build/cancel, <id>/artifacts, <id>/start, <id>/stop, <id>/delete,
-  <id>/feedback, <id>/promote-version}`.
+<id>/spec-edit, <id>/files, <id>/events (SSE), <id>/build,
+<id>/build/cancel, <id>/artifacts, <id>/start, <id>/stop, <id>/delete,
+<id>/feedback, <id>/promote-version}`.
 - **Dashboard:** Forge tab with three-column layout (chat / spec / files).
   Mode pill (interview → queued → building → build-complete | deploying →
   done | failed). Chat input mode-aware: in interview mode submits to
@@ -1383,8 +2978,8 @@ engine or skill drift fails this test loudly. Manual smoke runner at
   (typical complete spec lands in 5–8 questions).
 - **`skills/references/ultraapp.md`** (new) — operator reference: lifecycle,
   conventions §1–§7 summary, runtime modes, file layout, all 14 MCP tools
-  + matching HTTP routes, done-mode classifier behaviour, reference-trace
-  replayer, known limitations.
+  - matching HTTP routes, done-mode classifier behaviour, reference-trace
+    replayer, known limitations.
 - **`skills/references/tools.md`** — adds Autoloop (6) and Ultraapp (14)
   sections with full param schemas; total declared tool count now matches
   the 55 registered in `src/index.ts`.
@@ -1662,11 +3257,11 @@ The embedded HTTP server now requires authentication on every endpoint
 except `/health`. Previously it ran unauthenticated unless `OPENCLAW_SERVER_TOKEN`
 was explicitly set (CWE-306).
 
-| Mode | Trigger |
-|---|---|
+| Mode                            | Trigger                                                                                                   |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------- |
 | **Auto-generate** (new default) | unset env var → server writes a fresh 32-byte token to `~/.openclaw/server-token` (mode 0600) at startup. |
-| **Explicit token** (unchanged) | `OPENCLAW_SERVER_TOKEN=<value>` |
-| **Disabled** (opt-out, new) | `OPENCLAW_SERVER_TOKEN=disabled` — single-user host only; logs a loud warning |
+| **Explicit token** (unchanged)  | `OPENCLAW_SERVER_TOKEN=<value>`                                                                           |
+| **Disabled** (opt-out, new)     | `OPENCLAW_SERVER_TOKEN=disabled` — single-user host only; logs a loud warning                             |
 
 Three ways to authenticate (all equivalent):
 
@@ -1750,11 +3345,11 @@ Each agent session is monitored after every turn via `getStats().contextPercent`
 When it crosses the per-agent threshold the dispatcher dispatches `/compact`
 with an agent-specific summary hint:
 
-| Agent | Default threshold | What `/compact` is told to preserve |
-|---|---|---|
-| Planner | 80% | current plan / goal, decisions with the user, what's been tried + rejected, user prefs, iter verdicts |
-| Coder | 70% | codebase familiarity, attempted patches, current working state, plan + goal |
-| Reviewer | 70% | fakery patterns caught, recent metrics, structural rules from goal.json |
+| Agent    | Default threshold | What `/compact` is told to preserve                                                                   |
+| -------- | ----------------- | ----------------------------------------------------------------------------------------------------- |
+| Planner  | 80%               | current plan / goal, decisions with the user, what's been tried + rejected, user prefs, iter verdicts |
+| Coder    | 70%               | codebase familiarity, attempted patches, current working state, plan + goal                           |
+| Reviewer | 70%               | fakery patterns caught, recent metrics, structural rules from goal.json                               |
 
 Per-run override via `compactThresholds: { planner?, coder?, reviewer? }` on
 the dispatcher config. 30-second cooldown prevents back-to-back compactions.
@@ -1874,6 +3469,7 @@ explicit decision-needed. WeChat → WhatsApp → email fallback chain
 (mirrors push-api-skill SKILL.md §B). 5-minute dedup on (level, summary).
 
 **Backend SSE/HTTP** for the upcoming 3-pane UI:
+
 - `GET /autoloop/list`
 - `GET /autoloop/<id>/state`
 - `GET /autoloop/<id>/push_log`
@@ -1987,10 +3583,10 @@ Schema is undocumented upstream and the project releases nearly daily — pin a 
 
 OpenClaw 2026.5.x ships its own `session_status` and `agents_list` tools at the gateway level. The plugin's identically-named tools triggered `plugin tool name conflict` warnings on every gateway restart, and dispatch was ambiguous when an LLM called either name. Renamed the two colliding tools:
 
-| Before | After |
-|--------|-------|
+| Before           | After                   |
+| ---------------- | ----------------------- |
 | `session_status` | `coding_session_status` |
-| `agents_list` | `coding_agents_list` |
+| `agents_list`    | `coding_agents_list`    |
 
 No aliases — the conflicting names couldn't be invoked reliably anyway. All other tool names (and the rest of the API surface) are unchanged. If you have callers that hard-coded these two names, update them.
 
@@ -2032,24 +3628,24 @@ Project repositioned as **Claw Orchestrator** — a multi-engine coding-agent ru
 
 The 17 `claude_*`-prefixed tools were renamed to engine-neutral names. The old names remain registered as deprecated aliases for the v3.0.x line and will be removed in v3.1. The `codex_*`, `council_*`, `ultraplan_*`, `ultrareview_*` tool names are unchanged.
 
-| Old name (alias, deprecated) | New name (canonical) |
-|---|---|
-| `claude_session_start` | `session_start` |
-| `claude_session_send` | `session_send` |
-| `claude_session_stop` | `session_stop` |
-| `claude_session_list` | `session_list` |
-| `claude_sessions_overview` | `sessions_overview` |
-| `claude_session_status` | `session_status` |
-| `claude_session_grep` | `session_grep` |
-| `claude_session_compact` | `session_compact` |
-| `claude_agents_list` | `agents_list` |
-| `claude_team_list` | `team_list` |
-| `claude_team_send` | `team_send` |
-| `claude_session_update_tools` | `session_update_tools` |
-| `claude_session_switch_model` | `session_switch_model` |
-| `claude_project_purge` | `project_purge` |
-| `claude_session_send_to` | `session_send_to` |
-| `claude_session_inbox` | `session_inbox` |
+| Old name (alias, deprecated)   | New name (canonical)    |
+| ------------------------------ | ----------------------- |
+| `claude_session_start`         | `session_start`         |
+| `claude_session_send`          | `session_send`          |
+| `claude_session_stop`          | `session_stop`          |
+| `claude_session_list`          | `session_list`          |
+| `claude_sessions_overview`     | `sessions_overview`     |
+| `claude_session_status`        | `session_status`        |
+| `claude_session_grep`          | `session_grep`          |
+| `claude_session_compact`       | `session_compact`       |
+| `claude_agents_list`           | `agents_list`           |
+| `claude_team_list`             | `team_list`             |
+| `claude_team_send`             | `team_send`             |
+| `claude_session_update_tools`  | `session_update_tools`  |
+| `claude_session_switch_model`  | `session_switch_model`  |
+| `claude_project_purge`         | `project_purge`         |
+| `claude_session_send_to`       | `session_send_to`       |
+| `claude_session_inbox`         | `session_inbox`         |
 | `claude_session_deliver_inbox` | `session_deliver_inbox` |
 
 Calling a deprecated name still works; the tool description in OpenClaw's tool listing is prefixed with `[DEPRECATED — use <new-name>; this alias is removed in v3.1]` to nudge migration.
@@ -2131,6 +3727,7 @@ Skipped (passive / interactive-only): OTel numeric attribute fix and `invocation
 ## [2.14.1] - 2026-04-29
 
 ### Fixed
+
 - **`team_list` / `team_send` on Claude engine** — earlier code assumed Claude Code CLI exposed `/team` and `@teammate` as user-facing commands. They do not. `team_list` returned `Unknown command: /team` and `team_send` sent the message as plain prose with a stray `@name` prefix. Both tools now use the same engine-agnostic virtual-team layer (cross-session inbox routing) for every engine. Claude Code's native experimental Agent Teams (`CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1`, v2.1.32+) is an in-process TUI mechanism with no stdin-driven messaging surface, so a subprocess wrapper cannot drive it. Thanks @shendiid ([#48](https://github.com/Enderfga/openclaw-claude-code/issues/48))
 - Removed unused `TEAM_LIST_TIMEOUT_MS` and `TEAM_SEND_TIMEOUT_MS` constants
 - Updated README, SKILL.md, and `multi-engine.md` to describe the unified virtual-team behavior
@@ -2159,12 +3756,14 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.13.1] - 2026-04-28
 
 ### Fixed
+
 - **Windows path resolution in council** — replaced manual `import.meta.url.replace('file://', '')` with `fileURLToPath()` in `src/council.ts`. The hand-rolled stripping left a leading `/` on Windows file URLs (`file:///C:/...` → `/C:/...`), breaking config path resolution and the project-directory safety check. Thanks @shendiid ([#47](https://github.com/Enderfga/openclaw-claude-code/pull/47))
 - **Council safety check now uses `path.relative` instead of POSIX-only `'/'` separator** — the `moduleRoot + '/'` prefix check was Windows-incorrect (`\` vs `/`); now uses `path.relative()` so the safety guard works across platforms
 
 ## [2.13.0] - 2026-04-16
 
 ### Added
+
 - **Claude Code CLI 2.1.111 support** — updated tested version from 2.1.91 to 2.1.111
 - **Hook event streaming** — `includeHookEvents` option passes `--include-hook-events` for PreToolUse/PostToolUse lifecycle events
 - **Permission delegation** — `permissionPromptTool` option passes `--permission-prompt-tool` for non-interactive MCP-based permission handling
@@ -2179,17 +3778,20 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.12.2] - 2026-04-16
 
 ### Fixed
+
 - **OpenAI-compat: eliminated periodic 30–50s latency spikes** — tool definitions (`<available_tools>`) are now embedded in the session system prompt at create time instead of being prepended to every user message. For callers with many tools (e.g. 90+ MCP tools, ~50 KB payload), this enables reliable Anthropic prompt cache hits and eliminates a class of latency spikes that occurred every ~4 calls. Warm call latency drops from 3–45s (with spikes) to a stable 3–4s ([#43](https://github.com/Enderfga/openclaw-claude-code/pull/43))
 - **OpenAI-compat: session key now includes tool fingerprint** — prevents two callers with the same system prompt but different tool lists from sharing a stale session
 - **OpenAI-compat: extracted `buildSessionSystemPrompt()` helper** — deduplicated near-identical prompt strings, improved testability
 
 ### Added
+
 - **Opt-out env var `OPENAI_COMPAT_TOOLS_PER_MESSAGE=1`** — restores pre-fix per-turn tool injection for callers that mutate their tool list within a single session
 - 13 new unit tests covering tool fingerprinting, system prompt construction, and env var parsing (421 total)
 
 ## [2.12.1] - 2026-04-14
 
 ### Fixed
+
 - **Proxy: configurable Anthropic base URL** — three-layer fallback (`ANTHROPIC_BASE_URL` env var → `~/.openclaw/openclaw.json` providers → official API), enabling MiniMax and other Anthropic-compatible endpoints without patching code
 - **Proxy: removed hardcoded `minimax-portal` provider preference** — now uses first provider with a `baseUrl` from config, making the fallback generic
 - **Proxy: base URL resolution cached** — avoids synchronous filesystem reads on every request
@@ -2197,11 +3799,13 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - **Skill directory** — added `skills/claude-code-skill/` subdirectory symlink for OpenClaw skill loader compatibility
 
 ### Changed
+
 - `skills/claude-code-skill/SKILL.md` is a symlink to `skills/SKILL.md` (single source of truth)
 
 ## [2.12.0] - 2026-04-13
 
 ### Added
+
 - **Structured logging** — new `Logger` interface with `createConsoleLogger(prefix)` and `nullLogger`. Log level controlled via `OPENCLAW_LOG_LEVEL` env var (debug/info/warn/error). SessionManager and Council now accept optional `logger` parameter instead of using bare `console.*`
 - **`BaseOneShotSession` base class** — shared abstract class for one-shot (process-per-send) engines. Eliminates ~600 lines of duplication across Codex, Gemini, and Cursor session implementations
 - **`CircuitBreaker` class** — extracted from SessionManager into standalone module (`src/circuit-breaker.ts`) with `check()`, `recordFailure()`, `reset()`, `getStatus()` API
@@ -2209,11 +3813,13 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - New exports: `BaseOneShotSession`, `OneShotEngineConfig`, `Logger`, `createConsoleLogger`, `nullLogger`, `CircuitBreaker`, `InboxManager`, `SessionLookup`
 
 ### Fixed
+
 - **openai-compat: unsafe type assertion in `parseToolCallsFromText`** — tool call array elements are now validated at runtime before use, preventing crashes on malformed model output
 - **gemini-session / cursor-session: redundant dead branches** — merged identical error-handling branches in process close handlers
 - **Sensitive content removed** — cleaned internal service references and personal paths from code comments and documentation examples
 
 ### Changed
+
 - `PersistentCodexSession` now extends `BaseOneShotSession` (317 → 120 lines)
 - `PersistentGeminiSession` now extends `BaseOneShotSession` (419 → 238 lines)
 - `PersistentCursorSession` now extends `BaseOneShotSession` (441 → 264 lines)
@@ -2224,6 +3830,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.11.1] - 2026-04-11
 
 ### Fixed
+
 - **openai-compat: `--system-prompt` replaces CLI default tools during function calling** — when tools are provided via the OpenAI API, the bridge now uses `--system-prompt` (replace mode) instead of `--append-system-prompt` to suppress Claude Code's built-in tools, preventing the agent from executing host tools instead of returning `tool_calls`
 - **openai-compat: `tool_calls` arguments not always valid JSON** — `parseToolCallsFromText` now ensures the `arguments` field is always a JSON string, wrapping raw values in a JSON object when needed
 - **openai-compat: only first `<tool_calls>` block parsed** — all `<tool_calls>` blocks in a response are now parsed, with output limited to one block per response to match the OpenAI protocol
@@ -2235,6 +3842,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.11.0] - 2026-04-10
 
 ### Added
+
 - **OpenAI function calling support for openai-compat endpoint** — the `/v1/chat/completions` bridge now supports the full OpenAI tool use protocol:
   - Accepts `tools` array from requests (previously silently dropped)
   - Injects tool definitions into the prompt via `<available_tools>` block
@@ -2247,12 +3855,14 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - 19 new unit tests for function calling (tool prompt building, response parsing, tool result serialization, multi-turn flow)
 
 ### Fixed
+
 - **openai-compat session cwd** — uses empty temp directory instead of `process.cwd()` to prevent the CLI from loading CLAUDE.md and workspace context from the serve directory
 - **`tools: ''` falsy check** — empty string is now correctly passed through as `--tools ""` (previously skipped due to truthiness check)
 
 ## [2.10.0] - 2026-04-10
 
 ### Added
+
 - **Custom Engine (`engine: 'custom'`)** — integrate any coding agent CLI without writing engine-specific code. Users provide a `CustomEngineConfig` that maps CLI flags to OpenClaw session concepts. Supports two modes:
   - **Persistent** (`persistent: true`) — long-running subprocess with stream-json I/O over stdin/stdout (for Claude Code-compatible CLIs)
   - **One-shot** (`persistent: false`, default) — new process per `send()` (for simpler CLIs)
@@ -2265,16 +3875,19 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.9.4] - 2026-04-09
 
 ### Fixed
+
 - **openai-compat: system prompt not injected for non-Claude engines** — Cursor, Codex, and Gemini CLIs don't support `--append-system-prompt`, so the upstream caller's system prompt (OpenClaw agent identity, tool definitions, workspace context) was silently dropped. Now prepended as `<system>...</system>` to the user message on every turn for non-Claude engines.
 - **openai-compat: removed forceNonStream** — returning JSON when the gateway sent `stream: true` caused a protocol mismatch; the OpenAI SDK expected SSE, so webchat received no reply. Streaming with the fixed heartbeat comment format handles cold-start delay correctly.
 
 ### Added
+
 - **Cursor Auto model routing** — `model: "auto"` now resolves to the `cursor` engine, enabling Cursor's unlimited Auto mode as a primary backend via the OpenAI-compat bridge.
 - **openai-compat: optional status webhook (`OPENAI_COMPAT_STATUS_URL`)** — best-effort `POST` JSON `{ state, activity, tool }` at request start, on each CLI `tool_use` event (human-readable `activity`), when the turn completes (`state: idle`), and on handler failure (so UIs don't stick on `thinking`). Enables a webchat status bar or other dashboard to show live agent activity without parsing SSE.
 
 ## [2.9.3] - 2026-04-09
 
 ### Fixed
+
 - **openai-compat: persistent CLI destroyed every turn (#40)** — `extractUserMessage()`'s `nonSystemMessages.length <= 1` heuristic fired on every request for clients that forward only the latest user turn (OpenClaw main agent, cron jobs, subagents), causing `stopSession` + `startSession` on every turn, destroying the persistent CLI, and preventing Anthropic prompt caching from ever warming. The heuristic is now off by default; clients that want the old behavior set `OPENAI_COMPAT_NEW_CONVO_HEURISTIC=1`. All clients can still force a reset via `X-Session-Reset: 1` (now also accepted case-insensitively with whitespace).
 - **openai-compat: unkeyed callers collapsed onto one shared session (#40)** — `resolveSessionKey()` returned the literal string `'default'` when neither `X-Session-Id` nor `user` was set, so multi-caller setups all shared one `openai-default` plugin session and could see each other's `appendSystemPrompt` (a privacy leak across distinct callers). Now falls back to `'sys-<sha1(model + systemPrompt)>'` so distinct callers land on distinct sessions.
 - **openai-compat: session key ignored requested model (#40)** — two callers with the same system prompt but different requested models collided onto one session and silently got responses from whichever model the session was created with. Model is now mixed into the hash input.
@@ -2286,6 +3899,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - **openai-compat: `OpenAIChatMessage` type too narrow** — added `role: 'tool'`, `content: null | Array`, `tool_calls`, `tool_call_id` fields. `OpenAIChatCompletionRequest` now includes `tools`, `max_completion_tokens`. These fields are accepted but intentionally not forwarded to the Claude CLI — the bridge delegates all tool use to Claude Code's own tool system.
 
 ### Added
+
 - **`OPENAI_COMPAT_NEW_CONVO_HEURISTIC` env var** — opt-in legacy heuristic for webchat frontends that re-send the full transcript (ChatGPT-Next-Web, Open WebUI, etc).
 - **`GET /v1/sessions` inspection endpoint** — lists active OpenAI-compat sessions with `cached_tokens`, `tokens_in/out`, `turns`, `context_percent`, `cost_usd`. Production observability for verifying that prompt caching is actually warming. Bearer-token gated like the rest of `/v1/*`.
 - **Serve-mode tuning env vars** — `OPENCLAW_SERVE_MAX_SESSIONS` (default 32, was 5) and `OPENCLAW_SERVE_TTL_MINUTES` (default 60, was 120). Plugin-mode defaults are unchanged.
@@ -2293,14 +3907,17 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - **Tests** — 11 new unit tests covering: positive `X-Session-Reset` (1/true/case-insensitive/whitespace), negative reset values, distinct hash by system prompt, distinct hash by model, model-only hash, legacy-heuristic env-var restore, per-session send mutex serialization, mutex recovery from a failed send.
 
 ### Important
+
 - **Extra usage billing**: When OpenClaw's agent loop routes through this bridge, Anthropic recognizes the system prompt signature as programmatic/agent traffic and bills it against Claude Code's **extra usage** quota at standard API rates. This bridge does NOT bypass Anthropic's subscription enforcement or billing — it is not a workaround for API access restrictions.
 
 ### Credits
+
 - Bug diagnosis (#40) by @megayounus786.
 
 ## [2.9.2] - 2026-04-05
 
 ### Fixed
+
 - **Session creation race condition** — concurrent `startSession()` calls for the same name now check `_pendingSessions` before `sessions.has()`, preventing duplicate session creation
 - **Streaming proxy timeout** — `handleStreamingResponse` now uses `fetchWithRetry` (1 retry) instead of bare `fetch`, preventing indefinite hangs on upstream failures
 - **Swallowed errors in PersistentClaudeSession** — 7 empty `catch {}` blocks now log errors via `SESSION_EVENT.LOG` instead of silently ignoring them; process kill catches distinguish `ESRCH` (expected) from `EPERM` (logged)
@@ -2311,6 +3928,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.9.1] - 2026-04-05
 
 ### Fixed
+
 - **CLI argument parsing** — comma-separated `--allowed-tools`, `--disallowed-tools`, `--add-dir`, `--mcp-config`, and `--betas` flags now trim whitespace and filter empty entries
 - **API key sanitization** — stderr redaction now catches `sk-proj-*` and other `sk-*` key formats (previously only matched `sk-ant-*`)
 - **Council worktree cleanup** — if a worktree creation fails mid-batch, already-created worktrees are cleaned up instead of left dangling
@@ -2319,6 +3937,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - **Ultraplan TTL** — still-running ultraplans are marked as error at TTL expiry
 
 ### Added
+
 - **`estimateTokens()`** — shared token estimation utility (`~4 chars/token`), replaces 3 inline duplicates across Codex/Gemini/Cursor sessions
 - **`lookupModelStrict()`** — throws for unknown models instead of returning `undefined`
 - **Pricing fallback warning** — `getModelPricing()` now logs a `console.warn` when falling back to default pricing for unknown models
@@ -2327,11 +3946,13 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - **Tests: `embedded-server.test.ts`** — 22 tests for HTTP server (health, auth, rate limiting, body limits, routing, CORS, errors)
 
 ### Changed
+
 - **Model detection** — deduplicated inline `CLAUDE_PATTERNS` arrays in `persistent-session.ts` and `session-manager.ts`; both now use centralized `isClaudeModel()` from `models.ts`
 
 ## [2.9.0] - 2026-04-05
 
 ### Added
+
 - **Centralized model registry** (`src/models.ts`) — single source of truth for all 17 models across 4 providers. Model definitions, pricing, aliases, engine mappings, context windows, and `/v1/models` list are all auto-generated from one `MODELS[]` array. Adding a model is now a one-line change
 - **Per-model context window** — `contextPercent` in session stats now uses the actual model's context window (e.g. 1M for Gemini, 256k for GPT-5.4) instead of a fixed 200k assumption
 - **Session engine persistence** — `engine` field is now saved/restored across session restarts, so resumed sessions pick up the correct engine without re-specifying it
@@ -2342,18 +3963,21 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - **Configurable rate limit** — `OPENCLAW_RATE_LIMIT` env var overrides the default per-IP rate limit
 
 ### Changed
+
 - **`MAX_BODY_SIZE`** increased from 1 MB to 5 MB for larger request payloads
 - **`RATE_LIMIT_MAX_REQUESTS`** increased from 100 to 300 per window
 - **Error format consistency** — `/v1/*` routes now return OpenAI-standard `{ error: { message, type, code } }` format; internal routes keep `{ ok: false, error }` format
 - **Proxy provider detection** — `resolveProvider` now correctly returns `'google'` (not `'gemini'`) as the provider name, matching the `ProviderName` type
 
 ### Removed
+
 - **`CONTEXT_WINDOW_SIZE` constant** — replaced by per-model `getContextWindow()` from the model registry
 - **Duplicate model definitions** — `MODEL_ENGINE_MAP` (openai-compat.ts), `resolveProviderModel` (handler.ts), `isGeminiModel`/`isClaudeModel` (anthropic-adapter.ts), `DEFAULT_MODEL_PRICING`/`MODEL_PRICING` (types.ts) all consolidated into `src/models.ts`
 
 ## [2.8.1] - 2026-04-05
 
 ### Changed
+
 - **Model references updated to current flagships** — all code and docs now use current SOTA models: `gpt-5.4`/`gpt-5.4-mini` (OpenAI), `gemini-3.1-pro-preview`/`gemini-3-flash-preview` (Google), `composer-2`/`composer-2-fast` (Cursor). Deprecated model names (`gpt-4o`, `cursor-small`, etc.) removed from docs and `/v1/models` list
 - **Updated pricing table** — Opus 4.6 corrected to $5/$25, added GPT-5.4 series, Gemini 3.x, and Composer 2 pricing
 - **Council default roles** — renamed default agents from model-based names (GPT/Claude/Gemini) to delivery-stage roles (Planner/Generator/Evaluator) with specialized personas aligned to the Plan → Build → Verify workflow. Engine mappings preserved: Planner→claude, Generator→gpt, Evaluator→gemini
@@ -2361,6 +3985,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.8.0] - 2026-04-04
 
 ### Added
+
 - **OpenAI-compatible `/v1/chat/completions` endpoint** — drop-in backend for webchat apps (ChatGPT-Next-Web, Open WebUI, LobeChat, etc.). Stateful sessions maximize Anthropic prompt caching (90% discount on cached tokens). Supports streaming (SSE) and non-streaming responses
 - **`/v1/models` endpoint** — lists supported models for OpenAI client discovery
 - **Auto session management** — sessions created/reused per conversation via `X-Session-Id` header or `user` field. Auto-compact when context reaches 80%
@@ -2370,6 +3995,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.7.1] - 2026-04-04
 
 ### Added
+
 - **Embedded server authentication** — opt-in bearer token via `OPENCLAW_SERVER_TOKEN` env var; written to `~/.openclaw/server-token` for CLI. `/health` exempt. Default: no auth (localhost binding is the primary boundary)
 - **Orphaned process cleanup** — PID file tracking (`~/.openclaw/session-pids.json`) with startup cleanup. Verifies process command line matches known CLIs (claude/codex/gemini/agent) before killing to prevent PID reuse mishaps
 - **Circuit breaker** — engine-level failure tracking with exponential backoff prevents cascading failures from broken CLIs
@@ -2378,6 +4004,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - **Shared constants module** — `src/constants.ts` consolidates 30+ magic numbers (timeouts, limits, thresholds) from across the codebase
 
 ### Changed
+
 - **Council cleanup consolidation** — extracted `_cleanup()` method from `accept()` for reusable worktree/branch/file cleanup
 - **Strongly typed event names** — `SESSION_EVENT` constant object replaces magic strings in event emission
 - **Type cast fix** — eliminated `as unknown as` double cast in proxy handler registration
@@ -2385,6 +4012,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.7.0] - 2026-04-04
 
 ### Added
+
 - **Cursor Agent engine** — new `engine: 'cursor'` option wraps the Cursor Agent CLI (`agent`) with headless print mode, stream-json parsing, and full `ISession` interface support. Resolves #32
 - `PersistentCursorSession` class (`src/persistent-cursor-session.ts`) implementing the same pattern as Codex/Gemini engines
 - Unit tests for Cursor session (spawn flags, stream-json parsing, lifecycle, stderr sanitization)
@@ -2393,10 +4021,12 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.6.1] - 2026-04-03
 
 ### Added
+
 - **Zero-config proxy** — non-Claude models on the `claude` engine automatically start a local proxy server that converts Anthropic → OpenAI format and forwards to the OpenClaw gateway. Gateway port and auth are auto-detected from `~/.openclaw/openclaw.json`. No env vars, no baseUrl, no config changes needed
 - Proxy documentation in `skills/references/multi-engine.md`
 
 ### Fixed
+
 - **Proxy model URL extraction** — `extractRealModel` regex fixed to handle Claude Code CLI's `/real/<model>/v1/messages` URL pattern
 - **Gateway model name** — `forwardToGateway` now sends `model: "openclaw"` as required by gateway
 - **HEAD request handling** — proxy returns 200 for CLI probe requests instead of JSON parse errors
@@ -2404,17 +4034,20 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.6.0] - 2026-04-03
 
 ### Changed
+
 - **Skill restructure** — SKILL.md rewritten from scratch: removed hardcoded local paths, migrated metadata from `clawdis` to `openclaw` format, install via `kind: "node"` npm package instead of local path
 - **Docs moved into skill** — `docs/` directory moved to `skills/references/` for progressive disclosure. AI agents load reference files on demand instead of duplicating content. All README/CLAUDE.md links updated
 - **Skill description** — comprehensive trigger keywords covering all 27 tools, multi-engine, council, ultraplan, ultrareview
 
 ### Removed
+
 - `docs/` directory (content lives in `skills/references/` now)
 - Hardcoded `~/clawd/claude-code-skill` path from skill metadata
 
 ## [2.5.5] - 2026-04-03
 
 ### Fixed
+
 - **Codex engine fully reworked** — migrated from `codex --full-auto --quiet` to `codex exec --full-auto --skip-git-repo-check -C <dir>`. Fixes `--quiet` rejection, `--cwd` rejection, TTY requirement, and git-repo-check in non-git directories (codex-cli 0.112.0+)
 - **Gemini engine fake success** — non-zero exit codes (except 53/turn-limit) now correctly reject instead of resolving with empty output
 - **Gemini prompt echo** — user-role messages from `stream-json` output are now filtered; only assistant responses are collected
@@ -2423,6 +4056,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - **Ultraplan error masking** — error responses (auth failures, empty output) no longer marked as `status: 'completed'` with error text in the `plan` field; correctly set `status: 'error'` with `error` field
 
 ### Added
+
 - **Cross-engine team tools** — `team_list` and `team_send` now work on all engines. Claude uses native `/team` and `@teammate`; Codex/Gemini use SessionManager's cross-session messaging as a virtual team layer
 - Engine Compatibility Matrix in README with tested CLI versions (Claude 2.1.91, Codex 0.118.0, Gemini 0.36.0)
 - Known Limitations section in README
@@ -2430,17 +4064,20 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - Full functional audit test script (`test-full-audit.ts`) — 47 tests covering all 27 tools across all 3 engines
 
 ### Changed
+
 - Codex stdin set to `'ignore'` (was `'pipe'`) to prevent `codex exec` from waiting for piped input
 - Consensus tail-fallback tests updated to match stricter parsing behavior
 
 ## [2.5.0] - 2026-04-03
 
 ### Added
+
 - Council post-processing lifecycle: `council_review`, `council_accept`, `council_reject` tools — completes the council workflow with structured review, cleanup, and rejection-with-feedback
 - `CouncilReviewResult`, `CouncilAcceptResult`, `CouncilRejectResult` types for structured post-processing responses
 - Council `accepted` and `rejected` status states
 
 ### Changed
+
 - Translated `configs/council-system-prompt.md` from Chinese to English for project-wide consistency
 - Translated all Chinese strings in `council.ts` agent prompts and CLAUDE.md worktree templates to English
 - `openclaw.plugin.json` contracts.tools updated from 24 → 27
@@ -2448,12 +4085,14 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.4.0] - 2026-04-01
 
 ### Added
+
 - Gemini CLI engine (`engine: 'gemini'`) — third engine alongside Claude Code and Codex. Per-message spawning with `--output-format stream-json` for real token usage tracking. Permission mapping: `bypassPermissions` → `--yolo`, `default` → `--sandbox` (#29)
 - 88 new unit tests: SessionManager (74 tests, #28) and Gemini session (14 tests, #29). Total: 162 tests
 - CLAUDE.md project context file for contributors
 - README architecture diagram (mermaid), test badge, "Why not Claude API" callout
 
 ### Fixed
+
 - Test files no longer compiled to `dist/` or shipped in npm package (tsconfig exclude)
 - `openclaw.plugin.json` contracts.tools updated from 10 → 24 to match actual registered tools
 - `SessionManagerLike` interface in council.ts uses real types instead of `Record<string, unknown>`
@@ -2463,6 +4102,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.3.1] - 2026-04-01
 
 ### Fixed
+
 - Plugin installation blocked on OpenClaw 2026.3.31 — resolved security scanner false positive for "credential harvesting" in CLI by deferring env var access (#24)
 - Added `openclaw.hooks` declaration to prevent hook pack validation error
 - Added `capabilities.childProcess` and `capabilities.networkAccess` to plugin manifest for scanner whitelisting
@@ -2470,12 +4110,14 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.3.0] - 2026-03-31
 
 ### Added
+
 - Session Inbox — cross-session messaging with `claude_session_send_to`, `claude_session_inbox`, `claude_session_deliver_inbox`. Idle sessions receive immediately; busy sessions queue for later delivery. Broadcast via `"*"` (#22)
 - Ultraplan — dedicated Opus planning session (up to 30 min) with `ultraplan_start`, `ultraplan_status` (#22)
 - Ultrareview — fleet of 5-20 specialized reviewer agents in parallel via council system with `ultrareview_start`, `ultrareview_status`. 20 review angles: security, logic, performance, types, concurrency, etc. (#22)
 - Tool count: 17 → 24
 
 ### Fixed
+
 - Session creation race condition — concurrent `startSession()` calls no longer create duplicates (#23)
 - File persistence error handling — proper error callbacks, orphan `.tmp` cleanup on rename failure (#23)
 - HTTP stream reader leak — `try/finally { reader.cancel() }` on all streaming paths (#23)
@@ -2491,6 +4133,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.2.0] - 2026-03-31
 
 ### Added
+
 - Stream output support — `onChunk` callback and `stream` param for `claude_session_send` (#9)
 - Session persistence — registry saved to `~/.openclaw/claude-sessions.json` with 7-day disk TTL, atomic writes, debounced saves (#11)
 - Dynamic tool/model switching — `claude_session_update_tools` and `claude_session_switch_model` with rollback on failure (#12)
@@ -2498,21 +4141,25 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 - Premature CLI exit detection — startup crash no longer leaves sessions stuck in busy state (#13)
 
 ### Fixed
+
 - Stale close listener on fallback ready path (follow-up to #13)
 - Truncated code comments in startup flow
 
 ### Improved
+
 - Project governance: CONTRIBUTING.md, CHANGELOG.md, issue/PR templates, CI workflows, npm publish automation
 
 ## [2.1.0] - 2026-03-31
 
 ### Added
+
 - Cross-platform PATH inheritance from `process.env.PATH`
 - `CLAUDE_BIN` env var override for custom binary locations
 - `resumeSessionId` exposed in tool schema
 - Lazy initialization — zero memory when unused
 
 ### Fixed
+
 - `contextPercent` calculation (was hardcoded 0)
 - Process blocking on detached child (`proc.unref()`)
 - Ready event now listens for CLI init signal instead of blind 2s timeout
@@ -2520,12 +4167,14 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [2.0.0] - 2026-03-31
 
 ### Added
+
 - Complete rewrite as native OpenClaw plugin
 - 10 native tools (`claude_session_start/send/stop/list/status/grep/compact`, `claude_agents_list`, `claude_team_list/send`)
 - Plugin hooks: `before_prompt_build`, `registerHttpRoute`
 - Embedded HTTP server for backward-compatible CLI access
 
 ### Breaking Changes
+
 - Requires OpenClaw >= 2026.3.0 with plugin SDK
 - Standalone Express backend deprecated
 - FastAPI proxy now optional
@@ -2533,6 +4182,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [1.2.0] - 2026-03-27
 
 ### Added
+
 - Cost tracking per session
 - Git branch awareness
 - Hook system for pre/post execution
@@ -2541,6 +4191,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [1.1.0] - 2026-03-25
 
 ### Added
+
 - Effort levels (low/medium/high/max)
 - Plan mode (`--plan` flag)
 - Compact command for context reclamation
@@ -2550,6 +4201,7 @@ Distributed tracing (`TRACEPARENT` / `TRACESTATE`) is automatically forwarded si
 ## [1.0.0] - 2026-03-23
 
 ### Added
+
 - Initial release
 - Persistent Claude Code sessions via MCP
 - Multi-model proxy support

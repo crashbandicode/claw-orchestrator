@@ -7,12 +7,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import * as fs from 'node:fs';
+import fsDefault, * as fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
 import { ClaudeAgentDispatcher } from '../autoloop/dispatcher.js';
-import { Msg } from '../autoloop/messages.js';
+import { AutoloopRunner } from '../autoloop/runner.js';
+import { type AnyAutoloopMessage, Msg } from '../autoloop/messages.js';
 import type { SessionManager } from '../session-manager.js';
 import type { PushPolicy } from '../autoloop/types.js';
 import { DEFAULT_PUSH_POLICY, LEDGER_SCHEMA_VERSION } from '../autoloop/types.js';
@@ -75,6 +77,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   fs.rmSync(tmpRoot, { recursive: true, force: true });
 });
 
@@ -107,6 +110,38 @@ function findStart(calls: StubCalls, role: 'planner' | 'coder' | 'reviewer'): Re
   return call![0] as Record<string, unknown>;
 }
 
+interface ObservedSendTimeout {
+  type: 'send_timeout';
+  payload: {
+    status: 'awaiting_resume';
+    dispatch_id: string;
+    agent: 'planner' | 'coder' | 'reviewer';
+    message_id: string;
+    message_type: string;
+    iter: number;
+    timeout_ms: number;
+    error: string;
+  };
+}
+
+function fixedIdentity<T extends AnyAutoloopMessage>(env: T, messageId: string, ts = '2026-09-03T00:00:00.000Z'): T {
+  return { ...env, msg_id: messageId, ts };
+}
+
+function sendTimeout(replies: AnyAutoloopMessage[]): ObservedSendTimeout {
+  expect(replies).toHaveLength(1);
+  expect(replies[0].type).toBe('send_timeout');
+  return replies[0] as unknown as ObservedSendTimeout;
+}
+
+function genuineSendTimeout(): Error {
+  return new Error('Timeout waiting for response');
+}
+
+function plannerControl(tool: string, args: Record<string, unknown>): string {
+  return `\`\`\`autoloop\n${JSON.stringify({ tool, args })}\n\`\`\``;
+}
+
 describe('ClaudeAgentDispatcher — role engine configuration', () => {
   it('keeps the legacy Claude model defaults when no role overrides are provided', async () => {
     const { dispatcher, calls } = makeDispatcher();
@@ -114,9 +149,17 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
     await dispatcher.deliver(Msg.chat(0, { text: 'hello' }));
     await dispatcher.spawnSubagents();
 
-    expect(findStart(calls, 'planner')).toMatchObject({ engine: 'claude', model: 'opus' });
+    expect(findStart(calls, 'planner')).toMatchObject({
+      engine: 'claude',
+      model: 'opus',
+      permissionMode: 'manual',
+      sandboxMode: 'read-only',
+    });
     expect(findStart(calls, 'coder')).toMatchObject({ engine: 'claude', model: 'sonnet' });
     expect(findStart(calls, 'reviewer')).toMatchObject({ engine: 'claude', model: 'sonnet' });
+    expect(findStart(calls, 'planner')).not.toHaveProperty('effort');
+    expect(findStart(calls, 'coder')).not.toHaveProperty('effort');
+    expect(findStart(calls, 'reviewer')).not.toHaveProperty('effort');
   });
 
   it('uses each non-Claude engine without injecting a Claude model default', async () => {
@@ -140,15 +183,53 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
     }
   });
 
+  it('keeps each configured effort across Planner engine overrides and eager resets', async () => {
+    const { dispatcher, calls } = makeDispatcher({
+      plannerEffort: 'high',
+      coderEffort: 'ultra',
+      reviewerEffort: 'low',
+    });
+
+    await dispatcher.deliver(Msg.chat(0, { text: 'hello' }));
+    await dispatcher.spawnSubagents({
+      coder_engine: 'codex',
+      coder_model: 'gpt-coder',
+      reviewer_engine: 'gemini',
+      coder_effort: 'low',
+      reviewer_effort: 'max',
+    } as never);
+
+    expect(findStart(calls, 'planner')).toMatchObject({ effort: 'high' });
+    expect(findStart(calls, 'coder')).toMatchObject({ engine: 'codex', model: 'gpt-coder', effort: 'ultra' });
+    expect(findStart(calls, 'reviewer')).toMatchObject({ engine: 'gemini', effort: 'low' });
+
+    await dispatcher.resetAgent('coder', { eagerRestart: true });
+    await dispatcher.resetAgent('reviewer', { eagerRestart: true });
+
+    const latestStart = (role: 'coder' | 'reviewer') =>
+      calls.startSession.mock.calls
+        .map((entry) => entry[0] as Record<string, unknown>)
+        .filter((config) => config.name === `autoloop-r1-${role}`)
+        .at(-1);
+    expect(latestStart('coder')).toMatchObject({ effort: 'ultra' });
+    expect(latestStart('reviewer')).toMatchObject({ effort: 'low' });
+  });
+
   it('delivers the Planner protocol in-band and starts non-Claude Planners read-only', async () => {
     const { dispatcher, calls } = makeDispatcher({ plannerEngine: 'codex' });
 
     await dispatcher.deliver(Msg.chat(0, { text: 'inspect this repository' }));
 
-    expect(findStart(calls, 'planner')).toMatchObject({
+    const start = findStart(calls, 'planner');
+    expect(start).toMatchObject({
       permissionMode: 'manual',
       sandboxMode: 'read-only',
     });
+    expect(start).not.toHaveProperty('permissionMode', 'bypassPermissions');
+    const systemPrompt = start.systemPrompt as string;
+    expect(systemPrompt).toMatch(/native shell\/file tools must not create `plan\.md` or `goal\.json`/i);
+    expect(systemPrompt).toContain('fenced in-band controls');
+    expect(systemPrompt).toContain('`write_plan`, `write_goal`, and approved `spawn_subagents`');
     const prompt = calls.sendMessage.mock.calls[0][1] as string;
     expect(prompt).toContain('<autoloop_role_instructions>');
     expect(prompt).toContain('Planner');
@@ -317,6 +398,110 @@ describe('ClaudeAgentDispatcher — role engine configuration', () => {
   });
 });
 
+describe('ClaudeAgentDispatcher — Planner control transactions', () => {
+  it('rejects a malformed control batch without writes, spawn, or an initial directive', async () => {
+    const originalPlan = '# original plan\n';
+    const originalGoal = '{"original":true}\n';
+    fs.writeFileSync(path.join(tmpRoot, 'plan.md'), originalPlan);
+    fs.writeFileSync(path.join(tmpRoot, 'goal.json'), originalGoal);
+    const spawn = vi.fn(async () => undefined);
+    const reply = [
+      plannerControl('write_plan', { content: '# replacement plan\n' }),
+      '```autoloop\n{malformed json\n```',
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'must not run' } }),
+    ].join('\n');
+    const { dispatcher } = makeDispatcher({ onSpawnSubagents: spawn }, { sendOutput: reply });
+
+    const emitted = await dispatcher.deliver(Msg.chat(0, { text: 'apply the batch' }));
+
+    expect(fs.readFileSync(path.join(tmpRoot, 'plan.md'), 'utf-8')).toBe(originalPlan);
+    expect(fs.readFileSync(path.join(tmpRoot, 'goal.json'), 'utf-8')).toBe(originalGoal);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(emitted.filter((message) => message.type === 'directive')).toEqual([]);
+  });
+
+  it('restores pre-existing artifacts and suppresses spawn when an artifact write fails', async () => {
+    const originalPlan = '# original plan\n';
+    const originalGoal = '{"original":true}\n';
+    const replacementPlan = '# replacement plan\n';
+    const replacementGoal = '{"replacement":true}\n';
+    const planPath = path.join(tmpRoot, 'plan.md');
+    const goalPath = path.join(tmpRoot, 'goal.json');
+    fs.writeFileSync(planPath, originalPlan);
+    fs.writeFileSync(goalPath, originalGoal);
+    const spawn = vi.fn(async () => undefined);
+    const reply = [
+      plannerControl('write_plan', { content: replacementPlan }),
+      plannerControl('write_goal', { content: replacementGoal }),
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'must not run' } }),
+    ].join('\n');
+    const { dispatcher } = makeDispatcher({ onSpawnSubagents: spawn }, { sendOutput: reply });
+
+    // Fail the second visible replacement, after plan.md has been replaced,
+    // so the transaction must restore the first file from its byte snapshot.
+    const originalRenameSync = fsDefault.renameSync;
+    let failed = false;
+    fsDefault.renameSync = ((from: fs.PathLike, to: fs.PathLike) => {
+      if (!failed && path.resolve(String(to)) === goalPath) {
+        failed = true;
+        throw new Error('simulated artifact replacement failure');
+      }
+      return originalRenameSync(from, to);
+    }) as typeof fs.renameSync;
+    syncBuiltinESMExports();
+    let emitted: AnyAutoloopMessage[] = [];
+    try {
+      emitted = await dispatcher.deliver(Msg.chat(0, { text: 'apply the batch' }));
+    } finally {
+      fsDefault.renameSync = originalRenameSync;
+      syncBuiltinESMExports();
+    }
+
+    expect(fs.readFileSync(planPath, 'utf-8')).toBe(originalPlan);
+    expect(fs.readFileSync(goalPath, 'utf-8')).toBe(originalGoal);
+    expect(spawn).not.toHaveBeenCalled();
+    expect(emitted.filter((message) => message.type === 'directive')).toEqual([]);
+  });
+
+  it('materializes exact artifacts before exactly one spawn and initial directive', async () => {
+    const plan = '# exact plan\n\nNo normalization.\n';
+    const goal = '{\n  "scalar": null,\n  "gates": []\n}\n';
+    const observedAtSpawn: Array<{ plan: string; goal: string }> = [];
+    const spawn = vi.fn(async () => {
+      observedAtSpawn.push({
+        plan: fs.readFileSync(path.join(tmpRoot, 'plan.md'), 'utf-8'),
+        goal: fs.readFileSync(path.join(tmpRoot, 'goal.json'), 'utf-8'),
+      });
+    });
+    const reply = [
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'ship exact artifacts' } }),
+      plannerControl('write_plan', { content: plan }),
+      plannerControl('write_goal', { content: goal }),
+    ].join('\n');
+    const { dispatcher } = makeDispatcher({ onSpawnSubagents: spawn }, { sendOutput: reply });
+
+    const emitted = await dispatcher.deliver(Msg.chat(0, { text: 'approved' }));
+
+    expect(observedAtSpawn).toEqual([{ plan, goal }]);
+    expect(spawn).toHaveBeenCalledTimes(1);
+    expect(emitted.filter((message) => message.type === 'directive')).toHaveLength(1);
+  });
+
+  it('rejects duplicate spawn controls without duplicate startup or directives', async () => {
+    const spawn = vi.fn(async () => undefined);
+    const reply = [
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'first' } }),
+      plannerControl('spawn_subagents', { initial_directive: { goal: 'second' } }),
+    ].join('\n');
+    const { dispatcher } = makeDispatcher({ onSpawnSubagents: spawn }, { sendOutput: reply });
+
+    const emitted = await dispatcher.deliver(Msg.chat(0, { text: 'approved once' }));
+
+    expect(spawn).not.toHaveBeenCalled();
+    expect(emitted.filter((message) => message.type === 'directive')).toEqual([]);
+  });
+});
+
 describe('ClaudeAgentDispatcher — frozen reviewer memory', () => {
   it('injects reviewer_memory.md contents into the Reviewer system prompt at startSession', async () => {
     const { dispatcher, calls, ledgerDir } = makeDispatcher();
@@ -370,17 +555,317 @@ describe('ClaudeAgentDispatcher — frozen reviewer memory', () => {
 
 describe('ClaudeAgentDispatcher — phase_error surfacing', () => {
   it('returns a phase_error envelope (not a fake directive_ack) when Coder send fails twice', async () => {
+    vi.useFakeTimers();
     const { dispatcher } = makeDispatcher({}, { sendThrows: 2 });
     await dispatcher.spawnSubagents();
-    const replies = await dispatcher.deliver(
+    const pending = dispatcher.deliver(
       Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
     );
+    void pending.catch(() => undefined);
+    await vi.runAllTimersAsync();
+    const replies = await pending;
     expect(replies).toHaveLength(1);
     expect(replies[0].type).toBe('phase_error');
     if (replies[0].type === 'phase_error') {
       expect(replies[0].payload.agent).toBe('coder');
       expect(replies[0].payload.phase).toBe('send');
     }
+  });
+});
+
+describe('ClaudeAgentDispatcher — recoverable send timeout and dispatch identity', () => {
+  const roleCases: Array<['planner' | 'coder' | 'reviewer', (ledgerDir: string) => AnyAutoloopMessage]> = [
+    ['planner', () => fixedIdentity(Msg.chat(3, { text: 'continue' }), 'logical-planner-3')],
+    [
+      'coder',
+      () =>
+        fixedIdentity(
+          Msg.directive(3, { goal: 'ship I3', constraints: [], success_criteria: [], max_attempts: 1 }),
+          'logical-coder-3',
+        ),
+    ],
+    [
+      'reviewer',
+      (ledgerDir) =>
+        fixedIdentity(
+          Msg.reviewRequest(3, { iter: 3, ledger_path: ledgerDir, prior_metrics: [] }),
+          'logical-reviewer-3',
+        ),
+    ],
+  ];
+
+  it.each(roleCases)(
+    'classifies a genuine %s send timeout once without reset or automatic retry',
+    async (role, makeMessage) => {
+      vi.useFakeTimers();
+      const { dispatcher, calls, ledgerDir } = makeDispatcher({ sendTimeoutMs: 7_200_000 });
+      calls.sendMessage.mockRejectedValue(genuineSendTimeout());
+      const message = makeMessage(ledgerDir);
+
+      const pending = dispatcher.deliver(message);
+      void pending.catch(() => undefined);
+      await vi.runAllTimersAsync();
+      const observed = sendTimeout(await pending);
+
+      expect(observed.payload).toMatchObject({
+        status: 'awaiting_resume',
+        agent: role,
+        message_id: message.msg_id,
+        message_type: message.type,
+        iter: message.iter,
+        timeout_ms: 7_200_000,
+        error: 'Timeout waiting for response',
+      });
+      expect(observed.payload.dispatch_id).toMatch(/^dispatch_[a-f0-9]{64}$/);
+      expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+      expect(calls.stopSession).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps a non-timeout failure on the reset-once/retry-once phase_error path', async () => {
+    vi.useFakeTimers();
+    const { dispatcher, calls } = makeDispatcher();
+    calls.sendMessage.mockRejectedValue(new Error('subprocess failed while loading timeout configuration'));
+    const message = fixedIdentity(
+      Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }),
+      'logical-non-timeout',
+    );
+
+    const pending = dispatcher.deliver(message);
+    void pending.catch(() => undefined);
+    await vi.runAllTimersAsync();
+    const replies = await pending;
+
+    expect(replies).toHaveLength(1);
+    expect(replies[0].type).toBe('phase_error');
+    expect(calls.sendMessage).toHaveBeenCalledTimes(2);
+    expect(calls.stopSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('coalesces concurrent and later re-delivery of one logical dispatch, while distinct identities still send', async () => {
+    const { dispatcher, calls } = makeDispatcher();
+    let resolveSend!: (value: { output: string; error: undefined }) => void;
+    const underlying = new Promise<{ output: string; error: undefined }>((resolve) => {
+      resolveSend = resolve;
+    });
+    calls.sendMessage.mockReturnValue(underlying);
+    const first = fixedIdentity(Msg.chat(2, { text: 'same logical turn' }), 'logical-chat-a');
+    const duplicate = fixedIdentity(
+      Msg.chat(2, { text: 'same logical turn' }),
+      'logical-chat-a',
+      '2035-01-01T00:00:00.000Z',
+    );
+
+    const deliveryA = dispatcher.deliver(first);
+    const deliveryB = dispatcher.deliver(duplicate);
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+
+    resolveSend({ output: '', error: undefined });
+    await Promise.all([deliveryA, deliveryB]);
+    await dispatcher.deliver(duplicate);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+
+    await dispatcher.deliver(fixedIdentity(Msg.chat(2, { text: 'same logical turn' }), 'logical-chat-b'));
+    expect(calls.sendMessage).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds the retained dispatch cache while still coalescing a recent re-delivery', async () => {
+    const { dispatcher, calls } = makeDispatcher();
+    calls.sendMessage.mockResolvedValue({ output: '', error: undefined });
+    const retained = dispatcher as unknown as { logicalDispatches: Map<string, unknown> };
+
+    const recent = fixedIdentity(Msg.chat(1, { text: 'recent turn' }), 'logical-recent');
+    await dispatcher.deliver(recent);
+    const sendsAfterRecent = calls.sendMessage.mock.calls.length;
+
+    // Far more distinct dispatches than the cache is allowed to hold.
+    for (let i = 0; i < 200; i++) {
+      await dispatcher.deliver(fixedIdentity(Msg.chat(1, { text: `turn ${i}` }), `logical-bulk-${i}`));
+    }
+
+    expect(retained.logicalDispatches.size).toBeLessThanOrEqual(64);
+
+    // A dispatch well inside the retention window is still deduped, not re-sent.
+    // Deliberately not the very last one: that survives even a cache of size 1,
+    // so it could not tell a real window from a degenerate one.
+    const sendsBeforeReplay = calls.sendMessage.mock.calls.length;
+    await dispatcher.deliver(fixedIdentity(Msg.chat(1, { text: 'turn 190' }), 'logical-bulk-190'));
+    expect(calls.sendMessage.mock.calls.length).toBe(sendsBeforeReplay);
+    expect(sendsAfterRecent).toBeGreaterThan(0);
+  });
+
+  it('derives the same ID across dispatcher instances without using envelope time, but separates message identities', async () => {
+    vi.useFakeTimers();
+    const firstHarness = makeDispatcher({ sendTimeoutMs: 7_200_000 });
+    const secondHarness = makeDispatcher({ sendTimeoutMs: 7_200_000 });
+    firstHarness.calls.sendMessage.mockRejectedValue(genuineSendTimeout());
+    secondHarness.calls.sendMessage.mockRejectedValue(genuineSendTimeout());
+    const first = fixedIdentity(Msg.chat(4, { text: 'logical input' }), 'logical-stable-id', '2020-01-01T00:00:00Z');
+    const sameLogical = fixedIdentity(
+      Msg.chat(4, { text: 'logical input' }),
+      'logical-stable-id',
+      '2040-01-01T00:00:00Z',
+    );
+    const distinct = fixedIdentity(Msg.chat(4, { text: 'logical input' }), 'logical-distinct-id');
+
+    const firstPending = firstHarness.dispatcher.deliver(first);
+    const samePending = secondHarness.dispatcher.deliver(sameLogical);
+    const distinctPending = firstHarness.dispatcher.deliver(distinct);
+    for (const pending of [firstPending, samePending, distinctPending]) void pending.catch(() => undefined);
+    await vi.runAllTimersAsync();
+    const [firstResult, sameResult, distinctResult] = await Promise.all([firstPending, samePending, distinctPending]);
+    const firstId = sendTimeout(firstResult).payload.dispatch_id;
+    const sameId = sendTimeout(sameResult).payload.dispatch_id;
+    const distinctId = sendTimeout(distinctResult).payload.dispatch_id;
+
+    expect(sameId).toBe(firstId);
+    expect(distinctId).not.toBe(firstId);
+  });
+
+  it('records one deterministic pending-dispatch audit row even when the logical dispatch is re-delivered', async () => {
+    vi.useFakeTimers();
+    const { dispatcher, calls, ledgerDir } = makeDispatcher({ sendTimeoutMs: 7_200_000 });
+    calls.sendMessage.mockRejectedValue(genuineSendTimeout());
+    const message = fixedIdentity(Msg.chat(5, { text: 'audit this pending turn' }), 'logical-audit-id');
+
+    const firstPending = dispatcher.deliver(message);
+    void firstPending.catch(() => undefined);
+    await vi.runAllTimersAsync();
+    const first = sendTimeout(await firstPending);
+    const second = sendTimeout(await dispatcher.deliver({ ...message }));
+    const rows = fs
+      .readFileSync(path.join(ledgerDir, 'decisions.jsonl'), 'utf-8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as { kind: string; payload: Record<string, unknown> })
+      .filter((row) => row.kind === 'send_timeout');
+
+    expect(second.payload.dispatch_id).toBe(first.payload.dispatch_id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].payload).toEqual(first.payload);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('AutoloopRunner — recoverable dispatcher timeout state', () => {
+  function makeTimeoutRunner(hardTimeoutMs = 86_400_000): {
+    runner: AutoloopRunner;
+    calls: StubCalls;
+    rejectSend: (error: Error) => void;
+  } {
+    const { dispatcher, calls, ledgerDir, workspace } = makeDispatcher({ sendTimeoutMs: 7_200_000 });
+    let rejectSend!: (error: Error) => void;
+    calls.sendMessage.mockImplementation(
+      () =>
+        new Promise((_resolve, reject) => {
+          rejectSend = reject;
+        }),
+    );
+    const runner = new AutoloopRunner({
+      run_id: 'r1',
+      workspace,
+      ledger_dir: ledgerDir,
+      dispatcher,
+      notifyUser: vi.fn(async () => undefined),
+      sendTimeoutMs: 7_200_000,
+      activityLeaseMs: 7_200_000,
+      autoloopHardTimeoutMs: hardTimeoutMs,
+    });
+    return { runner, calls, rejectSend: (error) => rejectSend(error) };
+  }
+
+  it('pauses in awaiting-resume state with pending metadata and one structured timeout event', async () => {
+    const { runner, calls, rejectSend } = makeTimeoutRunner();
+    const timeoutEvents: ObservedSendTimeout['payload'][] = [];
+    runner.on('send_timeout', (event) => timeoutEvents.push(event as ObservedSendTimeout['payload']));
+    await runner.start();
+
+    const chat = runner.chat('wait for planner');
+    await Promise.resolve();
+    rejectSend(genuineSendTimeout());
+    await chat;
+
+    const state = runner.state as typeof runner.state & {
+      pending_dispatch: ObservedSendTimeout['payload'] | null;
+    };
+    expect(state.status).toBe('paused');
+    expect(state.status_reason).toBe(
+      `awaiting_resume:send_timeout:planner:${state.pending_dispatch?.dispatch_id ?? ''}`,
+    );
+    expect(state.pending_dispatch).toMatchObject({
+      status: 'awaiting_resume',
+      agent: 'planner',
+      timeout_ms: 7_200_000,
+    });
+    expect(timeoutEvents).toEqual([state.pending_dispatch]);
+    expect(calls.sendMessage).toHaveBeenCalledTimes(1);
+    runner.stop();
+  });
+
+  it('keeps the awaiting-resume timeout reason stable instead of letting the idle lease overwrite it', async () => {
+    vi.useFakeTimers();
+    const { runner, rejectSend } = makeTimeoutRunner();
+    const lifecycleTimeouts: Array<{ kind: string }> = [];
+    runner.on('timeout', (event) => lifecycleTimeouts.push(event as { kind: string }));
+    await runner.start();
+
+    const chat = runner.chat('wait for planner');
+    await Promise.resolve();
+    rejectSend(genuineSendTimeout());
+    await chat;
+    const reason = runner.state.status_reason;
+
+    await runner.send(Msg.resume(0));
+    await vi.advanceTimersByTimeAsync(7_200_000);
+    expect(runner.state.status).toBe('paused');
+    expect(runner.state.status_reason).toBe(reason);
+    expect(lifecycleTimeouts).toEqual([]);
+    runner.stop();
+  });
+
+  it('keeps operator termination terminal when its queued stop wins a late timeout result', async () => {
+    const { runner, rejectSend } = makeTimeoutRunner();
+    const timeoutEvents: unknown[] = [];
+    runner.on('send_timeout', (event) => timeoutEvents.push(event));
+    await runner.start();
+
+    const chat = runner.chat('slow planner turn');
+    await Promise.resolve();
+    await runner.send(Msg.terminate(0, { reason: 'operator_stop' }));
+    rejectSend(genuineSendTimeout());
+    await chat;
+
+    const state = runner.state as typeof runner.state & { pending_dispatch: unknown | null };
+    expect(state.status).toBe('terminated');
+    expect(state.status_reason).toBe('operator_stop');
+    expect(state.pending_dispatch).toBeNull();
+    expect(timeoutEvents).toEqual([]);
+  });
+
+  it('keeps the absolute hard timeout terminal when an in-flight send times out later', async () => {
+    vi.useFakeTimers();
+    const { runner, rejectSend } = makeTimeoutRunner(600_000);
+    const sendTimeoutEvents: unknown[] = [];
+    const deadlineEvents: Array<{ kind: string }> = [];
+    runner.on('send_timeout', (event) => sendTimeoutEvents.push(event));
+    runner.on('timeout', (event) => deadlineEvents.push(event as { kind: string }));
+    await runner.start();
+
+    const chat = runner.chat('outlive hard cap');
+    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(600_000);
+    expect(runner.state.status).toBe('terminated');
+    rejectSend(genuineSendTimeout());
+    await chat;
+
+    const state = runner.state as typeof runner.state & { pending_dispatch: unknown | null };
+    expect(state.status).toBe('terminated');
+    expect(state.status_reason).toBe('hard_timeout_exceeded');
+    expect(state.pending_dispatch).toBeNull();
+    expect(sendTimeoutEvents).toEqual([]);
+    expect(deadlineEvents.map((event) => event.kind)).toEqual(['hard_timeout_exceeded']);
   });
 });
 
@@ -468,5 +953,57 @@ describe('ClaudeAgentDispatcher — ledger schema_version', () => {
     await dispatcher.deliver(Msg.directive(0, { goal: 'g', constraints: [], success_criteria: [], max_attempts: 1 }));
     const written = JSON.parse(fs.readFileSync(path.join(ledgerDir, 'iter', '0', 'directive.json'), 'utf-8'));
     expect(written.schema_version).toBe(LEDGER_SCHEMA_VERSION);
+  });
+});
+
+// An Autoloop left idle past `sessionTtlMinutes` has its role sessions evicted
+// by the manager, while the dispatcher still believed them started — so the
+// next message failed with "Session not found". It now checks, and starts the
+// role again under the same name, which picks the persisted conversation back up.
+describe('ClaudeAgentDispatcher — evicted role sessions', () => {
+  function makeTrackedDispatcher() {
+    const { manager, calls } = makeStubManager();
+    const live = new Set<string>();
+    calls.startSession.mockImplementation(async (config: { name: string }) => {
+      live.add(config.name);
+      return { name: config.name, state: 'ready' };
+    });
+    (manager as unknown as { hasSession: (name: string) => boolean }).hasSession = (name) => live.has(name);
+    const dispatcher = new ClaudeAgentDispatcher({ manager, runId: 'r1', workspace: tmpRoot });
+    const starts = (role: string) =>
+      calls.startSession.mock.calls.filter((c) => (c[0] as { name: string }).name === `autoloop-r1-${role}`).length;
+    return { dispatcher, live, starts, ledgerDir: path.join(tmpRoot, 'tasks', 'r1') };
+  }
+
+  it('starts the Planner again after its session was evicted', async () => {
+    const { dispatcher, live, starts } = makeTrackedDispatcher();
+    await dispatcher.deliver(Msg.chat(0, { text: 'hello' }));
+    await dispatcher.deliver(Msg.chat(0, { text: 'still there?' }));
+    expect(starts('planner')).toBe(1);
+
+    live.delete('autoloop-r1-planner');
+    await dispatcher.deliver(Msg.chat(0, { text: 'after a long idle' }));
+    expect(starts('planner')).toBe(2);
+  });
+
+  it('starts the Coder and the Reviewer again after their sessions were evicted', async () => {
+    const { dispatcher, live, starts, ledgerDir } = makeTrackedDispatcher();
+    const directive = () =>
+      dispatcher.deliver(
+        Msg.directive(0, { goal: 'change one file', constraints: [], success_criteria: [], max_attempts: 1 }),
+      );
+    const review = () =>
+      dispatcher.deliver(Msg.reviewRequest(0, { iter: 0, ledger_path: ledgerDir, prior_metrics: [] }));
+
+    await dispatcher.spawnSubagents();
+    await directive();
+    await review();
+    expect([starts('coder'), starts('reviewer')]).toEqual([1, 1]);
+
+    live.delete('autoloop-r1-coder');
+    live.delete('autoloop-r1-reviewer');
+    await directive();
+    await review();
+    expect([starts('coder'), starts('reviewer')]).toEqual([2, 2]);
   });
 });

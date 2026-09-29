@@ -1,10 +1,10 @@
 /**
  * Unit tests for PersistentClaudeSession `--settings` / `ultracode` argv construction.
  *
- * ultracode (dynamic workflows) is enabled via the `ultracode: true` settings key — NOT a
- * --effort value (the CLI rejects `--effort ultracode`). These tests lock the merge logic so
- * user-supplied settings are never dropped. The binary-level behaviour (that
- * `--settings '{"ultracode":true}'` actually activates workflows) is verified out-of-band.
+ * ultracode (dynamic workflows) is enabled via the `ultracode: true` settings key rather than
+ * `--effort ultracode`, so it composes with a separately chosen effort. These tests lock the
+ * merge logic so user-supplied settings are never dropped. The binary-level behaviour (that
+ * `--settings '{"ultracode":true}'` actually launches a workflow headless) was verified on 2.1.274.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -164,6 +164,47 @@ describe('PersistentClaudeSession --settings / ultracode', () => {
     await startReady(session, mockProc);
     const argv = mockSpawn.mock.calls[0][1] as string[];
     expect(argv).not.toContain('--settings');
+  });
+
+  // `--restricted` removes the command-running tools from the session rather
+  // than denying them on request. Kept separate from `sandboxMode: 'read-only'`
+  // on purpose: plan mode already refuses a direct write, a shell write and a
+  // delegated subagent write on 2.1.251, and `--restricted` additionally drops
+  // the caller's user/project/local settings — including their CLAUDE.md and
+  // hooks — which is not something to switch on behind their back.
+  it('passes --restricted only when asked', async () => {
+    const on = new PersistentClaudeSession({ name: 't', cwd: '/tmp', restricted: true });
+    await startReady(on, mockProc);
+    expect(mockSpawn.mock.calls[0][1] as string[]).toContain('--restricted');
+  });
+
+  it('does not pass --restricted for a read-only session', async () => {
+    const session = new PersistentClaudeSession({ name: 't', cwd: '/tmp', sandboxMode: 'read-only' });
+    await startReady(session, mockProc);
+    const argv = mockSpawn.mock.calls[0][1] as string[];
+    expect(argv[argv.indexOf('--permission-mode') + 1]).toBe('plan');
+    expect(argv).not.toContain('--restricted');
+  });
+
+  // CLI 2.1.259 added `--permission-prompts`: "host" hands a prompt to the SDK
+  // host or --permission-prompt-tool; "none" denies it. This wrapper has no
+  // host, so without a prompt tool there is nobody to ask, and a prompt used to
+  // mean a hang. Verified against 2.1.259: `-p --permission-mode acceptEdits
+  // --permission-prompts none` runs a clean turn with no denials recorded.
+  it('tells the CLI nobody answers prompts when no prompt tool is configured', async () => {
+    const session = new PersistentClaudeSession({ name: 't', cwd: '/tmp' });
+    await startReady(session, mockProc);
+    const argv = mockSpawn.mock.calls[0][1] as string[];
+    expect(argv[argv.indexOf('--permission-prompts') + 1]).toBe('none');
+    expect(argv).not.toContain('--permission-prompt-tool');
+  });
+
+  it('leaves prompts to the prompt tool when one is configured', async () => {
+    const session = new PersistentClaudeSession({ name: 't', cwd: '/tmp', permissionPromptTool: 'mcp__x__ask' });
+    await startReady(session, mockProc);
+    const argv = mockSpawn.mock.calls[0][1] as string[];
+    expect(argv[argv.indexOf('--permission-prompt-tool') + 1]).toBe('mcp__x__ask');
+    expect(argv).not.toContain('--permission-prompts');
   });
 
   it('joins a fallbackModel array into a comma-separated --fallback-model', async () => {

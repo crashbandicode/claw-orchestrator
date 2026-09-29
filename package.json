@@ -1,7 +1,7 @@
 {
   "name": "@enderfga/claw-orchestrator",
-  "version": "5.0.0-memento.6",
-  "description": "Claw Orchestrator — run Claude Code, Codex, Gemini, Cursor Agent, OpenCode and custom coding CLIs as one unified runtime. Drop into Hermes Agent, Claude Desktop, Cursor, Cline, Continue, Zed, Windsurf, Goose or any Model Context Protocol (MCP) host, install as an OpenClaw plugin, or run standalone. Persistent sessions, multi-agent council, ultraplan, ultrareview, autoloop, tool orchestration.",
+  "version": "7.6.0-memento.1",
+  "description": "Claw Orchestrator \u2014 run Claude Code, Codex, Antigravity, Grok Build, Cursor Agent, OpenCode and custom coding CLIs as one unified runtime. Drop into Hermes Agent, Claude Desktop, Cursor, Cline, Continue, Zed, Windsurf, Goose or any Model Context Protocol (MCP) host, install as an OpenClaw plugin, or run standalone. Persistent sessions, multi-agent council, ultraplan, ultrareview, autoloop, tool orchestration.",
   "type": "module",
   "main": "./dist/src/index.js",
   "types": "./dist/src/index.d.ts",
@@ -33,6 +33,7 @@
     "test:coverage": "vitest run --coverage",
     "lint": "eslint src/ bin/",
     "lint:fix": "eslint src/ bin/ --fix",
+    "typecheck:tests": "tsc -p tsconfig.test.json",
     "format": "prettier --write 'src/**/*.ts' 'bin/**/*.ts'",
     "format:check": "prettier --check 'src/**/*.ts' 'bin/**/*.ts'",
     "prepublishOnly": "npm run build"
