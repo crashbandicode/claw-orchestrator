@@ -69,13 +69,17 @@ describe('OrchestrationEventWriter', () => {
       uuid: () => 'e'.repeat(300),
       appendLine: (_file, line) => lines.push(line),
     });
-    writer.emit('agent.identity_bound', {
-      ...context,
-      runId: `fanout-${'r'.repeat(500)}`,
-      agentKey: `review-${'k'.repeat(500)}`,
-      agentName: 'n'.repeat(500),
-      cwd: `C:\\${'d'.repeat(5_000)}`,
-    }, { nativeSessionId: 's'.repeat(900) });
+    writer.emit(
+      'agent.identity_bound',
+      {
+        ...context,
+        runId: `fanout-${'r'.repeat(500)}`,
+        agentKey: `review-${'k'.repeat(500)}`,
+        agentName: 'n'.repeat(500),
+        cwd: `C:\\${'d'.repeat(5_000)}`,
+      },
+      { nativeSessionId: 's'.repeat(900) },
+    );
 
     const event = JSON.parse(lines[0]);
     expect(event.event_id.length).toBeLessThanOrEqual(128);

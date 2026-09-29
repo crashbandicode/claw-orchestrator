@@ -44,9 +44,7 @@ export function sanitizeCwd(cwd: string | undefined): string | undefined {
   // without a drive. Treat only a drive-qualified or UNC path as explicitly
   // Windows so a genuine POSIX path survives a Windows -> WSL launch intact.
   const isWindowsAbsolute = /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(cwd);
-  const usesNativeGrammar = process.platform === 'win32'
-    ? isWindowsAbsolute || !isPosixAbsolute
-    : !isWindowsAbsolute;
+  const usesNativeGrammar = process.platform === 'win32' ? isWindowsAbsolute || !isPosixAbsolute : !isWindowsAbsolute;
 
   // Logical path: resolves .. and . but does NOT follow symlinks.
   // Resolve with the caller's path grammar. Claw can launch an agent in a
@@ -99,10 +97,7 @@ export function sanitizeCwd(cwd: string | undefined): string | undefined {
     }
     const normalizedWindows = check.replaceAll('\\', '/').toLocaleLowerCase();
     for (const prefix of BLOCKED_WINDOWS_PREFIXES) {
-      if (
-        normalizedWindows === prefix
-        || normalizedWindows.startsWith(prefix + '/')
-      ) {
+      if (normalizedWindows === prefix || normalizedWindows.startsWith(prefix + '/')) {
         throw new Error(`Unsafe working directory: ${logical}`);
       }
     }
@@ -115,10 +110,7 @@ export function sanitizeCwd(cwd: string | undefined): string | undefined {
       const sensitive = path.join(home, subdir);
       const normalizedCheck = check.replaceAll('\\', '/').toLocaleLowerCase();
       const normalizedSensitive = sensitive.replaceAll('\\', '/').toLocaleLowerCase();
-      if (
-        normalizedCheck === normalizedSensitive
-        || normalizedCheck.startsWith(normalizedSensitive + '/')
-      ) {
+      if (normalizedCheck === normalizedSensitive || normalizedCheck.startsWith(normalizedSensitive + '/')) {
         throw new Error(`Unsafe working directory: ${logical}`);
       }
     }

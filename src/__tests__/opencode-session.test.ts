@@ -104,6 +104,9 @@ describe('PersistentOpencodeSession', () => {
       // 1.1.40 does not have / does not need --dangerously-skip-permissions.
       // Adding it would trigger yargs strict mode and print the help screen.
       expect(spawnArgs).not.toContain('--dangerously-skip-permissions');
+      // Omitted session effort must not invent a variant (opencode 1.18.32 uses
+      // the provider default when --variant is absent).
+      expect(spawnArgs).not.toContain('--variant');
     });
 
     // Regression guard: `opencode run` opens a NEW session unless --session names
@@ -288,6 +291,157 @@ describe('PersistentOpencodeSession', () => {
 
       const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
       expect(spawnArgs).not.toContain('--model');
+    });
+
+    it.each(['low', 'medium', 'high', 'xhigh', 'max'] as const)(
+      'forwards session effort %s exactly as --variant',
+      async (effort) => {
+        const session = new PersistentOpencodeSession({
+          name: 'test',
+          cwd: '/tmp',
+          permissionMode: 'bypassPermissions',
+          effort,
+        });
+        await session.start();
+
+        const sendPromise = session.send('hello', { waitForComplete: true });
+        setTimeout(() => closeProc(mockProc, 0), 10);
+        await sendPromise;
+
+        const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+        const idx = spawnArgs.indexOf('--variant');
+        expect(idx).toBeGreaterThan(-1);
+        expect(spawnArgs[idx + 1]).toBe(effort);
+        expect(spawnArgs.filter((arg) => arg === '--variant')).toHaveLength(1);
+      },
+    );
+
+    it('omits --variant when session effort is auto', async () => {
+      const session = new PersistentOpencodeSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+        effort: 'auto',
+      });
+      await session.start();
+
+      const sendPromise = session.send('hello', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await sendPromise;
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs).not.toContain('--variant');
+    });
+
+    it('lets a per-turn effort override the session default without sticking', async () => {
+      const session = new PersistentOpencodeSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+        effort: 'high',
+      });
+      await session.start();
+
+      const p1 = session.send('first', { waitForComplete: true, effort: 'medium' });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await p1;
+
+      const proc2 = createMockProcess();
+      mockSpawn.mockReturnValue(proc2);
+      const p2 = session.send('second', { waitForComplete: true });
+      setTimeout(() => closeProc(proc2, 0), 10);
+      await p2;
+
+      const args1 = mockSpawn.mock.calls[0][1] as string[];
+      const args2 = mockSpawn.mock.calls[1][1] as string[];
+      expect(args1[args1.indexOf('--variant') + 1]).toBe('medium');
+      expect(args2[args2.indexOf('--variant') + 1]).toBe('high');
+      expect(session.getEffort()).toBe('high');
+    });
+
+    it('omits --variant for a per-turn auto override and restores session effort next turn', async () => {
+      const session = new PersistentOpencodeSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+        effort: 'high',
+      });
+      await session.start();
+
+      const p1 = session.send('first', { waitForComplete: true, effort: 'auto' });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await p1;
+
+      const proc2 = createMockProcess();
+      mockSpawn.mockReturnValue(proc2);
+      const p2 = session.send('second', { waitForComplete: true });
+      setTimeout(() => closeProc(proc2, 0), 10);
+      await p2;
+
+      const args1 = mockSpawn.mock.calls[0][1] as string[];
+      const args2 = mockSpawn.mock.calls[1][1] as string[];
+      expect(args1).not.toContain('--variant');
+      expect(args2[args2.indexOf('--variant') + 1]).toBe('high');
+      expect(session.getEffort()).toBe('high');
+    });
+
+    it('honors setEffort on the next spawn', async () => {
+      const session = new PersistentOpencodeSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+      });
+      await session.start();
+      session.setEffort('high');
+
+      const sendPromise = session.send('hello', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await sendPromise;
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs[spawnArgs.indexOf('--variant') + 1]).toBe('high');
+    });
+
+    it('passes --variant alongside --session on a resumed turn', async () => {
+      const session = new PersistentOpencodeSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+        effort: 'high',
+        resumeSessionId: 'opencode-live-ses_persisted',
+      });
+      await session.start();
+
+      const p = session.send('hello', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await p;
+
+      const args = mockSpawn.mock.calls[0][1] as string[];
+      expect(args[args.indexOf('--session') + 1]).toBe('ses_persisted');
+      expect(args[args.indexOf('--variant') + 1]).toBe('high');
+      expect(args).not.toContain('--continue');
+    });
+
+    it('keeps read-only spawn flags when session effort is set', async () => {
+      const session = new PersistentOpencodeSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'manual',
+        sandboxMode: 'read-only',
+        effort: 'high',
+      });
+      await session.start();
+
+      const sendPromise = session.send('hello', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await sendPromise;
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs).toContain('--agent');
+      expect(spawnArgs).toContain('clawo-readonly');
+      expect(spawnArgs[spawnArgs.indexOf('--variant') + 1]).toBe('high');
+      const spawnOptions = mockSpawn.mock.calls[0][2] as { env: Record<string, string> };
+      expect(spawnOptions.env.OPENCODE_CONFIG_CONTENT).toBeTruthy();
     });
   });
 

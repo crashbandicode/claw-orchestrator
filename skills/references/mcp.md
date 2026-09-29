@@ -292,3 +292,7 @@ For "let the model commission an ultrareview before merging":
 | You want to call the orchestrator from a non-MCP custom runtime (Python, Go, …) | Standalone `clawo serve` HTTP API |
 
 The same package supports all three — they share the SessionManager and tool definitions. Pick whichever entry point matches your host.
+
+## Open-session capacity
+
+Add `"CLAWO_MAX_CONCURRENT_SESSIONS": "32"` to the MCP registration's `env` object to allow 32 open sessions per MCP process, or use `"0"` for unlimited. OpenCode registrations call this object `environment`. The default remains five. Idle sessions count until stopped or expired; this is independent of provider rate limits and the host harness's native delegation limit. Reconnect an idle MCP server to apply changes without interrupting active workers.

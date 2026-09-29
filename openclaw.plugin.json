@@ -17,32 +17,19 @@
       },
       "defaultPermissionMode": {
         "type": "string",
-        "enum": [
-          "acceptEdits",
-          "bypassPermissions",
-          "default",
-          "delegate",
-          "dontAsk",
-          "plan",
-          "auto"
-        ],
+        "enum": ["acceptEdits", "bypassPermissions", "default", "delegate", "dontAsk", "plan", "auto"],
         "default": "acceptEdits"
       },
       "defaultEffort": {
         "type": "string",
-        "enum": [
-          "low",
-          "medium",
-          "high",
-          "max",
-          "auto"
-        ],
+        "enum": ["low", "medium", "high", "max", "auto"],
         "default": "auto"
       },
       "maxConcurrentSessions": {
-        "type": "number",
+        "type": "integer",
+        "minimum": 0,
         "default": 5,
-        "description": "Maximum concurrent coding sessions"
+        "description": "Maximum open coding sessions per manager, including idle/starting sessions; 0 = unlimited"
       },
       "sessionTtlMinutes": {
         "type": "number",
@@ -74,9 +61,7 @@
   },
   "capabilities": {
     "childProcess": true,
-    "networkAccess": [
-      "127.0.0.1"
-    ]
+    "networkAccess": ["127.0.0.1"]
   },
   "contracts": {
     "tools": [
@@ -151,7 +136,5 @@
       "ultraapp_delete"
     ]
   },
-  "skills": [
-    "skills/SKILL.md"
-  ]
+  "skills": ["skills/SKILL.md"]
 }

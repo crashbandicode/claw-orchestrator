@@ -26,6 +26,14 @@
  * `anthropic/claude-sonnet-4`). We pass `--model` through only when the
  * configured value contains a `/`; otherwise opencode's default applies.
  *
+ * Reasoning effort: session `effort` and per-turn `SessionSendOptions.effort`
+ * map to `opencode run --variant`. `auto` and an omitted effort leave the flag
+ * off so OpenCode keeps the provider default. Explicit values are forwarded
+ * exactly — no remap of `max` / `xhigh`. OpenCode only applies a variant when
+ * that id exists on the selected model's configured `variants`. Verified
+ * against opencode 1.18.32 (`opencode run --help`: "model variant
+ * (provider-specific reasoning effort, e.g., high, max, minimal)").
+ *
  * Permissions: on opencode 1.17.15's `run`, a tool that would prompt for a
  * permission is auto-REJECTED in non-interactive mode (it does not hang), so a
  * write-enabled session needs no skip flag. (`--dangerously-skip-permissions`,
@@ -36,7 +44,7 @@
 import { spawn } from 'node:child_process';
 import * as readline from 'node:readline';
 
-import type { SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
+import type { EffortLevel, SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
 import { estimateTokens } from './models.js';
 import { sanitizeSecrets } from './sanitize.js';
 import { SESSION_EVENT } from './constants.js';
@@ -142,6 +150,20 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
     super._cleanupProc();
   }
 
+  /**
+   * Map engine-agnostic effort onto `opencode run --variant`.
+   *
+   * `--variant` is a free-form provider-specific id. `auto` / omitted omit the
+   * flag. A per-turn override wins for this spawn only and does not mutate the
+   * session default. The selected model must have that variant configured, or
+   * OpenCode has no catalog body to apply.
+   */
+  private _variantArgs(turnEffort?: EffortLevel): string[] {
+    const effort = turnEffort ?? this.options.effort;
+    if (!effort || effort === 'auto') return [];
+    return ['--variant', effort];
+  }
+
   protected _run(message: string, options: SessionSendOptions): Promise<TurnResult> {
     // opencode run <message..> --format json [--session <id>]
     const args: string[] = ['run', message, '--format', 'json'];
@@ -168,6 +190,8 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
     if (this.options.model && this.options.model.includes('/')) {
       args.push('--model', this.options.model);
     }
+
+    args.push(...this._variantArgs(options.effort));
 
     const timeout = options.timeout || 300_000;
 

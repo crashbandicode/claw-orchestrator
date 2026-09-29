@@ -20,10 +20,7 @@ function temporaryLauncher(): { directory: string; launcher: string; entry: stri
   fs.mkdirSync(path.dirname(entry), { recursive: true });
   fs.writeFileSync(entry, '#!/usr/bin/env node\n');
   const launcher = path.join(directory, 'codex.cmd');
-  fs.writeFileSync(
-    launcher,
-    '@ECHO off\r\n"%_prog%" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n',
-  );
+  fs.writeFileSync(launcher, '@ECHO off\r\n"%_prog%" "%dp0%\\node_modules\\@openai\\codex\\bin\\codex.js" %*\r\n');
   return { directory, launcher, entry };
 }
 

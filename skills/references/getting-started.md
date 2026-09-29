@@ -120,6 +120,8 @@ In `~/.openclaw/openclaw.json`:
 }
 ```
 
+For MCP deployments, set `CLAWO_MAX_CONCURRENT_SESSIONS` in the server environment (default `5`, `0` = unlimited). The plugin setting above takes precedence when explicitly supplied. See [session capacity](./sessions.md#session-capacity).
+
 ## Next Steps
 
 - [Sessions](./sessions.md) — persistent session lifecycle and management

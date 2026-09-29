@@ -155,9 +155,7 @@ export class OrchestrationEventWriter {
       ...(context.model ? { model: boundedText(context.model, 256) } : {}),
       ...(context.effort ? { effort: context.effort } : {}),
       cwd: boundedText(context.cwd, 4096),
-      ...(values.nativeSessionId
-        ? { native_session_id: boundedIdentity(values.nativeSessionId, 512) }
-        : {}),
+      ...(values.nativeSessionId ? { native_session_id: boundedIdentity(values.nativeSessionId, 512) } : {}),
       ...(values.agentStatus ? { agent_status: values.agentStatus } : {}),
     };
     try {

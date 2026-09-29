@@ -507,17 +507,21 @@ export class SessionManager {
   private _startedOrchestrationRuns = new Set<string>();
 
   constructor(config?: Partial<PluginConfig>, logger?: Logger) {
+    const maxConcurrentSessions =
+      config?.maxConcurrentSessions ?? Number(process.env.CLAWO_MAX_CONCURRENT_SESSIONS?.trim() || '5');
+    if (!Number.isSafeInteger(maxConcurrentSessions) || maxConcurrentSessions < 0) {
+      throw new Error(
+        'maxConcurrentSessions / CLAWO_MAX_CONCURRENT_SESSIONS must be a non-negative integer (0 = unlimited)',
+      );
+    }
     this.logger = logger || createConsoleLogger('SessionManager');
-    this._orchestrationEvents = new OrchestrationEventWriter(
-      { orchestratorVersion: getPluginVersion() },
-      this.logger,
-    );
+    this._orchestrationEvents = new OrchestrationEventWriter({ orchestratorVersion: getPluginVersion() }, this.logger);
     this.pluginConfig = {
       claudeBin: config?.claudeBin || 'claude',
       defaultModel: config?.defaultModel,
       defaultPermissionMode: config?.defaultPermissionMode || 'acceptEdits',
       defaultEffort: config?.defaultEffort || 'auto',
-      maxConcurrentSessions: config?.maxConcurrentSessions || 5,
+      maxConcurrentSessions,
       sessionTtlMinutes: config?.sessionTtlMinutes || 120,
     };
 
@@ -599,6 +603,14 @@ export class SessionManager {
       return this._toSessionInfo(name, existing);
     }
 
+    // Count starts still awaiting their engine as well as live (including idle)
+    // sessions. A started session can briefly exist in both maps; count it once.
+    const starting = [...this._pendingSessions.keys()].filter((key) => !this.sessions.has(key)).length;
+    const limit = this.pluginConfig.maxConcurrentSessions;
+    if (limit > 0 && this.sessions.size + starting >= limit) {
+      throw new Error(`Max concurrent sessions (${limit}) reached`);
+    }
+
     // Create the promise and register it in _pendingSessions BEFORE any async work,
     // so concurrent callers arriving between now and completion see the pending entry.
     const promise = this._doStartSession(name, config);
@@ -614,10 +626,6 @@ export class SessionManager {
     name: string,
     config: Partial<SessionConfig> & { name?: string },
   ): Promise<SessionInfo> {
-    if (this.sessions.size >= this.pluginConfig.maxConcurrentSessions) {
-      throw new Error(`Max concurrent sessions (${this.pluginConfig.maxConcurrentSessions}) reached`);
-    }
-
     // Auto-resume: if we have a persisted claudeSessionId for this name, inject it.
     // Skip when config.skipPersistence is set (e.g. openai-compat bridge sessions
     // that must NOT resume stale CLI state from a previous server run).
@@ -1013,10 +1021,7 @@ export class SessionManager {
       managed.orchestrationLastStatus === 'failed' ? 'failed' : 'completed';
     this._setOrchestrationAgentStatus(managed, terminalStatus);
     if (managed.orchestration.runKind === 'session') {
-      this._emitOrchestrationRunStatus(
-        managed.orchestration,
-        terminalStatus === 'failed' ? 'failed' : 'completed',
-      );
+      this._emitOrchestrationRunStatus(managed.orchestration, terminalStatus === 'failed' ? 'failed' : 'completed');
     }
     managed.session.stop();
     this.sessions.delete(name);
@@ -2252,10 +2257,7 @@ export class SessionManager {
     this._orchestrationEvents.emit('run.started', context, { runStatus: 'running' });
   }
 
-  private _emitOrchestrationRunStatus(
-    context: OrchestrationAgentContext,
-    status: OrchestrationRunStatus,
-  ): void {
+  private _emitOrchestrationRunStatus(context: OrchestrationAgentContext, status: OrchestrationRunStatus): void {
     this._orchestrationEvents.emit('run.status', context, { runStatus: status });
   }
 
@@ -2384,11 +2386,7 @@ export class SessionManager {
       .run()
       .then(() => {
         const status = council.getSession()?.status;
-        this.recordOrchestrationRunStatus(
-          initialSession.id,
-          'council',
-          status === 'error' ? 'failed' : 'completed',
-        );
+        this.recordOrchestrationRunStatus(initialSession.id, 'council', status === 'error' ? 'failed' : 'completed');
         // Keep completed council queryable; schedule cleanup after TTL
         this._scheduleCouncilCleanup(initialSession.id);
       })

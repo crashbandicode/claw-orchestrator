@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [5.0.0-memento.6] - 2026-09-29
+
+### Fixed
+
+- Forward OpenCode session and per-turn reasoning effort through `--variant`, including resumed sessions; leave provider defaults intact for `auto`.
+- Reserve session capacity during concurrent startup so finite limits cannot be bypassed by simultaneous requests.
+
+### Added
+
+- Configure MCP open-session capacity with `CLAWO_MAX_CONCURRENT_SESSIONS`; `0` explicitly disables the admission limit. Keep the default of five and reject invalid limits.
+
 ## [5.0.0] - 2026-08-19
 
 ### Breaking
