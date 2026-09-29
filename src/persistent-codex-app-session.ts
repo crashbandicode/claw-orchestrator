@@ -127,6 +127,14 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
 
   // Per-session state populated by notifications
   private threadId?: string;
+  /**
+   * Set when `start()` opened a fresh thread and `appendSystemPrompt` is set.
+   * Nothing passes it to `thread/start`, so the instructions ride on the first
+   * turn instead, as for the one-shot engines; a resumed thread already has them.
+   */
+  private _instructionsPending = false;
+  /** Effective initial effort returned by Codex, used to restore auto after a turn override. */
+  private _sessionDefaultEffort?: string;
   private currentTurnId?: string;
   private currentGoal: ThreadGoal | null = null;
 
@@ -226,12 +234,16 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
 
     // 2. thread/start — captures threadId both from the response and the
     //    `thread/started` notification (which arrives before the response per
-    //    observed protocol semantics).
-    const startParams = {
+    //    observed protocol semantics). ThreadStartParams (codex 0.155.1
+    //    generate-json-schema) has no top-level `effort`; session effort goes
+    //    in `config.model_reasoning_effort`. Per-turn overrides use `turn/start`.
+    const startParams: Record<string, unknown> = {
       cwd: this.options.cwd,
       model: this.options.model,
       sandbox: (this.options.sandboxMode || 'workspace-write') as SandboxMode,
     };
+    const sessionEffort = this._rpcEffort(this.options.effort);
+    if (sessionEffort) startParams.config = { model_reasoning_effort: sessionEffort };
     // When resuming a known thread, use `thread/resume` (loads prior turns)
     // instead of `thread/start` (which opens a fresh thread). A stale/unknown
     // thread id (e.g. a wrong-engine id from auto-resume, or a thread that no
@@ -239,11 +251,13 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     // the whole session.
     const resumeId = this.options.resumeSessionId;
     let threadResp: { thread?: { id?: string } };
+    let resumed = false;
     if (resumeId) {
       try {
         threadResp = (await this._request('thread/resume', { threadId: resumeId, ...startParams })) as {
           thread?: { id?: string };
         };
+        resumed = true;
       } catch (err) {
         this.emit(SESSION_EVENT.LOG, `[codex-app] thread/resume failed (${(err as Error).message}); starting fresh`);
         threadResp = (await this._request('thread/start', startParams)) as { thread?: { id?: string } };
@@ -257,6 +271,9 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     if (!this.threadId) {
       throw new Error('codex app-server did not return a thread id from thread/start');
     }
+    const initialEffort = (threadResp as { reasoningEffort?: string | null }).reasoningEffort;
+    this._sessionDefaultEffort = typeof initialEffort === 'string' ? initialEffort : sessionEffort;
+    this._instructionsPending = !resumed && !!this.options.appendSystemPrompt?.trim();
 
     this.sessionId = `codex-app-${this.threadId.slice(0, 8)}-${Date.now().toString(36)}`;
     this._startTime = new Date().toISOString();
@@ -300,10 +317,13 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
   ): Promise<TurnResult | { requestId: number; sent: boolean }> {
     if (!this._isReady) throw new Error('Session not ready. Call start() first.');
     if (!this.threadId) throw new Error('Session has no thread id (start() did not complete?)');
-    const text = typeof message === 'string' ? message : JSON.stringify(message);
+    let text = typeof message === 'string' ? message : JSON.stringify(message);
+    const instructions = this._instructionsPending ? this.options.appendSystemPrompt?.trim() : undefined;
+    this._instructionsPending = false;
+    if (instructions) text = `${instructions}\n\n---\n\n${text}`;
 
     if (!options.waitForComplete) {
-      this._fireAndForgetTurn(text).catch((err) => this.emit(SESSION_EVENT.ERROR, err));
+      this._fireAndForgetTurn(text, options).catch((err) => this.emit(SESSION_EVENT.ERROR, err));
       return { requestId: this._nextRpcId, sent: true };
     }
 
@@ -315,11 +335,8 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     }
   }
 
-  private async _fireAndForgetTurn(text: string): Promise<void> {
-    await this._request('turn/start', {
-      threadId: this.threadId,
-      input: [{ type: 'text', text, text_elements: [] }],
-    });
+  private async _fireAndForgetTurn(text: string, options: SessionSendOptions = {}): Promise<void> {
+    await this._request('turn/start', this._turnStartParams(text, options.effort));
   }
 
   private async _runTurn(text: string, options: SessionSendOptions): Promise<TurnResult> {
@@ -351,10 +368,7 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     }, timeout);
 
     try {
-      await this._request('turn/start', {
-        threadId: this.threadId,
-        input: [{ type: 'text', text, text_elements: [] }],
-      });
+      await this._request('turn/start', this._turnStartParams(text, options.effort));
       const result = await turnPromise;
       return result;
     } finally {
@@ -696,6 +710,43 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────
+
+  /**
+   * Map engine-agnostic effort onto the app-server `ReasoningEffort` string.
+   * Native 0.155.1 `codex_protocol::openai_models::ReasoningEffort` wire values
+   * are none|minimal|low|medium|high|xhigh|max|ultra (plus persistent/custom,
+   * which are not in our union). `auto` / omitted leave the engine default.
+   * Levels are forwarded exactly — `max`/`ultra` stay themselves.
+   */
+  private _rpcEffort(effort?: EffortLevel): string | undefined {
+    if (!effort || effort === 'auto') return undefined;
+    const known: ReadonlySet<string> = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+    return known.has(effort) ? effort : undefined;
+  }
+
+  /**
+   * `TurnStartParams.effort` overrides reasoning for this turn and subsequent
+   * turns. Always send the effective explicit level so a later turn restores
+   * the session default.
+   *
+   * Do **not** send `effort: null` to unpin. rust-v0.155.1
+   * `turn_processor.rs` maps `params.effort` with `.map(Some)` and comments
+   * "public null does not clear effort" (same as `thread/settings/update`).
+   * JSON null deserializes like omission for this single `Option` field.
+   * There is no public double-option clear, unlike `service_tier`. Restore the
+   * initial effective session effort from thread/start or thread/resume instead.
+   * This also keeps an auto session from inheriting a one-turn override forever.
+   */
+  private _turnStartParams(text: string, turnEffort?: EffortLevel): Record<string, unknown> {
+    const params: Record<string, unknown> = {
+      threadId: this.threadId,
+      input: [{ type: 'text', text, text_elements: [] }],
+    };
+    const explicitTurn = turnEffort !== undefined;
+    const value = this._rpcEffort(explicitTurn ? turnEffort : this.options.effort) ?? this._sessionDefaultEffort;
+    if (value) params.effort = value;
+    return params;
+  }
 
   private _addHistory(entry: { time: string; type: string; event: unknown }): void {
     this._history.push(entry);

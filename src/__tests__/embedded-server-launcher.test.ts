@@ -214,7 +214,7 @@ describe('POST /autoloop/new', () => {
     expect(j.run_id).toBe('my-custom-id');
   });
 
-  it('passes independent role engines and models to autoloopStart', async () => {
+  it('passes independent role engines, models, and efforts to autoloopStart', async () => {
     const r = await fetch(`http://127.0.0.1:${port}/autoloop/new`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
@@ -223,10 +223,13 @@ describe('POST /autoloop/new', () => {
         run_id: 'multi-engine-http',
         planner_engine: 'codex',
         planner_model: 'gpt-planner',
+        planner_effort: 'high',
         coder_engine: 'opencode',
         coder_model: 'anthropic/claude-sonnet-5',
+        coder_effort: 'ultra',
         reviewer_engine: 'gemini',
         reviewer_model: 'gemini-reviewer',
+        reviewer_effort: 'low',
       }),
     });
 
@@ -236,12 +239,64 @@ describe('POST /autoloop/new', () => {
       workspace: sanitizeCwd('/tmp'),
       plannerEngine: 'codex',
       plannerModel: 'gpt-planner',
+      plannerEffort: 'high',
       coderEngine: 'opencode',
       coderModel: 'anthropic/claude-sonnet-5',
+      coderEffort: 'ultra',
       reviewerEngine: 'gemini',
       reviewerModel: 'gemini-reviewer',
+      reviewerEffort: 'low',
       sendTimeoutMs: undefined,
+      activityLeaseMs: undefined,
+      autoloopHardTimeoutMs: undefined,
     });
+  });
+
+  it('accepts inclusive timeout boundaries and maps every wire field exactly once', async () => {
+    for (const [suffix, timeouts] of [
+      ['minimums', { send_timeout_ms: 5_000, activity_lease_ms: 60_000, autoloop_hard_timeout_ms: 600_000 }],
+      ['maximums', { send_timeout_ms: 7_200_000, activity_lease_ms: 7_200_000, autoloop_hard_timeout_ms: 259_200_000 }],
+    ] as const) {
+      const r = await fetch(`http://127.0.0.1:${port}/autoloop/new`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ workspace: '/tmp', run_id: `timeouts-${suffix}`, ...timeouts }),
+      });
+
+      expect(r.status).toBe(200);
+      expect(manager.autoloopStart).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          runId: `timeouts-${suffix}`,
+          sendTimeoutMs: timeouts.send_timeout_ms,
+          activityLeaseMs: timeouts.activity_lease_ms,
+          autoloopHardTimeoutMs: timeouts.autoloop_hard_timeout_ms,
+        }),
+      );
+    }
+  });
+
+  it('rejects malformed and out-of-range start timeouts without invoking autoloopStart', async () => {
+    const start = vi.mocked(manager.autoloopStart);
+    for (const body of [
+      JSON.stringify({ workspace: '/tmp', send_timeout_ms: 4_999 }),
+      JSON.stringify({ workspace: '/tmp', send_timeout_ms: 7_200_001 }),
+      JSON.stringify({ workspace: '/tmp', send_timeout_ms: '600000' }),
+      JSON.stringify({ workspace: '/tmp', activity_lease_ms: 59_999 }),
+      JSON.stringify({ workspace: '/tmp', activity_lease_ms: 7_200_001 }),
+      JSON.stringify({ workspace: '/tmp', activity_lease_ms: null }),
+      JSON.stringify({ workspace: '/tmp', autoloop_hard_timeout_ms: 599_999 }),
+      JSON.stringify({ workspace: '/tmp', autoloop_hard_timeout_ms: 259_200_001 }),
+      '{"workspace":"/tmp","autoloop_hard_timeout_ms":1e999}',
+    ]) {
+      start.mockClear();
+      const r = await fetch(`http://127.0.0.1:${port}/autoloop/new`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body,
+      });
+      expect(r.status).toBe(400);
+      expect(start).not.toHaveBeenCalled();
+    }
   });
 
   // A custom engine names an executable to spawn. This HTTP surface is routinely
@@ -264,7 +319,7 @@ describe('POST /autoloop/new', () => {
       expect(r.status).toBe(400);
       const payload = (await r.json()) as { ok: boolean; error: string };
       expect(payload.ok).toBe(false);
-      expect(payload.error).toContain('not accepted over HTTP');
+      expect(payload.error).toContain('may not be given as an inline config over HTTP');
       expect(manager.autoloopStart).not.toHaveBeenCalled();
     }
   });
@@ -275,6 +330,16 @@ describe('POST /autoloop/new', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ workspace: '/tmp', planner_engine: 'not-real' }),
+    });
+    expect(r.status).toBe(400);
+  });
+
+  it('returns 400 when autoloop role effort is invalid, including an empty value', async () => {
+    vi.mocked(manager.autoloopStart).mockRejectedValueOnce(new Error("Planner effort '' is not supported"));
+    const r = await fetch(`http://127.0.0.1:${port}/autoloop/new`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ workspace: '/tmp', planner_effort: '' }),
     });
     expect(r.status).toBe(400);
   });
@@ -504,6 +569,88 @@ describe('POST /autoloop/:id/resume + GET /autoloop/:id/chat_history', () => {
     expect(manager.autoloopResume).toHaveBeenLastCalledWith('custom-rsm', {});
   });
 
+  it('maps the approved timeout increase and pending identity alongside secret references', async () => {
+    process.env.CLAWO_CUSTOM_ENGINE_PLANNER_REF = JSON.stringify({
+      name: 'planner-safe',
+      bin: '/opt/planner-safe',
+      args: {},
+    });
+    const resume = vi.spyOn(manager, 'autoloopResume').mockResolvedValue({
+      run_id: 'recoverable-rsm',
+      status: 'running',
+      iter: 2,
+      subagents_spawned: true,
+      started_at: '2026-05-13T10:00:00.000Z',
+      workspace: '/tmp',
+      ledger_dir: '/tmp/tasks/recoverable-rsm',
+      push_log_count: 0,
+      status_reason: null,
+      pending_dispatch: null,
+      consecutive_phase_errors: 0,
+      recent_phase_errors: [],
+      metric_history: [],
+      last_activity_at: 0,
+    });
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/autoloop/recoverable-rsm/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          plannerCustomEngineRef: 'planner-ref',
+          send_timeout_ms: 900_000,
+          pending_dispatch_id: 'dispatch-planner-2',
+        }),
+      });
+
+      expect(r.status).toBe(200);
+      expect(resume).toHaveBeenLastCalledWith('recoverable-rsm', {
+        plannerCustomEngine: { name: 'planner-safe', bin: '/opt/planner-safe', args: {} },
+        sendTimeoutMs: 900_000,
+        pendingDispatchId: 'dispatch-planner-2',
+      });
+    } finally {
+      delete process.env.CLAWO_CUSTOM_ENGINE_PLANNER_REF;
+    }
+  });
+
+  it('rejects invalid or unapproved resume controls without invoking autoloopResume', async () => {
+    const resume = vi.spyOn(manager, 'autoloopResume');
+    for (const body of [
+      { send_timeout_ms: 4_999 },
+      { send_timeout_ms: 7_200_001 },
+      { send_timeout_ms: '700000' },
+      { send_timeout_ms: null },
+      { pending_dispatch_id: '' },
+      { pending_dispatch_id: 42 },
+      { activity_lease_ms: 2_000_000 },
+      { autoloop_hard_timeout_ms: 90_000_000 },
+      { allow_decrease: false },
+    ]) {
+      resume.mockClear();
+      const r = await fetch(`http://127.0.0.1:${port}/autoloop/recoverable-rsm/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(body),
+      });
+      expect(r.status).toBe(400);
+      expect(resume).not.toHaveBeenCalled();
+    }
+  });
+
+  it('returns 400 when I4 rejects an equal or decreased timeout', async () => {
+    const resume = vi
+      .spyOn(manager, 'autoloopResume')
+      .mockRejectedValue(new Error('sendTimeoutMs must be strictly greater than the current effective value 900000'));
+    const r = await fetch(`http://127.0.0.1:${port}/autoloop/recoverable-rsm/resume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ send_timeout_ms: 900_000, pending_dispatch_id: 'dispatch-planner-2' }),
+    });
+
+    expect(r.status).toBe(400);
+    expect(resume).toHaveBeenCalledOnce();
+  });
+
   it('refuses a custom engine supplied to resume over HTTP', async () => {
     const resumeSpy = vi.spyOn(manager, 'autoloopResume');
     const r = await fetch(`http://127.0.0.1:${port}/autoloop/custom-rsm/resume`, {
@@ -514,7 +661,7 @@ describe('POST /autoloop/:id/resume + GET /autoloop/:id/chat_history', () => {
 
     expect(r.status).toBe(400);
     const payload = (await r.json()) as { ok: boolean; error: string };
-    expect(payload.error).toContain('not accepted over HTTP');
+    expect(payload.error).toContain('may not be given as an inline config over HTTP');
     expect(resumeSpy).not.toHaveBeenCalled();
   });
 

@@ -1,7 +1,7 @@
 {
   "id": "claw-orchestrator",
   "name": "Claw Orchestrator",
-  "description": "Run Claude Code, Codex, Gemini, Cursor Agent and custom coding CLIs as one unified runtime. Persistent sessions, multi-engine orchestration, multi-agent council, worktree isolation, multi-model proxy, structured output, plan mode workflows.",
+  "description": "Run Claude Code, Codex, Antigravity, Grok Build, OpenCode and custom coding CLIs as one unified runtime. Persistent sessions, multi-engine orchestration, multi-agent council, worktree isolation, multi-model proxy, structured output, plan mode workflows.",
   "enabledByDefault": false,
   "configSchema": {
     "type": "object",
@@ -17,12 +17,31 @@
       },
       "defaultPermissionMode": {
         "type": "string",
-        "enum": ["acceptEdits", "bypassPermissions", "default", "delegate", "dontAsk", "plan", "auto"],
+        "enum": [
+          "acceptEdits",
+          "bypassPermissions",
+          "default",
+          "manual",
+          "dontAsk",
+          "plan",
+          "auto"
+        ],
         "default": "acceptEdits"
       },
       "defaultEffort": {
         "type": "string",
-        "enum": ["low", "medium", "high", "max", "auto"],
+        "enum": [
+          "none",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max",
+          "ultra",
+          "default",
+          "auto"
+        ],
         "default": "auto"
       },
       "maxConcurrentSessions": {
@@ -56,17 +75,48 @@
             "description": "Default model for fast requests"
           }
         }
+      },
+      "pricingOverrides": {
+        "type": "object",
+        "description": "Per-model pricing overrides, USD per 1M tokens, keyed by model id (aliases and vendor-prefixed forms resolve to the same entry). For a flat-rate plan (a subscription seat, where per-token cost is fiction) set the fields to 0 so costUsd stops reporting money nobody was billed: {\"gpt-5.5\": {\"input\": 0, \"output\": 0, \"cached\": 0}}. Unspecified fields fall back to the model's registry rate, so a partial override leaves the rest at list price; on a model the registry does not know there is no rate to fall back to and they become 0, which is logged. Zeroing a model disables maxBudgetUsd for it - see skills/references/observability.md.",
+        "additionalProperties": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "number",
+              "minimum": 0,
+              "description": "USD per 1M input tokens"
+            },
+            "output": {
+              "type": "number",
+              "minimum": 0,
+              "description": "USD per 1M output tokens"
+            },
+            "cached": {
+              "type": "number",
+              "minimum": 0,
+              "description": "USD per 1M cached input tokens"
+            }
+          },
+          "additionalProperties": false
+        },
+        "propertyNames": {
+          "minLength": 1
+        }
       }
     }
   },
   "capabilities": {
     "childProcess": true,
-    "networkAccess": ["127.0.0.1"]
+    "networkAccess": [
+      "127.0.0.1"
+    ]
   },
   "contracts": {
     "tools": [
       "session_start",
       "session_send",
+      "session_handoff",
       "session_stop",
       "session_list",
       "sessions_overview",
@@ -95,11 +145,19 @@
       "codex_fork",
       "codex_rollback",
       "codex_models",
-      "codex_threads",
+      "codex_thread_list",
       "claude_agents_list",
       "fanout_start",
       "fanout_status",
       "fanout_abort",
+      "workflow_start",
+      "workflow_status",
+      "workflow_list",
+      "workflow_resume",
+      "workflow_cancel",
+      "workflow_steer",
+      "workflow_approve",
+      "verify_run",
       "council_start",
       "council_status",
       "council_abort",
@@ -136,5 +194,7 @@
       "ultraapp_delete"
     ]
   },
-  "skills": ["skills/SKILL.md"]
+  "skills": [
+    "skills/SKILL.md"
+  ]
 }

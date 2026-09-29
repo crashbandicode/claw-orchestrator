@@ -156,11 +156,13 @@ program
 // Session commands
 program
   .command('session-start [name]')
-  .description('Start a persistent coding session (Claude Code, Codex, Gemini, or Cursor)')
+  .description(
+    'Start a persistent coding session (Claude Code, Codex, Antigravity, Grok Build, OpenCode, or a custom engine preset)',
+  )
   .option('-d, --cwd <dir>', 'Working directory')
   .option(
     '-e, --engine <engine>',
-    'Engine: claude (default), codex, codex-app, gemini, agy, cursor, opencode, or custom',
+    'Engine: claude (default), codex, codex-app, gemini, agy, cursor, grok, opencode, or custom',
   )
   .option('-m, --model <model>', 'Model to use')
   .option('--permission-mode <mode>', 'Permission mode', 'acceptEdits')
@@ -186,10 +188,18 @@ program
   .option('--resume-session-id <id>', 'Resume existing session by ID')
   .option('--base-url <url>', 'Custom API endpoint (for proxy)')
   .option('--add-dir <dirs>', 'Comma-separated additional working directories')
+  .option(
+    '--custom-engine <preset>',
+    'With -e custom: the id of a bundled engine preset (see `clawo engines`). Inline configs are not accepted here — that is what presets are for',
+  )
   .action(async (name, opts) => {
     const body: Record<string, unknown> = { name: name || `session-${Date.now()}` };
     if (opts.cwd) body.cwd = opts.cwd;
     if (opts.engine) body.engine = opts.engine;
+    // Only a preset id. An inline config names a binary and its arguments, and
+    // this command reaches the session through the same HTTP surface that
+    // refuses those — see `clawo engines` for what is available.
+    if (opts.customEngine) body.customEngine = opts.customEngine;
     if (opts.model) body.model = opts.model;
     if (opts.permissionMode) body.permissionMode = opts.permissionMode;
     if (opts.effort) body.effort = opts.effort;
@@ -329,6 +339,42 @@ program
     console.log(`  Uptime: ${s.uptime}s`);
   });
 
+/** Print an API failure the same way every command does. */
+function fail(r: { error?: string }): void {
+  console.error(`Failed: ${r.error}`);
+}
+
+program
+  .command('engines')
+  .description('List the community engine presets bundled with this package')
+  .option('--json', 'Emit raw JSON instead of a table')
+  .action(async (opts) => {
+    // Read locally rather than over HTTP: this is a property of the installed
+    // package, and it has to work whether or not a server is running.
+    const { listEnginePresets } = await import('../src/engine-presets.js');
+    const presets = listEnginePresets();
+    if (opts.json) {
+      console.log(JSON.stringify(presets, null, 2));
+      return;
+    }
+    if (!presets.length) {
+      console.log('No engine presets are bundled with this build.');
+      return;
+    }
+    console.log('Community presets — schema-validated here, but not run here.');
+    console.log("What each one claims is its maintainer's dated attestation:\n");
+    for (const p of presets) {
+      console.log(`  ${p.id}`);
+      console.log(`    ${p.description}`);
+      console.log(
+        `    verified by ${p.provenance.maintainer} against ${p.provenance.verifiedAgainst} on ${p.provenance.verifiedOn}`,
+      );
+      if (p.provenance.smokeUrl) console.log(`    smoke: ${p.provenance.smokeUrl}`);
+      console.log(`    use:   clawo session-start my-session -e custom --custom-engine ${p.id}`);
+      console.log('');
+    }
+  });
+
 program
   .command('runs')
   .description('Show the durable run ledger — one row per turn, across engines, surviving restarts')
@@ -336,13 +382,17 @@ program
   .option('-n, --limit <n>', 'Max rows', '50')
   .option('--session <name>', 'Filter by session name')
   .option('--engine <engine>', 'Filter by engine')
-  .option('--parent <id>', 'Filter by council / fanout / autoloop run id')
+  .option('--parent <id>', 'Filter by council / fanout / autoloop / workflow run id')
+  .option('--verified', 'Only turns whose acceptance contract passed')
+  .option('--refuted', 'Only turns whose acceptance contract failed')
   .option('--json', 'Emit raw JSON instead of a table')
   .action(async (opts) => {
     const params = new URLSearchParams({ since: opts.since, limit: String(parseInt(opts.limit, 10) || 50) });
     if (opts.session) params.set('session', opts.session);
     if (opts.engine) params.set('engine', opts.engine);
     if (opts.parent) params.set('parent', opts.parent);
+    if (opts.verified) params.set('verified', 'true');
+    if (opts.refuted) params.set('verified', 'false');
     const r = await api(`/runs?${params.toString()}`);
     if (!r.ok) {
       console.error(`Failed: ${r.error}`);
@@ -520,6 +570,99 @@ program
     const r = await api('/session/team-send', 'POST', { name, teammate, message });
     if (r.ok) console.log(r.output || 'Sent');
     else console.error(`Failed: ${r.error}`);
+  });
+
+// ─── workflow / verify ──────────────────────────────────────────────────────
+
+program
+  .command('workflow')
+  .description('List, inspect, and control durable workflow runs')
+  .argument('<action>', 'list | show | cancel | resume | steer | approve')
+  .argument('[runId]', 'Run id (not needed for `list`)')
+  .argument('[text]', 'Steer text, or approve/reject for `approve`')
+  .option('--state <state>', 'Filter by run state (list)')
+  .option('--workflow <name>', 'Filter by workflow name (list)')
+  .option('--limit <n>', 'Max rows (list)', '25')
+  .option('--json', 'Raw JSON output')
+  .action(async (action: string, runId: string | undefined, text: string | undefined, opts) => {
+    if (action === 'list') {
+      const params = new URLSearchParams();
+      if (opts.state) params.set('state', opts.state);
+      if (opts.workflow) params.set('workflow', opts.workflow);
+      params.set('limit', String(opts.limit));
+      const r = await api(`/workflow/list?${params}`);
+      if (!r.ok) return fail(r);
+      if (opts.json) return console.log(JSON.stringify(r.runs, null, 2));
+      const runs = r.runs as Array<Record<string, string>>;
+      if (runs.length === 0) return console.log('No workflow runs recorded.');
+      for (const run of runs) {
+        // Three outcomes, printed as three things: `unverified` is not a
+        // failure, it means no contract was declared and nothing checked it.
+        const mark = run.outcome === 'verified' ? 'verified' : run.outcome === 'refuted' ? 'REFUTED' : 'unchecked';
+        console.log(
+          `${run.runId.padEnd(26)} ${String(run.workflow).padEnd(12)} ${String(run.state).padEnd(15)} ${mark.padEnd(10)} ${run.createdAt}`,
+        );
+      }
+      return;
+    }
+
+    if (!runId) return console.error('Error: runId is required for this action');
+
+    if (action === 'show') {
+      const r = await api(`/workflow/${encodeURIComponent(runId)}/state`);
+      if (!r.ok) return fail(r);
+      if (opts.json) return console.log(JSON.stringify(r.run, null, 2));
+      // `Record<string, never>` typed every access as the bottom type, which is
+      // assignable to anything — `run.workflw` would have compiled too.
+      const run = r.run as Record<string, unknown>;
+      console.log(`${String(run.runId)}  ${String(run.workflow)}  ${String(run.state)} / ${String(run.outcome)}`);
+      if (run.error) console.log(`error: ${String(run.error)}`);
+      for (const node of Object.values(run.nodes as Record<string, Record<string, string>>)) {
+        console.log(`  ${String(node.id).padEnd(18)} ${String(node.kind).padEnd(11)} ${node.state}`);
+      }
+      return;
+    }
+
+    if (action === 'cancel' || action === 'resume') {
+      const r = await api(`/workflow/${encodeURIComponent(runId)}/${action}`, 'POST', {});
+      if (!r.ok) return fail(r);
+      console.log(JSON.stringify(r, null, 2));
+      return;
+    }
+
+    if (action === 'steer') {
+      if (!text) return console.error('Error: steer needs text');
+      const r = await api(`/workflow/${encodeURIComponent(runId)}/steer`, 'POST', { text });
+      if (!r.ok) return fail(r);
+      console.log(r.steered ? 'Steer queued.' : 'Run is not live here; nothing queued.');
+      return;
+    }
+
+    if (action === 'approve') {
+      const approved = text !== 'reject' && text !== 'false' && text !== 'no';
+      const r = await api(`/workflow/${encodeURIComponent(runId)}/approve`, 'POST', { approved });
+      if (!r.ok) return fail(r);
+      console.log(r.answered ? `Gate ${approved ? 'approved' : 'rejected'}.` : 'No gate is waiting on this run.');
+      return;
+    }
+
+    console.error(`Unknown action '${action}'. Use list | show | cancel | resume | steer | approve.`);
+  });
+
+program
+  .command('verify')
+  .description("Show a workflow run's evidence bundle — what the runtime actually checked")
+  .argument('<runId>')
+  .option('--evidence <id>', "A specific bundle (default: the run's latest)")
+  .option('--json', 'Raw JSON output')
+  .action(async (runId: string, opts) => {
+    const params = new URLSearchParams();
+    if (opts.evidence) params.set('evidenceId', opts.evidence);
+    const r = await api(`/workflow/${encodeURIComponent(runId)}/evidence?${params}`);
+    if (!r.ok) return fail(r);
+    if (opts.json) return console.log(JSON.stringify(r.evidence, null, 2));
+    const { formatEvidence } = await import('../src/verify/evidence.js');
+    console.log(formatEvidence(r.evidence as never));
   });
 
 program.parse();

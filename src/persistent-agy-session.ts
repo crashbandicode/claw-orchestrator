@@ -19,11 +19,14 @@
  *     so cost is measured rather than guessed. Earlier versions of this wrapper
  *     read plain text and estimated ~4 chars/token, which is now only the
  *     fallback path when no result event arrives.
- *   - Timeout coherence: agy enforces its own --print-timeout (default 5m);
- *     we derive it from the send timeout so the two never disagree.
+ *   - Timeout coherence: we derive --print-timeout from the send timeout so the
+ *     two never disagree. Since 1.2.6 a headless run has no default timeout at
+ *     all unless that flag is passed, so it is now the only bound there is.
  *
- * Unknown --model values do not error — agy silently falls back to its
- * default model (verified empirically on 1.0.16).
+ * Unknown --model values are NOT reliably harmless. On 1.0.16 an unknown slug
+ * fell back to the default silently; on 1.1.25 a slug agy has stopped serving
+ * (gemini-3.5-flash) returns `status: ERROR` with an empty response and
+ * nothing on stderr. Treat a wrong model as a failed turn, not a quiet swap.
  */
 
 import { spawn } from 'node:child_process';
@@ -32,9 +35,14 @@ import * as os from 'node:os';
 import * as path from 'node:path';
 
 import type { EffortLevel, SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
-import { estimateTokens } from './models.js';
+import { estimateTokens, getModelPricing } from './models.js';
 import { sanitizeSecrets } from './sanitize.js';
-import { extractCreatedAgyConversationId, isAgyConversationId } from './agy-conversation.js';
+import {
+  extractCreatedAgyConversationId,
+  extractAgyToolPermissionDenials,
+  hasAgyToolPermissionDenial,
+  isAgyConversationId,
+} from './agy-conversation.js';
 import { SESSION_EVENT } from './constants.js';
 import { BaseOneShotSession } from './base-oneshot-session.js';
 
@@ -60,6 +68,33 @@ interface AgyStreamEvent {
   };
 }
 
+const EMPTY_RESPONSE_ERROR =
+  'Antigravity returned an empty response; the turn failed but the session remains available for retry';
+const TOOL_DENIAL_EMPTY_RESPONSE_ERROR =
+  'Antigravity returned an empty response after a tool permission denial; the turn failed but the session remains available for retry';
+const AGY_ECHOABLE_TOOL_NAME_RE = /^[A-Za-z][A-Za-z0-9_.:-]{0,63}$/;
+
+// agy 1.2.9+ ends a headless run whose own deadline passed mid-turn with exit 0
+// and status SUCCESS, carrying whatever partial reply exists, and says so only
+// on stderr. The idle line means the agent had finished and agy was waiting on a
+// background task, so a deadline after it is a clean end.
+const AGY_DEADLINE_IN_PROGRESS_RE = /print timeout after \S+ with turn in progress/;
+const AGY_IDLE_WAIT_RE = /agent idle; waiting up to/;
+
+/**
+ * agy's own `--print-timeout` for a send timeout. agy 1.2.9+ holds a headless
+ * run open until this deadline while a background task the agent started (a
+ * dev server, a watcher) is still running, and prints the reply only when it
+ * exits. It must therefore expire before the wrapper's timer: agy then ends the
+ * background tasks and delivers the reply. The other order killed the process
+ * and failed a finished turn as a timeout. SIGTERM is no substitute: agy answers
+ * it with an empty `interrupted` error and leaves the background task running.
+ */
+function agyPrintTimeoutSec(timeoutMs: number): number {
+  const marginMs = Math.min(10_000, Math.floor(timeoutMs / 10));
+  return Math.max(1, Math.floor((timeoutMs - marginMs) / 1000));
+}
+
 // ─── PersistentAgySession ───────────────────────────────────────────────────
 
 export class PersistentAgySession extends BaseOneShotSession {
@@ -73,7 +108,14 @@ export class PersistentAgySession extends BaseOneShotSession {
   constructor(config: SessionConfig, agyBin?: string) {
     super(config, agyBin || process.env.AGY_BIN || 'agy', {
       enginePrefix: 'agy',
-      defaultModel: 'gemini-3.5-flash',
+      // 3.8 because 1.1.25 stopped serving 3.5: `--model gemini-3.5-flash`
+      // returns `status: ERROR` with an empty response and nothing on stderr,
+      // while 3.7 and 3.8 complete normally — measured, not inferred. This
+      // wrapper always passes `--model`, so whatever sits here is what actually
+      // runs; and agy's stream-json carries no model field at all, so its own
+      // default cannot be read back and adopted. Re-check `agy models` when
+      // the next tier appears.
+      defaultModel: 'gemini-3.8-flash',
       supportsCachedTokens: false,
       engineDisplayName: 'Antigravity',
     });
@@ -87,6 +129,10 @@ export class PersistentAgySession extends BaseOneShotSession {
   /** Expose the captured conversation ID for resume tooling and stats overlay. */
   get conversationId(): string | undefined {
     return this.agyConversationId;
+  }
+
+  protected override _continuesConversation(): boolean {
+    return !!this.agyConversationId;
   }
 
   /**
@@ -132,9 +178,10 @@ export class PersistentAgySession extends BaseOneShotSession {
     // default model.
     // agy 1.1.5+ exposes reasoning variants through --effort. Its accepted
     // values are narrower than the engine-agnostic EffortLevel union: only
-    // low|medium|high are valid. Preserve the caller's intent by clamping the
-    // two higher aliases to agy's ceiling. A per-turn override wins over the
-    // session default, matching session_send's documented contract.
+    // low|medium|high are valid (agy 1.1.21 lists them in its own rejection).
+    // Preserve the caller's intent by clamping everything above that to agy's
+    // ceiling. A per-turn override wins over the session default, matching
+    // session_send's documented contract.
     //
     // Current agy also requires an effort when --model is an unsuffixed base
     // slug, so the provider-specific meaning of auto is high in that case. A
@@ -145,7 +192,7 @@ export class PersistentAgySession extends BaseOneShotSession {
     let model = configuredModel ? this.resolveModel(configuredModel.replace(/^agy\//, '')) : undefined;
     const requestedEffort = turnEffort ?? this.options.effort;
     const explicitEffort =
-      requestedEffort === 'max' || requestedEffort === 'xhigh'
+      requestedEffort === 'max' || requestedEffort === 'xhigh' || requestedEffort === 'ultra'
         ? 'high'
         : requestedEffort === 'auto'
           ? undefined
@@ -161,9 +208,9 @@ export class PersistentAgySession extends BaseOneShotSession {
 
     if (this.agyConversationId) args.push('--conversation', this.agyConversationId);
 
-    // agy enforces its own print-mode timeout (default 5m). Derive it from the
-    // send timeout (+5s margin) so our timer, not agy's, decides the outcome.
-    args.push('--print-timeout', `${Math.ceil(timeoutMs / 1000) + 5}s`);
+    // 1.2.6 changed the default for a headless run from 5 minutes to unlimited,
+    // so passing this is also what keeps a stuck turn from running forever.
+    args.push('--print-timeout', `${agyPrintTimeoutSec(timeoutMs)}s`);
 
     return args;
   }
@@ -173,15 +220,12 @@ export class PersistentAgySession extends BaseOneShotSession {
    * `Created conversation <uuid>`; resumed ones only log lookups, so an
    * existing ID is never overwritten by a miss.
    */
-  private _harvestConversationId(): void {
+  private _harvestConversationId(log: string | undefined): void {
     // Once harvested (or seeded) the ID is final for the life of the session
-    // — skip the synchronous whole-log re-read on every later turn.
+    // — skip the fallback match on every later turn.
     if (this.agyConversationId) return;
-    try {
-      const log = fs.readFileSync(this._logFile, 'utf8');
+    if (log) {
       this.agyConversationId = extractCreatedAgyConversationId(log);
-    } catch {
-      // Log file missing — agy failed before logging anything
     }
     if (!this.agyConversationId) {
       // Without an ID every later send silently starts a fresh conversation.
@@ -203,6 +247,16 @@ export class PersistentAgySession extends BaseOneShotSession {
     const timeout = options.timeout || 300_000;
     const args = this._buildArgs(message, timeout, options.effort);
 
+    // The path is stable for the session, so remove the previous turn's file
+    // before spawning. If that cannot be proven, do not inspect the file at all:
+    // a stale denial must never be attributed to the current empty response.
+    let mayReadTurnLog = true;
+    try {
+      fs.unlinkSync(this._logFile);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') mayReadTurnLog = false;
+    }
+
     return new Promise<TurnResult>((resolve, reject) => {
       let resultText = '';
       let stderr = '';
@@ -215,6 +269,7 @@ export class PersistentAgySession extends BaseOneShotSession {
       // exited with code 1" — agy's own message names the valid values.
       let turnError: string | undefined;
 
+      const startedAt = Date.now();
       const proc = spawn(this.engineBin, args, {
         cwd: this.options.cwd,
         env: { ...process.env },
@@ -225,7 +280,12 @@ export class PersistentAgySession extends BaseOneShotSession {
       const timer = setTimeout(() => {
         if (!settled) {
           settled = true;
-          proc.kill('SIGTERM');
+          // Kill the whole process tree (on Windows `kill` would leave agy's own
+          // children running), but keep the conversation id: a turn killed by
+          // the timeout does not end the conversation, and the next send with the
+          // same `--conversation` still recalls what came before (verified on
+          // agy 1.2.4). Dropping the id would cost an agy Planner its whole chat.
+          this._cleanupProc();
           reject(new Error('Timeout waiting for Antigravity response'));
         }
       }, timeout);
@@ -301,25 +361,39 @@ export class PersistentAgySession extends BaseOneShotSession {
         this.currentProc = null;
         if (pending) handleLine(pending, false);
 
+        const text = resultText.replace(/\n$/, '');
+        const emptyResponse = text.trim().length === 0;
+        let turnLog: string | undefined;
+        const needsLog = !this.agyConversationId || (!settled && code === 0 && !turnError);
+        if (mayReadTurnLog && needsLog) {
+          try {
+            turnLog = fs.readFileSync(this._logFile, 'utf8');
+          } catch {
+            // Log file missing — agy failed before logging anything.
+          }
+        }
+
         // Harvest BEFORE the settled check: a turn that hit the wrapper timeout
         // has already rejected (settled), but agy may still have announced the
         // conversation before being killed. Skipping this would lose the id
         // permanently and every later send would silently start fresh. The
         // stream normally supplies it from the `init` event; this is the
         // fallback for a turn that died before emitting one.
-        this._harvestConversationId();
+        this._harvestConversationId(turnLog);
 
         if (settled) return;
         settled = true;
 
-        // One expression for the outcome: it feeds the counter here and the `stop_reason`
-        // below, and it is the reject condition at the end of this handler. The exit code
-        // stays in the conjunction — agy can report SUCCESS and then die in cleanup, and a
-        // turn whose promise rejects is not a turn that succeeded.
-        const ok = !turnError && !turnStatus && code === 0;
+        // One expression for the outcome feeds both the counter and `stop_reason`.
+        // A non-SUCCESS status with a partial reply still resolves below so callers do
+        // not lose useful output, but it deliberately remains a failed ledger turn.
+        // Reached agy's deadline while still working: a partial reply is not an
+        // answer. Elapsed time is the backstop should agy reword that line.
+        const hitDeadline =
+          AGY_DEADLINE_IN_PROGRESS_RE.test(stderr) ||
+          (!AGY_IDLE_WAIT_RE.test(stderr) && Date.now() - startedAt >= agyPrintTimeoutSec(timeout) * 1000);
+        const ok = !hitDeadline && !turnError && !turnStatus && code === 0 && !emptyResponse;
         this._recordTurnComplete(ok);
-
-        const text = resultText.replace(/\n$/, '');
 
         // Real usage from the `result` event. estimateTokens() is the fallback
         // for a turn that produced no result event (killed, crashed, or an
@@ -340,13 +414,16 @@ export class PersistentAgySession extends BaseOneShotSession {
 
         this._addHistory({ text, code });
 
+        const permissionDenials = extractAgyToolPermissionDenials(turnLog ?? '');
         const event: StreamEvent = {
           type: 'result',
           result: text,
-          // agy can exit 0 while reporting a non-SUCCESS status or an error in the
-          // result event (e.g. a turn stopped early), so the status is
-          // authoritative when present and the exit code is the fallback.
+          // agy can exit 0 while reporting a non-SUCCESS status, an error, or no
+          // usable response, so all terminal signals participate in the verdict.
           stop_reason: ok ? 'end_turn' : 'error',
+          ...(permissionDenials.length > 0
+            ? { permission_denials: permissionDenials.map((tool_name) => ({ tool_name })) }
+            : {}),
         };
 
         this.emit(SESSION_EVENT.RESULT, event);
@@ -354,10 +431,21 @@ export class PersistentAgySession extends BaseOneShotSession {
 
         // A captured result error means the turn failed even when agy exits 0,
         // so surface it rather than resolving an empty string as a reply.
-        if (turnError) {
+        if (hitDeadline) {
+          reject(new Error('Timeout waiting for Antigravity response'));
+        } else if (turnError) {
           reject(new Error(turnError));
         } else if (code !== 0) {
           reject(new Error(stderr || `Antigravity exited with code ${code}`));
+        } else if (emptyResponse) {
+          const echoableDenials = permissionDenials.filter((name) => AGY_ECHOABLE_TOOL_NAME_RE.test(name));
+          const emptyResponseError =
+            echoableDenials.length > 0
+              ? `Antigravity returned an empty response after denying tool confirmation for ${echoableDenials.map((name) => `"${name}"`).join(', ')}; the turn failed but the session remains available for retry`
+              : hasAgyToolPermissionDenial(turnLog ?? '')
+                ? TOOL_DENIAL_EMPTY_RESPONSE_ERROR
+                : EMPTY_RESPONSE_ERROR;
+          reject(new Error(emptyResponseError));
         } else {
           resolve({ text, event });
         }
@@ -371,6 +459,21 @@ export class PersistentAgySession extends BaseOneShotSession {
         }
       });
     });
+  }
+
+  // ── Pricing ────────────────────────────────────────────────
+
+  /**
+   * An effort-qualified slug (`gemini-3.1-pro-high`) is priced as the base
+   * model it qualifies. Looked up verbatim it is unknown, and fell back to
+   * the Flash default: a Pro turn billed at Flash rates.
+   */
+  private _baseModel(model: string | undefined): string | undefined {
+    return model?.replace(/-(low|medium|high)$/, '');
+  }
+
+  protected override _getModelPricing() {
+    return getModelPricing(this._baseModel(this.options.model), this.engineCfg.defaultModel);
   }
 
   /** Clean up the per-session log file along with the base teardown. */

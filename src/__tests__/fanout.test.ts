@@ -15,26 +15,30 @@ function makeManager(
   } = {},
 ) {
   const started: string[] = [];
-  const startConfigs: Array<Record<string, unknown>> = [];
+  const startedConfigs: Array<Record<string, unknown>> = [];
   const stopped: string[] = [];
   const sent: Array<{ name: string; message: string }> = [];
   const manager = {
     startSession: vi.fn(async (config: { name?: string } & Record<string, unknown>) => {
       started.push(config.name!);
-      startConfigs.push(config);
+      startedConfigs.push(config);
       return { name: config.name } as never;
     }),
     sendMessage: vi.fn(async (name: string, message: string) => {
       sent.push({ name, message });
       const agent = name.split('-').pop()!;
       if (opts.fail?.has(agent)) throw new Error(`boom:${agent}`);
+      // A turn-level failure is REPORTED, not thrown — see SessionManager.
+      if (opts.returnsError?.has(agent)) {
+        return { output: `upstream said no (${agent})`, error: `turn failed: ${agent}`, events: [] } as never;
+      }
       return { output: opts.outputs?.[agent] ?? `out:${agent}`, events: [] } as never;
     }),
     stopSession: vi.fn(async (name: string) => {
       stopped.push(name);
     }),
   };
-  return { manager, started, startConfigs, stopped, sent };
+  return { manager, started, startedConfigs, stopped, sent };
 }
 
 const baseConfig = (agents: FanoutConfig['agents'], extra: Partial<FanoutConfig> = {}): FanoutConfig => ({
@@ -66,7 +70,7 @@ describe('Fanout', () => {
   });
 
   it('gives every native child an explicit shared run id and unique agent key', async () => {
-    const { manager, startConfigs } = makeManager();
+    const { manager, startedConfigs } = makeManager();
     const fan = new Fanout(
       baseConfig([
         { name: 'reviewer', engine: 'codex', model: 'gpt-test' },
@@ -77,20 +81,72 @@ describe('Fanout', () => {
     const initialized = fan.init();
     await fan.run();
 
-    expect(startConfigs).toHaveLength(2);
-    expect(startConfigs.map((config) => config.orchestration)).toEqual([
+    expect(startedConfigs).toHaveLength(2);
+    expect(startedConfigs.map((config) => config.orchestration)).toEqual([
       expect.objectContaining({ runId: initialized.id, runKind: 'fanout', agentKey: 'reviewer' }),
       expect.objectContaining({ runId: initialized.id, runKind: 'fanout', agentKey: 'implementer' }),
     ]);
   });
 
-  it('uses a per-agent prompt override when provided, else the shared task', async () => {
+  it('composes persona instructions before the shared task', async () => {
     const { manager, sent } = makeManager();
-    const fan = new Fanout(baseConfig([{ name: 'a', prompt: 'custom prompt' }, { name: 'b' }]), manager);
+    const fan = new Fanout(baseConfig([{ name: 'a', persona: 'ROLE INSTRUCTIONS' }]), manager);
+
     await fan.run();
-    const byAgent = Object.fromEntries(sent.map((s) => [s.name.split('-').pop(), s.message]));
-    expect(byAgent.a).toBe('custom prompt');
-    expect(byAgent.b).toBe('do the thing');
+
+    expect(sent[0]?.message).toBe('ROLE INSTRUCTIONS\n\n## Shared task\n\ndo the thing');
+  });
+
+  it('uses a per-agent prompt override instead of the shared task', async () => {
+    const { manager, sent } = makeManager();
+    const fan = new Fanout(baseConfig([{ name: 'a', prompt: 'custom prompt' }]), manager);
+
+    await fan.run();
+
+    expect(sent[0]?.message).toBe('custom prompt');
+  });
+
+  it('gives prompt precedence when an agent also has a persona', async () => {
+    const { manager, sent } = makeManager();
+    const fan = new Fanout(baseConfig([{ name: 'a', prompt: 'custom prompt', persona: 'ROLE INSTRUCTIONS' }]), manager);
+
+    await fan.run();
+
+    expect(sent[0]?.message).toBe('custom prompt');
+  });
+
+  it('uses the shared task when neither prompt nor persona is provided', async () => {
+    const { manager, sent } = makeManager();
+    const fan = new Fanout(baseConfig([{ name: 'a' }]), manager);
+
+    await fan.run();
+
+    expect(sent[0]?.message).toBe('do the thing');
+  });
+
+  it('passes each agent reasoning effort into its session', async () => {
+    const { manager, startedConfigs } = makeManager();
+    const fan = new Fanout(
+      baseConfig([
+        { name: 'a', engine: 'codex', effort: 'ultra' },
+        { name: 'b', engine: 'claude', effort: 'low' },
+      ]),
+      manager,
+    );
+
+    await fan.run();
+
+    expect(startedConfigs.find((config) => config.name?.toString().endsWith('-a'))).toMatchObject({ effort: 'ultra' });
+    expect(startedConfigs.find((config) => config.name?.toString().endsWith('-b'))).toMatchObject({ effort: 'low' });
+  });
+
+  it('omits effort when the agent does not override the session default', async () => {
+    const { manager, startedConfigs } = makeManager();
+    const fan = new Fanout(baseConfig([{ name: 'a', engine: 'codex' }]), manager);
+
+    await fan.run();
+
+    expect(startedConfigs[0]).not.toHaveProperty('effort');
   });
 
   it('isolates a single agent failure without failing the batch', async () => {
@@ -139,5 +195,97 @@ describe('Fanout', () => {
     const session = await fan.run();
     expect(session.synthesis).toBeUndefined();
     expect(session.synthesisError).toContain('boom:synthesis');
+  });
+});
+
+// ─── Success predicate (6.0.0) ──────────────────────────────────────────────
+
+describe('per-agent ok', () => {
+  /** A manager that reports the engine's own terminal verdict, like the real one. */
+  function makeCountingManager(succeeds: Record<string, boolean>) {
+    const stats: Record<string, { turns: number; turnsSucceeded: number }> = {};
+    return {
+      startSession: vi.fn(async (config: { name?: string }) => {
+        stats[config.name!] = { turns: 0, turnsSucceeded: 0 };
+        return { name: config.name } as never;
+      }),
+      sendMessage: vi.fn(async (name: string) => {
+        const agent = name.split('-').pop()!;
+        stats[name].turns++;
+        if (succeeds[agent]) stats[name].turnsSucceeded++;
+        return { output: `out:${agent}`, events: [] } as never;
+      }),
+      stopSession: vi.fn(async () => undefined),
+      getStatus: (name: string) => ({ stats: stats[name] }) as never,
+    };
+  }
+
+  it('records a turn the engine declined to count as succeeded as NOT ok', async () => {
+    const manager = makeCountingManager({ alpha: true, beta: false });
+    const fanout = new Fanout(baseConfig([{ name: 'alpha' }, { name: 'beta' }]), manager as never);
+    const session = await fanout.run();
+    expect(session.results.find((r) => r.agent === 'alpha')?.ok).toBe(true);
+    // Before 6.0.0 this was an unconditional `true` — the send returned, so it
+    // was called a success even though the engine reported the turn as failed.
+    expect(session.results.find((r) => r.agent === 'beta')?.ok).toBe(false);
+    expect(session.results.find((r) => r.agent === 'beta')?.error).toBeTruthy();
+  });
+
+  it('still succeeds when the manager cannot report stats', async () => {
+    const { manager } = makeManager();
+    const fanout = new Fanout(baseConfig([{ name: 'alpha' }]), manager as never);
+    const session = await fanout.run();
+    expect(session.results[0].ok).toBe(true);
+  });
+
+  it('stamps the ledger with the node kind', async () => {
+    const { manager } = makeManager();
+    const fanout = new Fanout(baseConfig([{ name: 'alpha' }]), manager as never);
+    await fanout.run();
+    expect(manager.sendMessage).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.any(String),
+      expect.objectContaining({ nodeKind: 'fanout' }),
+    );
+  });
+});
+
+// ── A synthesis turn that fails cleanly must not be published as the answer.
+//
+//    `sendMessage` returns `{error}` for auth loss, an invalid model, or
+//    rate-limit exhaustion — it does not throw — so the catch never ran, the
+//    error text landed in `session.synthesis`, `synthesisError` stayed
+//    undefined and status went to 'done'. A caller checking `synthesisError`
+//    (the field's documented purpose) read the error text as the merged answer.
+describe('Fanout — synthesis turn reports a returned error', () => {
+  it('sets synthesisError and publishes no synthesis when the turn fails', async () => {
+    const { manager } = makeManager({ outputs: { a: 'A', b: 'B' }, returnsError: new Set(['synthesis']) });
+    const fan = new Fanout(
+      baseConfig(
+        [
+          { name: 'a', engine: 'claude' },
+          { name: 'b', engine: 'codex' },
+        ],
+        { synthesize: true },
+      ),
+      manager,
+    );
+
+    const session = await fan.run();
+
+    expect(session.synthesisError).toBe('turn failed: synthesis');
+    expect(session.synthesis).toBeUndefined();
+    // The agents themselves succeeded; only the merge failed.
+    expect(session.results.every((r) => r.ok)).toBe(true);
+  });
+
+  it('still publishes a synthesis when the turn succeeds', async () => {
+    const { manager } = makeManager({ outputs: { a: 'A', b: 'B', synthesis: 'MERGED' } });
+    const fan = new Fanout(baseConfig([{ name: 'a' }, { name: 'b' }], { synthesize: true }), manager);
+
+    const session = await fan.run();
+
+    expect(session.synthesis).toBe('MERGED');
+    expect(session.synthesisError).toBeUndefined();
   });
 });

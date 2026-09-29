@@ -155,6 +155,25 @@ describe('PersistentClaudeSession', () => {
       expect(args).toContain('resume_abc');
     });
 
+    // The CLI's agent schema grows every few releases (2.1.271 added
+    // `omitClaudeMd`). Agents are handed over verbatim, so a field the CLI adds
+    // must reach it unchanged — mapping them through a list of known fields
+    // would drop the next one silently.
+    it('passes agent definitions to --agents verbatim, fields it does not name included', async () => {
+      const agents = {
+        scout: { description: 'Looks things up', prompt: 'You are a scout.', omitClaudeMd: true, maxTurns: 3 },
+      };
+      session = new PersistentClaudeSession(makeConfig({ agents }));
+      const { spawn } = await import('node:child_process');
+      const startPromise = session.start();
+      emitInitEvent(mockProc);
+      await startPromise;
+
+      const args = vi.mocked(spawn).mock.calls.at(-1)![1] as string[];
+      const json = args[args.indexOf('--agents') + 1];
+      expect(JSON.parse(json)).toEqual(agents);
+    });
+
     it('routes non-Claude model through proxy when baseUrl is set', async () => {
       session = new PersistentClaudeSession(makeConfig({ model: 'gpt-5.4', baseUrl: 'http://localhost:3000' }));
       const { spawn } = await import('node:child_process');
@@ -457,16 +476,172 @@ describe('PersistentClaudeSession', () => {
       await startPromise;
     });
 
-    it('tracks tool calls from stream_event content_block_start', () => {
-      const event = {
+    // The event order of a real two-tool turn (claude 2.1.274, --include-partial-messages,
+    // --replay-user-messages), trimmed to the fields the wrapper reads. Each tool_use
+    // block arrives twice: first on `content_block_start` with an empty input, then as
+    // an `assistant` event carrying the same id and the full input. The results come
+    // back inside `user` messages.
+    const twoToolTurn = [
+      { type: 'user', message: { role: 'user', content: [{ type: 'text', text: 'run two commands' }] } },
+      { type: 'stream_event', event: { type: 'message_start' } },
+      {
         type: 'stream_event',
         event: {
           type: 'content_block_start',
-          content_block: { type: 'tool_use', name: 'Read' },
+          content_block: { type: 'tool_use', id: 'toolu_1', name: 'Bash', input: {} },
         },
+      },
+      {
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: 'toolu_1', name: 'Bash', input: { command: 'echo one' } }] },
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'one', is_error: false }],
+        },
+      },
+      { type: 'stream_event', event: { type: 'message_start' } },
+      {
+        type: 'stream_event',
+        event: {
+          type: 'content_block_start',
+          content_block: { type: 'tool_use', id: 'toolu_2', name: 'Bash', input: {} },
+        },
+      },
+      {
+        type: 'assistant',
+        message: { content: [{ type: 'tool_use', id: 'toolu_2', name: 'Bash', input: { command: 'exit 3' } }] },
+      },
+      {
+        type: 'user',
+        message: {
+          role: 'user',
+          content: [{ type: 'tool_result', tool_use_id: 'toolu_2', content: 'Exit code 3', is_error: true }],
+        },
+      },
+      { type: 'assistant', message: { content: [{ type: 'text', text: 'DONE' }] } },
+      { type: 'result', subtype: 'success', result: 'DONE' },
+    ];
+
+    it('reports each tool call once, with its input, and counts failed tool results', () => {
+      const seen: unknown[] = [];
+      session.on(SESSION_EVENT.TOOL_USE, (e: unknown) => seen.push(e));
+      for (const event of twoToolTurn) mockProc.stdout.emit('data', Buffer.from(JSON.stringify(event) + '\n'));
+      expect(session.stats.toolCalls).toBe(2);
+      expect(seen).toEqual([
+        { tool: { name: 'Bash', input: { command: 'echo one' } } },
+        { tool: { name: 'Bash', input: { command: 'exit 3' } } },
+      ]);
+      expect(session.stats.toolErrors).toBe(1);
+      expect(session.stats.turnsSucceeded).toBe(1);
+    });
+
+    it('does not hand a waiting send the reply of a turn it did not send', async () => {
+      const waiting = session.send('second message', { waitForComplete: true, timeout: 60_000 });
+      // A background workflow finishing while this send is in flight: its own turn
+      // ends in a result tagged with an origin (recorded on 2.1.274).
+      const late = {
+        type: 'result',
+        subtype: 'success',
+        result: 'The workflow finished: PONG',
+        origin: { kind: 'task-notification' },
+        total_cost_usd: 0.12,
       };
+      mockProc.stdout.emit('data', Buffer.from(JSON.stringify(late) + '\n'));
+      const own = { type: 'result', subtype: 'success', result: 'reply to the second message', total_cost_usd: 0.13 };
+      mockProc.stdout.emit('data', Buffer.from(JSON.stringify(own) + '\n'));
+      const reply = (await waiting) as { text: string };
+      expect(reply.text).toBe('reply to the second message');
+      expect(session.stats.turnsSucceeded).toBe(1);
+    });
+
+    const lastSentUuid = (): string => {
+      const written = mockProc.stdin.write.mock.calls.at(-1)![0] as string;
+      return JSON.parse(written.trim()).uuid as string;
+    };
+    const emit = (event: Record<string, unknown>) =>
       mockProc.stdout.emit('data', Buffer.from(JSON.stringify(event) + '\n'));
-      expect(session.stats.toolCalls).toBe(1);
+
+    it('resolves a send the CLI folded into a turn it started itself', async () => {
+      const waiting = session.send('question', { waitForComplete: true, timeout: 60_000 });
+      const uuid = lastSentUuid();
+      expect(uuid).toMatch(/^[0-9a-f-]{36}$/);
+      // Background-task turn that absorbed the message: tagged with an origin, but
+      // it names the message it answers.
+      emit({ type: 'result', result: 'answer', origin: { kind: 'task-notification' }, user_message_uuids: [uuid] });
+      expect(((await waiting) as { text: string }).text).toBe('answer');
+      expect(session.stats.turnsSucceeded).toBe(1);
+    });
+
+    it('ignores a result that names only messages this session did not send', async () => {
+      const waiting = session.send('question', { waitForComplete: true, timeout: 60_000 });
+      const uuid = lastSentUuid();
+      emit({ type: 'result', result: 'someone else', user_message_uuids: ['00000000-0000-0000-0000-000000000000'] });
+      emit({ type: 'result', result: 'mine', user_message_uuids: [uuid] });
+      expect(((await waiting) as { text: string }).text).toBe('mine');
+      expect(session.stats.turnsSucceeded).toBe(1);
+    });
+
+    it('does not hand a waiting send the reply to a message sent without waiting', async () => {
+      // An inbox delivery writes without waiting; a caller then sends and waits.
+      await session.send('inbox message', { waitForComplete: false });
+      const inbox = lastSentUuid();
+      const waiting = session.send('question', { waitForComplete: true, timeout: 60_000 });
+      const mine = lastSentUuid();
+      emit({ type: 'result', result: 'reply to the inbox message', user_message_uuids: [inbox] });
+      emit({ type: 'result', result: 'reply to the question', user_message_uuids: [mine] });
+      expect(((await waiting) as { text: string }).text).toBe('reply to the question');
+      expect(session.stats.turnsSucceeded).toBe(2);
+    });
+
+    it('does not hand the next send the late reply to a send that timed out', async () => {
+      const first = session.send('first', { waitForComplete: true, timeout: 1000 });
+      const firstUuid = lastSentUuid();
+      const firstOutcome = first.catch((e: Error) => e.message);
+      vi.advanceTimersByTime(1001);
+      expect(await firstOutcome).toMatch(/Timeout/);
+      const second = session.send('second', { waitForComplete: true, timeout: 60_000 });
+      const secondUuid = lastSentUuid();
+      emit({ type: 'result', result: 'late reply to first', user_message_uuids: [firstUuid] });
+      emit({ type: 'result', result: 'reply to second', user_message_uuids: [secondUuid] });
+      expect(((await second) as { text: string }).text).toBe('reply to second');
+      // The late turn is not the second send's success; counting it would mark a
+      // failed second turn ok in the run ledger.
+      expect(session.stats.turnsSucceeded).toBe(1);
+    });
+
+    it("does not build a reply's fallback text from a turn it did not send", async () => {
+      const waiting = session.send('question', { waitForComplete: true, timeout: 60_000 });
+      const uuid = lastSentUuid();
+      emit({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'NOT MINE' } },
+      });
+      emit({ type: 'result', result: 'workflow done', origin: { kind: 'task-notification' } });
+      emit({
+        type: 'stream_event',
+        event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'mine' } },
+      });
+      emit({ type: 'result', result: '', user_message_uuids: [uuid] });
+      expect(((await waiting) as { text: string }).text).toBe('mine');
+    });
+
+    it('names the model the CLI reported in init when the caller set none', async () => {
+      const unnamed = new PersistentClaudeSession(makeConfig({ model: undefined }));
+      expect(unnamed.getCost().model).toBe('default');
+      const started = unnamed.start();
+      const init = { type: 'system', subtype: 'init', session_id: 'sess_456', model: 'claude-haiku-4-5-20251001' };
+      mockProc.stdout.emit('data', Buffer.from(JSON.stringify(init) + '\n'));
+      await started;
+      expect(unnamed.getCost().model).toBe('claude-haiku-4-5-20251001');
+      // A model the caller chose still wins over what init says.
+      const named = new PersistentClaudeSession(makeConfig());
+      const namedStarted = named.start();
+      mockProc.stdout.emit('data', Buffer.from(JSON.stringify(init) + '\n'));
+      await namedStarted;
+      expect(named.getCost().model).toBe('claude-sonnet-4-6');
     });
 
     it('emits text from content_block_delta', () => {
@@ -593,6 +768,125 @@ describe('PersistentClaudeSession', () => {
     });
   });
 
+  // Regression: the CLI reports one turn's usage twice — once on the streaming
+  // `message_delta`, once on the terminal `result` — and both used to be added.
+  // Measured against claude 2.1.246 on a live turn: the engine reported
+  // in=2 / out=4 / cache_read=47371 and getStats() came back 4 / 8 / 94742.
+  describe('turn usage is counted once', () => {
+    beforeEach(async () => {
+      const startPromise = session.start();
+      emitInitEvent(mockProc);
+      await startPromise;
+    });
+
+    const emit = (obj: unknown) => mockProc.stdout.emit('data', Buffer.from(JSON.stringify(obj) + '\n'));
+
+    it('does not double-count when the delta and the result report the same turn', () => {
+      const usage = { input_tokens: 2, output_tokens: 4, cache_read_input_tokens: 47_371 };
+      emit({ type: 'stream_event', event: { type: 'message_start' } });
+      emit({ type: 'stream_event', event: { type: 'message_delta', usage } });
+      emit({ type: 'result', usage });
+
+      expect(session.stats.tokensIn).toBe(2);
+      expect(session.stats.tokensOut).toBe(4);
+      expect(session.stats.cachedTokens).toBe(47_371);
+    });
+
+    it('keeps every message of a multi-message turn, without counting any twice', () => {
+      // Two assistant messages (one tool round), then the turn total.
+      emit({ type: 'stream_event', event: { type: 'message_start' } });
+      emit({
+        type: 'stream_event',
+        event: { type: 'message_delta', usage: { input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 100 } },
+      });
+      emit({ type: 'stream_event', event: { type: 'message_start' } });
+      emit({
+        type: 'stream_event',
+        event: { type: 'message_delta', usage: { input_tokens: 7, output_tokens: 3, cache_read_input_tokens: 120 } },
+      });
+      emit({
+        type: 'result',
+        usage: { input_tokens: 17, output_tokens: 8, cache_read_input_tokens: 220 },
+      });
+
+      expect(session.stats.tokensIn).toBe(17);
+      expect(session.stats.tokensOut).toBe(8);
+      expect(session.stats.cachedTokens).toBe(220);
+    });
+
+    it("takes the engine's spend figure and treats it as a running total", () => {
+      // `total_cost_usd` is the session total, not the turn's: two turns on one
+      // process read 0.02377 then 0.047559. Accumulating them would bill 0.0713.
+      emit({ type: 'result', usage: { input_tokens: 2, output_tokens: 3 }, total_cost_usd: 0.02377 });
+      expect(session.stats.costUsd).toBeCloseTo(0.02377, 10);
+
+      emit({ type: 'result', usage: { input_tokens: 2, output_tokens: 3 }, total_cost_usd: 0.047559 });
+      expect(session.stats.costUsd).toBeCloseTo(0.047559, 10);
+    });
+
+    it('resumes accumulating when the CLI process restarts its own counter', () => {
+      emit({ type: 'result', usage: { input_tokens: 2, output_tokens: 3 }, total_cost_usd: 0.05 });
+      // A resume spawns a fresh CLI, whose running total starts over.
+      emit({ type: 'result', usage: { input_tokens: 2, output_tokens: 3 }, total_cost_usd: 0.01 });
+      expect(session.stats.costUsd).toBeCloseTo(0.06, 10);
+    });
+
+    it('prices cache writes when the engine reports no cost of its own', () => {
+      // 1-hour cache writes bill at 2x input. Leaving them out is what made the
+      // estimate read $0.016 on a turn the engine priced at $0.322428.
+      emit({
+        type: 'result',
+        usage: {
+          input_tokens: 0,
+          output_tokens: 0,
+          cache_creation_input_tokens: 1_000_000,
+          cache_creation: { ephemeral_1h_input_tokens: 1_000_000, ephemeral_5m_input_tokens: 0 },
+        },
+      });
+      // claude-sonnet-4-6 fallback pricing: input 3/Mtok, so 1M at 2x = 6.
+      expect(session.stats.costUsd).toBeCloseTo(6, 6);
+    });
+  });
+
+  // Regression: claude 2.1.277 made a headless process started with --resume
+  // restore the totals the resumed session saved at exit, where it used to
+  // begin at zero. Measured on 2.1.278: a turn reported $0.363044, and the same
+  // session resumed in a new process reported $0.386463 for a turn whose own
+  // usage was $0.023419. Reading that as this process's spend re-charges the
+  // whole history on every model switch and every session recovery, and
+  // `maxBudgetUsd` gates against that number.
+  describe('cost on a process started with --resume', () => {
+    const emit = (obj: unknown) => mockProc.stdout.emit('data', Buffer.from(JSON.stringify(obj) + '\n'));
+
+    async function startWith(overrides: Partial<SessionConfig>) {
+      session = new PersistentClaudeSession(makeConfig(overrides));
+      const startPromise = session.start();
+      emitInitEvent(mockProc);
+      await startPromise;
+    }
+
+    it('treats the inherited total as a baseline, not as this process spend', async () => {
+      await startWith({ resumeSessionId: 'resume_abc' });
+
+      emit({ type: 'result', usage: { input_tokens: 2, output_tokens: 3 }, total_cost_usd: 0.386463 });
+      const afterFirst = session.stats.costUsd;
+      // The turn keeps the registry estimate for its own two tokens, which is
+      // under a cent — the point is that it is not the inherited $0.386463.
+      expect(afterFirst).toBeLessThan(0.001);
+
+      // From the baseline on, the difference is this process's own spend.
+      emit({ type: 'result', usage: { input_tokens: 2, output_tokens: 3 }, total_cost_usd: 0.4 });
+      expect(session.stats.costUsd).toBeCloseTo(afterFirst + (0.4 - 0.386463), 10);
+    });
+
+    it('still takes the first total in full when the process was not resumed', async () => {
+      await startWith({});
+
+      emit({ type: 'result', usage: { input_tokens: 2, output_tokens: 3 }, total_cost_usd: 0.02377 });
+      expect(session.stats.costUsd).toBeCloseTo(0.02377, 10);
+    });
+  });
+
   describe('_updateCost', () => {
     beforeEach(async () => {
       const startPromise = session.start();
@@ -623,11 +917,16 @@ describe('PersistentClaudeSession', () => {
       mockProc.stdout.emit('data', Buffer.from(JSON.stringify(deltaEvent) + '\n'));
       const costWithCache = session.stats.costUsd;
 
-      // Reset and do without cache
+      // Start a fresh message, so the next delta is a new series rather than a
+      // continuation of the previous one.
       session.stats.tokensIn = 0;
       session.stats.tokensOut = 0;
       session.stats.cachedTokens = 0;
       session.stats.costUsd = 0;
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(JSON.stringify({ type: 'stream_event', event: { type: 'message_start' } }) + '\n'),
+      );
 
       const deltaEvent2 = {
         type: 'stream_event',
@@ -643,6 +942,12 @@ describe('PersistentClaudeSession', () => {
       // Both should be >= 0
       expect(costWithCache).toBeGreaterThanOrEqual(0);
       expect(costWithoutCache).toBeGreaterThanOrEqual(0);
+      // The API's `input_tokens` excludes cached reads, so the two turns are
+      // not the same prompt: one carries 1500 tokens, the other 1000. Cached
+      // reads therefore ADD to the bill instead of being carved out of it —
+      // subtracting them out was what let a cached session bill at nothing.
+      const cachedRate = 0.3 / 1_000_000; // claude-sonnet-4-6 fallback pricing
+      expect(costWithCache).toBeCloseTo(costWithoutCache + 500 * cachedRate, 10);
     });
   });
 
@@ -772,12 +1077,21 @@ describe('PersistentClaudeSession', () => {
       expect(status.contextPercent).toBeLessThanOrEqual(100);
     });
 
-    it('contextPercent scales with token usage', () => {
-      // Inject some tokens
-      session.stats.tokensIn = 100_000;
-      session.stats.tokensOut = 50_000;
-      const status = session.getStats();
-      expect(status.contextPercent).toBeGreaterThan(0);
+    it("contextPercent measures the last turn's prompt, not the session total", () => {
+      // `input_tokens` alone is not the prompt: on a resumed conversation the
+      // history arrives as cached reads, and summing the session's input and
+      // output instead reported 0% for a full context.
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(
+          JSON.stringify({
+            type: 'result',
+            usage: { input_tokens: 2, output_tokens: 4, cache_read_input_tokens: 400_000 },
+            modelUsage: { 'claude-opus-5': { contextWindow: 1_000_000 } },
+          }) + '\n',
+        ),
+      );
+      expect(session.getStats().contextPercent).toBe(40);
     });
   });
 

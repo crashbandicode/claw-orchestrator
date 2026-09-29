@@ -35,7 +35,7 @@ describe('lookupModel', () => {
   it('finds model by alias', () => {
     const m = lookupModel('opus');
     expect(m).toBeDefined();
-    expect(m!.id).toBe('claude-opus-5');
+    expect(m!.id).toBe('claude-opus-5-5');
   });
 
   it('returns undefined for unknown model', () => {
@@ -45,13 +45,18 @@ describe('lookupModel', () => {
   it('finds all known models', () => {
     const ids = [
       'claude-fable-5',
+      'claude-opus-5-5',
       'claude-opus-5',
       'claude-opus-4-8',
       'claude-opus-4-7',
       'claude-opus-4-6',
+      'claude-sonnet-5-5',
       'claude-sonnet-5',
       'claude-sonnet-4-6',
       'claude-haiku-4-5',
+      'gpt-6-astra',
+      'gpt-6-sol',
+      'gpt-6-luna',
       'gpt-5.6-sol',
       'gpt-5.6-terra',
       'gpt-5.6-luna',
@@ -80,8 +85,8 @@ describe('lookupModel', () => {
 
 describe('resolveAlias', () => {
   it('resolves known aliases', () => {
-    expect(resolveAlias('opus')).toBe('claude-opus-5');
-    expect(resolveAlias('sonnet')).toBe('claude-sonnet-5');
+    expect(resolveAlias('opus')).toBe('claude-opus-5-5');
+    expect(resolveAlias('sonnet')).toBe('claude-sonnet-5-5');
     expect(resolveAlias('haiku')).toBe('claude-haiku-4-5');
     expect(resolveAlias('gemini-pro')).toBe('gemini-3.1-pro-preview');
     expect(resolveAlias('gemini-flash')).toBe('gemini-3-flash-preview');
@@ -110,7 +115,7 @@ describe('resolveEngineAndModel', () => {
   });
 
   it('resolves aliases to canonical id', () => {
-    expect(resolveEngineAndModel('opus')).toEqual({ engine: 'claude', model: 'claude-opus-5' });
+    expect(resolveEngineAndModel('opus')).toEqual({ engine: 'claude', model: 'claude-opus-5-5' });
     expect(resolveEngineAndModel('gemini-flash')).toEqual({ engine: 'gemini', model: 'gemini-3-flash-preview' });
     expect(resolveEngineAndModel('agy-pro')).toEqual({ engine: 'agy', model: 'gemini-3.1-pro' });
   });
@@ -199,7 +204,7 @@ describe('getContextWindow', () => {
   // after Anthropic moved the Opus line and Sonnet 4.6 to a 1M-token context,
   // which under-reported the context-used percentage by 5x.
   it('uses the documented 1M window across the Opus line and Sonnet 4.6', () => {
-    for (const id of ['claude-opus-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-sonnet-4-6']) {
+    for (const id of ['claude-opus-5-5', 'claude-opus-5', 'claude-opus-4-8', 'claude-opus-4-7', 'claude-sonnet-4-6']) {
       expect(getContextWindow(id), id).toBe(1_000_000);
     }
     // Haiku 4.5 genuinely is 200K — guards against a blanket find-and-replace.
@@ -222,6 +227,24 @@ describe('getContextWindow', () => {
 
   it('returns 200k default for unknown models', () => {
     expect(getContextWindow('unknown-model')).toBe(200_000);
+  });
+});
+
+describe("Claude Code's [1m] model suffix", () => {
+  // Claude Code reports a 1M-context selection as `claude-opus-5[1m]` in its init
+  // event; the model is the same, only the window differs.
+  it('prices the suffixed id as the model itself, without the unknown-model fallback', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    expect(getModelPricing('claude-opus-5[1m]')).toEqual(getModelPricing('claude-opus-5'));
+    expect(getModelPricing('opus[1m]')).toEqual(getModelPricing('opus'));
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it('reads the suffix as a 1M window, and leaves an unsuffixed id alone', () => {
+    expect(getContextWindow('claude-sonnet-4-5')).toBe(200_000);
+    expect(getContextWindow('claude-sonnet-4-5[1m]')).toBe(1_000_000);
+    expect(getContextWindow('claude-opus-5[1m]')).toBe(1_000_000);
   });
 });
 
@@ -275,19 +298,38 @@ describe('claude-sonnet-5', () => {
     expect(m!.pricing.output).not.toBe(15);
   });
 
+  it('stays selectable by id after the `sonnet` alias moved on', () => {
+    expect(resolveAlias('claude-sonnet-5')).toBe('claude-sonnet-5');
+    expect(resolveAlias('sonnet')).not.toBe('claude-sonnet-5');
+  });
+});
+
+// Claude Code 2.1.284 made Sonnet 5.5 the model `--model sonnet` resolves to.
+describe('claude-sonnet-5-5', () => {
   it('owns the `sonnet` alias so it tracks the CLI default', () => {
-    expect(resolveAlias('sonnet')).toBe('claude-sonnet-5');
+    expect(resolveAlias('sonnet')).toBe('claude-sonnet-5-5');
     expect(getContextWindow('sonnet')).toBe(1_000_000);
+  });
+
+  it('is priced from the published table, the same as Sonnet 5', () => {
+    expect(lookupModel('claude-sonnet-5-5')!.pricing).toEqual({ input: 2, output: 10, cached: 0.2 });
+    expect(lookupModel('claude-sonnet-5-5')!.pricing).toEqual(lookupModel('claude-sonnet-5')!.pricing);
   });
 });
 
 describe('registry entries added by the weekly sweep', () => {
+  // Stated as an equality with Sol rather than as literal rates. The invariant
+  // is "bare gpt-5.6 is Sol", which survives a repricing; the literals did not,
+  // and this test kept asserting the launch numbers after OpenAI cut them.
   it("registers bare gpt-5.6 at Sol's numbers, not the Sonnet fallback", () => {
     const m = lookupModel('gpt-5.6');
+    const sol = lookupModel('gpt-5.6-sol');
     expect(m).toBeDefined();
+    expect(sol).toBeDefined();
+    expect(m!.contextWindow).toBe(sol!.contextWindow);
+    expect(m!.pricing).toEqual(sol!.pricing);
+    // Not the 200K/Sonnet fallback the registry uses for unknown ids.
     expect(m!.contextWindow).toBe(1_050_000);
-    expect(m!.pricing.input).toBe(5);
-    expect(m!.pricing.output).toBe(30);
   });
 
   it('leaves gpt-5.6-pro unregistered — it is in the codex binary but has no model docs', () => {
@@ -320,9 +362,35 @@ describe('claude-fable-5', () => {
     expect(m!.pricing.cached).toBe(1);
   });
 
-  it('resolves the `fable` alias to the claude engine', () => {
-    expect(resolveAlias('fable')).toBe('claude-fable-5');
-    expect(resolveEngineAndModel('fable')).toEqual({ engine: 'claude', model: 'claude-fable-5' });
+  it('no longer owns the `fable` alias, which tracks the CLI default', () => {
+    // The CLI's own `fable` resolves to 5.1 as of 2.1.258, read back from a real
+    // turn's `modelUsage.canonicalModel`. An alias left pointing at the previous
+    // generation is the drift that has bitten this registry repeatedly — it
+    // costs alias sessions at the wrong model's rates without failing.
+    expect(resolveAlias('fable')).toBe('claude-fable-5-1');
+    expect(resolveEngineAndModel('fable')).toEqual({ engine: 'claude', model: 'claude-fable-5-1' });
+    expect(lookupModel('claude-fable-5')!.aliases ?? []).not.toContain('fable');
+  });
+
+  it('prices 5.1 cache reads at the 0.025x exception, not the usual 0.1x', () => {
+    // Every other Claude model reads cache at 0.1x base input. Fable 5.1 and
+    // Mythos 5.1 are 0.025x — $0.25 against a $10 input price. Deriving the
+    // number from the input rate, or copying it from Fable 5, over-reports
+    // these two 4x.
+    for (const id of ['claude-fable-5-1', 'claude-mythos-5-1']) {
+      const m = lookupModel(id);
+      expect(m, `${id} is unregistered`).toBeDefined();
+      expect(m!.contextWindow).toBe(1_000_000);
+      expect(m!.pricing.input).toBe(10);
+      expect(m!.pricing.output).toBe(50);
+      expect(m!.pricing.cached).toBe(0.25);
+    }
+    // Reverse assertion: the 5 generation keeps $1, so a blanket edit fails here.
+    expect(lookupModel('claude-fable-5')!.pricing.cached).toBe(1);
+    expect(lookupModel('claude-mythos-5')!.pricing.cached).toBe(1);
+    // And the rule the exception is an exception to still holds elsewhere.
+    expect(lookupModel('claude-opus-5')!.pricing.cached).toBe(0.5);
+    expect(lookupModel('claude-sonnet-5')!.pricing.cached).toBe(0.2);
   });
 
   it('fable/mythos strings are detected as Anthropic in the heuristics', () => {
@@ -362,8 +430,8 @@ describe('isGeminiModel / isClaudeModel', () => {
 describe('getAliases', () => {
   it('returns all aliases as Record', () => {
     const aliases = getAliases();
-    expect(aliases.opus).toBe('claude-opus-5');
-    expect(aliases.sonnet).toBe('claude-sonnet-5');
+    expect(aliases.opus).toBe('claude-opus-5-5');
+    expect(aliases.sonnet).toBe('claude-sonnet-5-5');
     expect(aliases['gemini-pro']).toBe('gemini-3.1-pro-preview');
   });
 });
@@ -377,7 +445,7 @@ describe('lookupModelStrict', () => {
 
   it('returns model for alias', () => {
     const m = lookupModelStrict('opus');
-    expect(m.id).toBe('claude-opus-5');
+    expect(m.id).toBe('claude-opus-5-5');
   });
 
   it('throws for unknown model', () => {
@@ -418,5 +486,120 @@ describe('getModelPricing fallback warning', () => {
     getModelPricing('claude-opus-4-6');
     expect(warnSpy).not.toHaveBeenCalled();
     warnSpy.mockRestore();
+  });
+});
+
+// Every one of these was found unregistered or mispriced by a sweep, and none
+// of them failed loudly first: an unregistered id falls through to the family
+// default, so it quietly gets Sonnet's rates and a 200K window.
+describe('registry covers what the engines actually offer', () => {
+  it('registers every Flash tier agy lists, not just the default one', () => {
+    for (const id of ['gemini-3.8-flash', 'gemini-3.7-flash', 'gemini-3.6-flash', 'gemini-3.5-flash']) {
+      const m = lookupModel(id);
+      expect(m, `${id} is unregistered`).toBeDefined();
+      expect(m!.engine).toBe('agy');
+      expect(m!.contextWindow).toBe(1_000_000);
+      expect(getContextWindow(id)).toBe(1_000_000);
+    }
+  });
+
+  it('prices the Flash tiers at their own list rates', () => {
+    // Reverse assertion: 3.5 Flash is NOT $0.5/$3 — that figure was carried
+    // over from an earlier generation and under-reported every turn 3x.
+    expect(getModelPricing('gemini-3.5-flash')).toMatchObject({ input: 1.5, output: 9 });
+    expect(getModelPricing('gemini-3.8-flash')).toMatchObject({ input: 0.75, output: 3.75 });
+    expect(getModelPricing('gemini-3.7-flash')).toMatchObject({ input: 0.75, output: 3.75 });
+    expect(getModelPricing('gemini-3.6-flash')).toMatchObject({ input: 0.75, output: 3.75 });
+  });
+
+  it('registers gpt-5.2 with its own window rather than the family default', () => {
+    expect(getContextWindow('gpt-5.2')).toBe(400_000);
+    expect(getModelPricing('gpt-5.2')).toMatchObject({ input: 1.75, output: 14, cached: 0.175 });
+    expect(resolveEngineAndModel('gpt-5.2')).toEqual({ engine: 'codex', model: 'gpt-5.2' });
+  });
+
+  it('does not silently price an unregistered id as a Flash tier', () => {
+    // Guard against a blanket find-and-replace: 200K is the fallback window, so
+    // a registered model must never be reachable only through it.
+    expect(getContextWindow('gemini-9.9-flash')).toBe(200_000);
+  });
+
+  // agy 1.1.25 stopped serving gemini-3.5-flash (a session asking for it gets
+  // `status: ERROR`), so an alias still pointing there would fail every session
+  // that uses it. The id itself stays registered: it is a real API model.
+  it('points agy-flash at the newest Flash tier agy actually serves', () => {
+    expect(resolveAlias('agy-flash')).toBe('gemini-3.8-flash');
+    expect(lookupModel('gemini-3.5-flash')).toBeDefined();
+    expect(lookupModel('gemini-3.5-flash')!.aliases ?? []).not.toContain('agy-flash');
+  });
+
+  // The registry drifting behind OpenAI's published rates is the recurring bug
+  // this file exists to catch: all three GPT-5.6 tiers were repriced after
+  // launch and this file kept the launch numbers, over-reporting Luna by 5x.
+  it('prices the GPT-5.6 tiers at the current published rates, not the launch ones', () => {
+    expect(getModelPricing('gpt-5.6-sol')).toMatchObject({ input: 4, output: 20, cached: 0.4 });
+    expect(getModelPricing('gpt-5.6')).toMatchObject({ input: 4, output: 20, cached: 0.4 });
+    expect(getModelPricing('gpt-5.6-terra')).toMatchObject({ input: 2, output: 12, cached: 0.2 });
+    expect(getModelPricing('gpt-5.6-luna')).toMatchObject({ input: 0.2, output: 1.2, cached: 0.02 });
+  });
+
+  it('registers gpt-6-astra so it is not priced as a fallback tier', () => {
+    expect(getContextWindow('gpt-6-astra')).toBe(1_050_000);
+    expect(getModelPricing('gpt-6-astra')).toMatchObject({ input: 10, output: 50, cached: 1 });
+    expect(resolveEngineAndModel('gpt-6-astra')).toEqual({ engine: 'codex', model: 'gpt-6-astra' });
+  });
+
+  it('registers gpt-4.1 at its published rates and window', () => {
+    expect(getModelPricing('gpt-4.1')).toMatchObject({ input: 2, output: 8, cached: 0.5 });
+    expect(getContextWindow('gpt-4.1')).toBe(1_047_576);
+  });
+});
+
+// Registered 2026-09-23: Claude Code 2.1.280 made Opus 5.5 the model `--model
+// opus` resolves to, and Codex 0.156.1 added GPT-6 Sol and Luna. Every number
+// here comes from the vendors' own price tables, and each has a reverse
+// assertion so a blanket edit across the family fails the suite.
+describe('models registered on 2026-09-23', () => {
+  it('prices Opus 5.5 below Opus 5, with its half-rate cache read', () => {
+    expect(lookupModel('claude-opus-5-5')!.pricing).toEqual({ input: 4, output: 20, cached: 0.2 });
+    expect(getContextWindow('claude-opus-5-5')).toBe(1_000_000);
+    // A cache read on 5.5 is 5% of input; the rest of the line pays the usual 10%.
+    const newer = lookupModel('claude-opus-5-5')!.pricing;
+    expect(newer.cached).toBeCloseTo(newer.input * 0.05, 10);
+    // Reverse: Opus 5 is still selectable and keeps its own, higher rate.
+    const older = lookupModel('claude-opus-5')!.pricing;
+    expect(older).toEqual({ input: 5, output: 25, cached: 0.5 });
+    expect(older.cached).toBeCloseTo(older.input * 0.1, 10);
+  });
+
+  it('registers both new GPT-6 tiers at the published 1.05M window', () => {
+    expect(lookupModel('gpt-6-sol')!.pricing).toEqual({ input: 2, output: 10, cached: 0.2 });
+    expect(lookupModel('gpt-6-luna')!.pricing).toEqual({ input: 0.1, output: 0.5, cached: 0.01 });
+    for (const id of ['gpt-6-sol', 'gpt-6-luna', 'gpt-6-astra']) {
+      expect(getContextWindow(id), id).toBe(1_050_000);
+    }
+    // Reverse: Astra stays the expensive tier of the same generation, and the
+    // 5.6 models of the same names are different, cheaper-windowed entries.
+    expect(lookupModel('gpt-6-astra')!.pricing).toEqual({ input: 10, output: 50, cached: 1 });
+    expect(lookupModel('gpt-6-sol')!.pricing).not.toEqual(lookupModel('gpt-5.6-sol')!.pricing);
+  });
+});
+
+describe('Memento delegation routes', () => {
+  it.each(['grok-4.7', 'composer-2.5', 'composer-2.5-fast', 'gemini-3.8-flash-high'])(
+    'keeps the explicit Cursor route for %s',
+    (model) => {
+      expect(resolveEngineAndModel(model)).toEqual({ engine: 'cursor', model });
+    },
+  );
+  it.each(['nvidia', 'nvidia-b'])('preserves gateway identities in the %s pool', (provider) => {
+    for (const gateway of [
+      'nvidia/nvidia/nemotron-nano-9b-v2',
+      'openai/openai/gpt-6-astra',
+      'azure/anthropic/claude-opus-5-5',
+    ]) {
+      const model = `${provider}/${gateway}`;
+      expect(resolveEngineAndModel(model)).toEqual({ engine: 'opencode', model });
+    }
   });
 });

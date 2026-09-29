@@ -79,7 +79,12 @@ function defaultResponder(extra?: (msg: WrittenMsg) => Record<string, unknown> |
 
 async function startSession(proc: ReturnType<typeof createMockProc>) {
   mockSpawn.mockReturnValue(proc);
-  const session = new PersistentCodexAppServerSession({ name: 't', cwd: '/tmp', engine: 'codex-app' });
+  const session = new PersistentCodexAppServerSession({
+    permissionMode: 'bypassPermissions',
+    name: 't',
+    cwd: '/tmp',
+    engine: 'codex-app',
+  });
   await session.start();
   return session;
 }
@@ -278,6 +283,7 @@ describe('PersistentCodexAppServerSession v2 RPCs', () => {
     });
     mockSpawn.mockReturnValue(proc);
     const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
       name: 't',
       cwd: '/tmp',
       engine: 'codex-app',
@@ -300,6 +306,7 @@ describe('PersistentCodexAppServerSession v2 RPCs', () => {
     });
     mockSpawn.mockReturnValue(proc);
     const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
       name: 't',
       cwd: '/tmp',
       engine: 'codex-app',
@@ -356,5 +363,307 @@ describe('PersistentCodexAppServerSession v2 RPCs', () => {
     expect(stats.tokensIn).toBe(250_000);
     // 129,200 / 258,400 = 50%. The old formula gave (250,000 + 100) / 1,050,000 = 24%.
     expect(stats.contextPercent).toBe(50);
+  });
+});
+
+// Nothing passes `appendSystemPrompt` to `thread/start`, so it used to be
+// dropped — including the charter of a council seat on this engine. It now
+// leads the first turn of a fresh thread, and only that turn.
+describe('PersistentCodexAppServerSession — appendSystemPrompt', () => {
+  beforeEach(() => mockSpawn.mockReset());
+
+  const turnTexts = (proc: ReturnType<typeof createMockProc>): string[] =>
+    proc.written
+      .filter((m) => m.method === 'turn/start')
+      .map((m) => (m.params?.input as Array<{ text: string }>)[0].text);
+
+  it('leads the first turn of a fresh thread, and only that turn', async () => {
+    const proc = createMockProc(defaultResponder());
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      appendSystemPrompt: 'SEAT RULES',
+    });
+    await session.start();
+    await session.send('hi');
+    await session.send('again');
+    await new Promise((r) => setTimeout(r, 5));
+    expect(turnTexts(proc)).toEqual(['SEAT RULES\n\n---\n\nhi', 'again']);
+  });
+
+  it('is not repeated on a resumed thread, which already carries it', async () => {
+    const proc = createMockProc(
+      defaultResponder((m) => (m.method === 'thread/resume' ? { thread: { id: 't9' } } : undefined)),
+    );
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      appendSystemPrompt: 'SEAT RULES',
+      resumeSessionId: 't9',
+    });
+    await session.start();
+    await session.send('continue');
+    await new Promise((r) => setTimeout(r, 5));
+    expect(turnTexts(proc)).toEqual(['continue']);
+  });
+});
+
+function completeTurn(proc: ReturnType<typeof createMockProc>, turnId = 'tturn'): void {
+  proc.stdout.push(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'item/completed',
+      params: { threadId: 't1', turnId, item: { type: 'agentMessage', text: 'ok' } },
+    }) + '\n',
+  );
+  proc.stdout.push(
+    JSON.stringify({
+      jsonrpc: '2.0',
+      method: 'turn/completed',
+      params: { threadId: 't1', turn: { id: turnId, status: 'completed' } },
+    }) + '\n',
+  );
+}
+
+function turnStartCalls(proc: ReturnType<typeof createMockProc>): WrittenMsg[] {
+  return proc.written.filter((m) => m.method === 'turn/start');
+}
+
+describe('PersistentCodexAppServerSession — reasoning effort RPC', () => {
+  beforeEach(() => mockSpawn.mockReset());
+
+  it('puts session effort on thread/start config.model_reasoning_effort, not a top-level effort field', async () => {
+    const proc = createMockProc(defaultResponder());
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      effort: 'max',
+    });
+    await session.start();
+    const started = proc.written.find((m) => m.method === 'thread/start');
+    expect(started?.params).toMatchObject({
+      config: { model_reasoning_effort: 'max' },
+    });
+    expect(started?.params).not.toHaveProperty('effort');
+  });
+
+  it('omits thread/start config when session effort is auto', async () => {
+    const proc = createMockProc(defaultResponder());
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      effort: 'auto',
+    });
+    await session.start();
+    const started = proc.written.find((m) => m.method === 'thread/start');
+    expect(started?.params).not.toHaveProperty('config');
+  });
+
+  it('sends turn/start.effort for session none and minimal', async () => {
+    const proc = createMockProc(defaultResponder());
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      effort: 'none',
+    });
+    await session.start();
+    const started = proc.written.find((m) => m.method === 'thread/start');
+    expect(started?.params).toMatchObject({
+      config: { model_reasoning_effort: 'none' },
+    });
+    await session.send('hello');
+    await new Promise((r) => setTimeout(r, 5));
+    expect(turnStartCalls(proc)[0]?.params?.effort).toBe('none');
+
+    session.setEffort('minimal');
+    await session.send('again');
+    await new Promise((r) => setTimeout(r, 5));
+    expect(turnStartCalls(proc)[1]?.params?.effort).toBe('minimal');
+    const resumeStart = proc.written.find((m) => m.method === 'thread/start');
+    expect(resumeStart?.params?.config).toEqual({ model_reasoning_effort: 'none' });
+  });
+
+  it('sends turn/start.effort for session max and ultra without folding max to xhigh', async () => {
+    const proc = createMockProc(defaultResponder());
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      effort: 'max',
+    });
+    await session.start();
+    await session.send('hello');
+    await new Promise((r) => setTimeout(r, 5));
+    expect(turnStartCalls(proc)[0]?.params).toMatchObject({
+      threadId: 't1',
+      effort: 'max',
+    });
+    expect(Object.keys(turnStartCalls(proc)[0]?.params ?? {}).sort()).toEqual(['effort', 'input', 'threadId']);
+
+    session.setEffort('ultra');
+    await session.send('again');
+    await new Promise((r) => setTimeout(r, 5));
+    expect(turnStartCalls(proc)[1]?.params?.effort).toBe('ultra');
+  });
+
+  it('forwards every native ReasoningEffort string on turn/start and thread/start config', async () => {
+    const levels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const;
+    for (const effort of levels) {
+      const proc = createMockProc(defaultResponder());
+      mockSpawn.mockReturnValue(proc);
+      const session = new PersistentCodexAppServerSession({
+        permissionMode: 'bypassPermissions',
+        name: 't',
+        cwd: '/tmp',
+        engine: 'codex-app',
+        effort,
+      });
+      await session.start();
+      const started = proc.written.find((m) => m.method === 'thread/start');
+      expect(started?.params).toMatchObject({
+        config: { model_reasoning_effort: effort },
+      });
+      await session.send('hello');
+      await new Promise((r) => setTimeout(r, 5));
+      expect(turnStartCalls(proc)[0]?.params?.effort).toBe(effort);
+    }
+  });
+
+  it('applies a per-turn override on turn/start without sticking to the next turn', async () => {
+    const proc = createMockProc(defaultResponder());
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      effort: 'max',
+    });
+    await session.start();
+
+    const p1 = session.send('one', { waitForComplete: true });
+    setTimeout(() => completeTurn(proc, 'a'), 5);
+    await p1;
+
+    const p2 = session.send('two', { waitForComplete: true, effort: 'high' });
+    setTimeout(() => completeTurn(proc, 'b'), 5);
+    await p2;
+
+    const p3 = session.send('three', { waitForComplete: true });
+    setTimeout(() => completeTurn(proc, 'c'), 5);
+    await p3;
+
+    const efforts = turnStartCalls(proc).map((m) => m.params?.effort);
+    expect(efforts).toEqual(['max', 'high', 'max']);
+    expect(session.getEffort()).toBe('max');
+  });
+
+  it('restores the engine-reported default after a one-turn override in an auto session', async () => {
+    let effective = 'low';
+    const observed: string[] = [];
+    const proc = createMockProc((msg) => {
+      if (msg.method === 'thread/start') return { thread: { id: 't1' }, reasoningEffort: effective };
+      if (msg.method === 'turn/start') {
+        if (typeof msg.params?.effort === 'string') effective = msg.params.effort;
+        observed.push(effective);
+      }
+      return {};
+    });
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      effort: 'auto',
+    });
+    await session.start();
+
+    const p1 = session.send('one', { waitForComplete: true, effort: 'xhigh' });
+    setTimeout(() => completeTurn(proc, 'a'), 5);
+    await p1;
+
+    const p2 = session.send('two', { waitForComplete: true, effort: 'auto' });
+    setTimeout(() => completeTurn(proc, 'b'), 5);
+    await p2;
+
+    const p3 = session.send('three', { waitForComplete: true });
+    setTimeout(() => completeTurn(proc, 'c'), 5);
+    await p3;
+
+    const starts = turnStartCalls(proc);
+    expect(starts[0]?.params?.effort).toBe('xhigh');
+    expect(starts[1]?.params?.effort).toBe('low');
+    expect(starts[2]?.params?.effort).toBe('low');
+    expect(observed).toEqual(['xhigh', 'low', 'low']);
+    expect(
+      starts.some(
+        (m) => m.params && Object.prototype.hasOwnProperty.call(m.params, 'effort') && m.params.effort == null,
+      ),
+    ).toBe(false);
+    expect(session.getEffort()).toBe('auto');
+  });
+
+  it('sends per-turn effort on fire-and-forget turn/start', async () => {
+    const proc = createMockProc(defaultResponder());
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      effort: 'low',
+    });
+    await session.start();
+    await session.send('go', { effort: 'medium' });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(turnStartCalls(proc)[0]?.params?.effort).toBe('medium');
+    expect(session.getEffort()).toBe('low');
+  });
+
+  it('puts session effort on thread/resume config and the following turn/start', async () => {
+    const proc = createMockProc((msg) => {
+      if (msg.method === 'initialize') return {};
+      if (msg.method === 'thread/resume') return { thread: { id: 't-prev' } };
+      return {};
+    });
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      resumeSessionId: 't-prev',
+      effort: 'xhigh',
+    });
+    await session.start();
+    const resume = proc.written.find((m) => m.method === 'thread/resume');
+    expect(resume?.params).toMatchObject({
+      threadId: 't-prev',
+      config: { model_reasoning_effort: 'xhigh' },
+    });
+    expect(resume?.params).not.toHaveProperty('effort');
+
+    const p = session.send('continue', { waitForComplete: true });
+    setTimeout(() => completeTurn(proc, 'r1'), 5);
+    await p;
+    expect(turnStartCalls(proc)[0]?.params?.effort).toBe('xhigh');
   });
 });

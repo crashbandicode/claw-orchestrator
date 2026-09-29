@@ -14,6 +14,8 @@ import * as os from 'node:os';
 import * as crypto from 'node:crypto';
 import { SessionManager } from './session-manager.js';
 import { sanitizeCwd, validateRegex } from './validation.js';
+import { resolveSecretRefs } from './kernel/secrets.js';
+import { validateAutoloopTimeoutConfig } from './autoloop/types.js';
 import type { EffortLevel, EngineType } from './types.js';
 import { handleChatCompletion } from './openai-compat.js';
 import { getModelList } from './models.js';
@@ -36,12 +38,19 @@ function autoloopErrorStatus(error: unknown): number {
   if (/^Autoloop with id '.+' (?:already exists|is being deleted|is still starting)$/.test(message)) return 409;
   if (/^Autoloop session name '.+' is already in use$/.test(message)) return 409;
   if (/^(?:Planner|Coder|Reviewer) engine '.+' is not supported$/.test(message)) return 400;
+  if (/^(?:Planner|Coder|Reviewer) effort\b/.test(message)) return 400;
   // Any custom-engine config complaint is caller error, not a server fault.
   // The old form pinned a single dotted segment and the verb "must be", so
   // `config.args.permissionMode must be a string` and `config.env must contain
   // only string values` both fell through to 500 — the opposite of the split
   // this helper exists to provide.
   if (/^(?:Planner|Coder|Reviewer) custom engine config\b/.test(message)) return 400;
+  if (/^(?:sendTimeoutMs|activityLeaseMs|autoloopHardTimeoutMs|pendingDispatchId)\b/.test(message)) return 400;
+  if (/^(?:allow_decrease|activity_lease_ms|autoloop_hard_timeout_ms) is not supported\b/.test(message)) return 400;
+  if (/^pending dispatch\b/.test(message)) return 400;
+  if (/^Autoloop run '.+' (?:has no pending dispatch|is not awaiting a recoverable send timeout)/.test(message)) {
+    return 400;
+  }
   return 500;
 }
 
@@ -54,18 +63,112 @@ function autoloopErrorStatus(error: unknown): number {
  * dashboard session into remote code execution, so the network surface refuses
  * it outright. Built-in engines (the actual ask in #72) stay fully selectable.
  */
-const CUSTOM_ENGINE_BODY_KEYS = ['planner_custom_engine', 'coder_custom_engine', 'reviewer_custom_engine'] as const;
+//
+// Matched by SHAPE, not by an allowlist of known keys, and applied to every
+// request body in `route()` rather than to the handful of routes that were
+// remembered. The list form covered `planner_/coder_/reviewer_custom_engine`
+// and missed `customEngine` — the camelCase spelling `session_start` accepts —
+// so `/session/start` handed the object straight to `startSession()`, which
+// dispatches it to `PersistentCustomSession` and spawns `bin`. A per-route
+// guard is only ever as good as the memory of whoever adds the next route.
+const CUSTOM_ENGINE_KEY = /custom_?engines?$/i;
+const MAX_SCAN_DEPTH = 12;
 
-function rejectCustomEngineOverHttp(body: unknown): string | null {
-  if (typeof body !== 'object' || body === null) return null;
-  const record = body as Record<string, unknown>;
-  for (const key of CUSTOM_ENGINE_BODY_KEYS) {
-    if (record[key] !== undefined && record[key] !== null) {
-      return `${key} is not accepted over HTTP: a custom engine names an executable to spawn, so it may only be configured by a local caller (MCP tool / SessionManager API). Use a built-in engine here.`;
+/**
+ * Deep-scan a request body for any custom-engine payload, returning the
+ * offending key path. Bodies here are small JSON documents (`MAX_BODY_SIZE`
+ * bounds them) and the depth cap stops a pathological nesting from costing
+ * more than the parse already did.
+ */
+function findCustomEngineKey(value: unknown, depth = 0, trail = ''): string | null {
+  if (depth > MAX_SCAN_DEPTH || typeof value !== 'object' || value === null) return null;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const hit = findCustomEngineKey(value[i], depth + 1, `${trail}[${i}]`);
+      if (hit) return hit;
     }
+    return null;
+  }
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    const path = trail ? `${trail}.${key}` : key;
+    // A string here is a preset id: it selects one of the descriptions this
+    // package ships and cannot introduce a binary or argv of its own. That is
+    // the same class as naming a built-in engine, which this surface already
+    // allows — and `engine: 'codex'` spawns an executable too, so "spawns
+    // something" was never the line. Arbitrary argv is.
+    if (CUSTOM_ENGINE_KEY.test(key) && isInlineCustomEngine(child)) return path;
+    const hit = findCustomEngineKey(child, depth + 1, path);
+    if (hit) return hit;
   }
   return null;
 }
+
+/**
+ * An inline config — the form that carries a binary and argv of its own.
+ *
+ * Tested by the thing that makes it dangerous: a name that resolves to an
+ * executable. `CustomEngineConfig` requires `bin`, and `resolveBin()` reads only
+ * `binEnv` then `bin`, so an object carrying neither cannot spawn anything.
+ *
+ * "Any object at all" was too wide, and not in a harmless direction. A request
+ * body may legitimately contain *descriptions* of this shape rather than an
+ * instance of it — an OpenAI/Anthropic `tools` array carries JSON Schema, and
+ * this package's own `autoloop_start` schema declares
+ * `planner_custom_engine` / `coder_custom_engine` / `reviewer_custom_engine`.
+ * Those property definitions are objects, so the old test rejected the whole
+ * request: every tool-bearing turn through `/v1/chat/completions` failed with a
+ * 400 while a tool-free smoke test passed, which is why it went unnoticed.
+ */
+function isInlineCustomEngine(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const cfg = value as { bin?: unknown; binEnv?: unknown };
+  return typeof cfg.bin === 'string' || typeof cfg.binEnv === 'string';
+}
+
+function rejectCustomEngineOverHttp(body: unknown): string | null {
+  const key = findCustomEngineKey(body);
+  if (!key) return null;
+  return `${key} may not be given as an inline config over HTTP: it names an executable and its arguments, so it is accepted only from a local caller (MCP tool / SessionManager API). Pass the id of a bundled engine preset instead, or use a built-in engine.`;
+}
+
+/**
+ * Exposed so the tool registry can check its own schemas against this guard.
+ * The schemas are what a host sends back in a `tools` array, and several of
+ * them describe custom-engine properties — the guard must read those as
+ * descriptions, not as an attempt to name a binary.
+ */
+export const __rejectCustomEngineOverHttpForTest = rejectCustomEngineOverHttp;
+
+/**
+ * A guarded SSE writer.
+ *
+ * Every one of these endpoints writes from an EventEmitter callback, and an
+ * event can fire between the client closing the socket and the `close` handler
+ * detaching the listener. Writing then throws ERR_STREAM_WRITE_AFTER_END inside
+ * the emitter callback, where nothing catches it. The autoloop handler was
+ * hardened for exactly this and the other three were not, so the guard lives in
+ * one place now rather than in each closure that remembers to have it.
+ */
+function sseSender(res: http.ServerResponse): (event: string, data: unknown) => void {
+  let closed = false;
+  res.on('close', () => {
+    closed = true;
+  });
+  return (event: string, data: unknown): void => {
+    if (closed || res.writableEnded || !res.writable) return;
+    try {
+      res.write(`event: ${event}\n`);
+      res.write(`data: ${JSON.stringify(data)}\n\n`);
+    } catch {
+      // Connection broke mid-write; stop sending. The route's own `close`
+      // handler detaches listeners and ends the response.
+      closed = true;
+    }
+  };
+}
+
+/** Test seam: the guard is invisible from outside, and an unguarded write throws where nothing catches it. */
+export const __sseSenderForTest = sseSender;
 
 export class EmbeddedServer {
   private server: http.Server | null = null;
@@ -271,7 +374,10 @@ export class EmbeddedServer {
       res.setHeader('Access-Control-Allow-Origin', origin || '*');
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    // X-Session-Id and X-Session-Reset are how an OpenAI-compat client keys and resets its
+    // conversation. A browser only sends a custom header if the preflight allows it, so leaving
+    // them out made every cross-origin client that used them fail before the request was sent.
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Session-Id, X-Session-Reset');
     if (req.method === 'OPTIONS') {
       res.writeHead(200);
       res.end();
@@ -285,9 +391,9 @@ export class EmbeddedServer {
     // We re-read ~/.openclaw/server-token PER REQUEST (64-byte read, kernel
     // page cache, microseconds). Necessary because another clawo instance
     // (nohup test, second launchd, npm test process) can overwrite the file
-    // mid-life; sasha-doctor's reverse proxy reads disk fresh on every
-    // request, so without us doing the same we sit with a stale in-memory
-    // token and 401 everything the proxy injects.
+    // mid-life; a reverse proxy that reads the file fresh on every request
+    // would then inject a token we no longer hold, and we would 401 everything
+    // it forwards.
     if (this.authToken && path !== '/health') {
       const envExplicit =
         typeof process.env.OPENCLAW_SERVER_TOKEN === 'string' &&
@@ -338,6 +444,14 @@ export class EmbeddedServer {
     if (req.method === 'POST') {
       const contentType = req.headers['content-type'] || '';
       if (!contentType.includes('application/json')) {
+        // Drain before answering. Ending a response while the peer is still
+        // writing lets the connection be torn down under it, which surfaces on
+        // the client as `write ECONNRESET` — and in a test run as a non-zero exit
+        // code while every test still reports passing, so it reads as a mystery
+        // flake. Reported against a real run; not covered by a test here, because
+        // neither a 4 MB body nor a staged write reproduces the reset on macOS,
+        // and a test that passes with this line deleted would be worse than none.
+        req.resume();
         res.writeHead(415, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
         return;
@@ -383,6 +497,13 @@ export class EmbeddedServer {
         res.writeHead(status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(data));
       };
+
+      // Every body, before any route sees it. See rejectCustomEngineOverHttp.
+      const customEngineRejection = rejectCustomEngineOverHttp(body);
+      if (customEngineRejection) {
+        json(400, { ok: false, error: customEngineRejection });
+        return;
+      }
 
       // ─── Session Routes ──────────────────────────────────────────
 
@@ -455,6 +576,7 @@ export class EmbeddedServer {
           session: pick('session'),
           engine: pick('engine'),
           parent: pick('parent'),
+          verified: pick('verified') === undefined ? undefined : pick('verified') === 'true',
           limit: limitRaw ? Number(limitRaw) : undefined,
         });
         json(200, { ok: true, rows, summary });
@@ -689,7 +811,7 @@ export class EmbeddedServer {
           json(400, { ok: false, error: 'projectDir failed sanitization' });
           return;
         }
-        const session = this.manager.councilStart(task, {
+        const session = await this.manager.councilStart(task, {
           projectDir: safeProjectDir,
           agents: [
             {
@@ -734,6 +856,103 @@ export class EmbeddedServer {
         return;
       }
 
+      // ─── Workflow kernel — list / new / state / control / evidence / SSE ─
+      //
+      // Same conventions as /runs and /autoloop/*: any method reaches the route,
+      // POST bodies win over query params, and the whole block sits behind the
+      // shared auth + rate limit.
+
+      if (path === '/workflow/list') {
+        json(200, {
+          ok: true,
+          runs: this.manager.workflowList({
+            workflow: (body.workflow as string) ?? query.get('workflow') ?? undefined,
+            state: ((body.state as string) ?? query.get('state') ?? undefined) as never,
+            limit: Number((body.limit as string) ?? query.get('limit') ?? 25) || 25,
+          }),
+        });
+        return;
+      }
+
+      if (path === '/workflow/new') {
+        const spec = body.spec as never;
+        if (!spec) {
+          json(400, { ok: false, error: 'workflow/new requires `spec`' });
+          return;
+        }
+        const record = await this.manager.workflowStart(spec, {
+          cwd: body.cwd as string | undefined,
+          runId: body.runId as string | undefined,
+          contract: body.contract,
+        });
+        json(200, { ok: true, runId: record.runId, state: record.state });
+        return;
+      }
+
+      const wfMatch = path.match(/^\/workflow\/([^/]+)\/(state|cancel|resume|steer|approve|evidence|events)$/);
+      if (wfMatch) {
+        const [, runId, verb] = wfMatch;
+        if (verb === 'events') {
+          res.writeHead(200, {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            Connection: 'keep-alive',
+          });
+          const send = sseSender(res);
+          const snapshot = this.manager.workflowList({ limit: 1000 }).find((r) => r.runId === runId);
+          if (snapshot) send('snapshot', snapshot);
+          const unsubscribe = this.manager.onWorkflowEvent((e) => {
+            if (e.runId === runId) send('workflow-event', e.event);
+          });
+          res.on('close', () => {
+            unsubscribe();
+            try {
+              res.end();
+            } catch {
+              /* ignore */
+            }
+          });
+          return;
+        }
+
+        try {
+          switch (verb) {
+            case 'state':
+              json(200, { ok: true, run: this.manager.workflowStatus(runId) });
+              return;
+            case 'cancel':
+              json(200, { ok: true, ...this.manager.workflowCancel(runId) });
+              return;
+            case 'resume': {
+              const record = await this.manager.workflowResume(runId);
+              json(200, { ok: true, runId: record.runId, state: record.state });
+              return;
+            }
+            case 'steer':
+              json(200, { ok: true, ...this.manager.workflowSteer(runId, String(body.text ?? '')) });
+              return;
+            case 'approve':
+              json(200, { ok: true, ...(await this.manager.workflowApprove(runId, body.approved !== false)) });
+              return;
+            case 'evidence': {
+              const bundle = this.manager.workflowEvidence(
+                runId,
+                (body.evidenceId as string) ?? query.get('evidenceId') ?? undefined,
+              );
+              if (!bundle) {
+                json(404, { ok: false, error: 'no evidence recorded for this run' });
+                return;
+              }
+              json(200, { ok: true, evidence: bundle });
+              return;
+            }
+          }
+        } catch (err) {
+          json(404, { ok: false, error: (err as Error).message });
+          return;
+        }
+      }
+
       const councilEventsMatch = path.match(/^\/council\/([^/]+)\/events$/);
       if (councilEventsMatch) {
         const id = councilEventsMatch[1];
@@ -747,10 +966,7 @@ export class EmbeddedServer {
           'Cache-Control': 'no-cache',
           Connection: 'keep-alive',
         });
-        const send = (event: string, data: unknown): void => {
-          res.write(`event: ${event}\n`);
-          res.write(`data: ${JSON.stringify(data)}\n\n`);
-        };
+        const send = sseSender(res);
         // Replay current session so the dashboard renders immediately.
         const snap = council.getSession();
         if (snap) send('snapshot', snap);
@@ -785,21 +1001,21 @@ export class EmbeddedServer {
       // `auto-{timestamp}-{4-byte-hex}`. Power users wanting a meaningful id
       // (e.g. "ml-refactor-v2") can pass run_id explicitly.
       if (path === '/autoloop/new') {
-        const customEngineRejection = rejectCustomEngineOverHttp(body);
-        if (customEngineRejection) {
-          json(400, { ok: false, error: customEngineRejection });
-          return;
-        }
         const input = body as {
           workspace?: string;
           run_id?: string;
           planner_engine?: EngineType;
           planner_model?: string;
+          planner_effort?: EffortLevel;
           coder_engine?: EngineType;
           coder_model?: string;
+          coder_effort?: EffortLevel;
           reviewer_engine?: EngineType;
           reviewer_model?: string;
-          send_timeout_ms?: number;
+          reviewer_effort?: EffortLevel;
+          send_timeout_ms?: unknown;
+          activity_lease_ms?: unknown;
+          autoloop_hard_timeout_ms?: unknown;
         };
         const workspace = input.workspace;
         if (typeof workspace !== 'string' || !workspace.trim()) {
@@ -817,16 +1033,25 @@ export class EmbeddedServer {
             ? explicitId
             : `auto-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
         try {
+          const timeoutConfig = {
+            sendTimeoutMs: input.send_timeout_ms as number | undefined,
+            activityLeaseMs: input.activity_lease_ms as number | undefined,
+            autoloopHardTimeoutMs: input.autoloop_hard_timeout_ms as number | undefined,
+          };
+          validateAutoloopTimeoutConfig(timeoutConfig);
           const result = await this.manager.autoloopStart({
             runId,
             workspace: safeWorkspace,
             plannerEngine: input.planner_engine,
             plannerModel: input.planner_model,
+            plannerEffort: input.planner_effort,
             coderEngine: input.coder_engine,
             coderModel: input.coder_model,
+            coderEffort: input.coder_effort,
             reviewerEngine: input.reviewer_engine,
             reviewerModel: input.reviewer_model,
-            sendTimeoutMs: input.send_timeout_ms,
+            reviewerEffort: input.reviewer_effort,
+            ...timeoutConfig,
           });
           json(200, {
             ok: true,
@@ -841,11 +1066,13 @@ export class EmbeddedServer {
 
       const v2StateMatch = path.match(/^\/autoloop\/([^/]+)\/state$/);
       if (v2StateMatch) {
-        const state = this.manager.autoloopStatus(v2StateMatch[1]);
+        const id = v2StateMatch[1];
+        const state = this.manager.autoloopStatus(id);
+        const live = Boolean(this.manager.getAutoloop(id));
         if (!state) {
           json(404, { ok: false, error: 'run not found' });
         } else {
-          json(200, { ok: true, state });
+          json(200, { ok: true, state, live });
         }
         return;
       }
@@ -927,6 +1154,7 @@ export class EmbeddedServer {
             'Cache-Control': 'no-cache',
             Connection: 'keep-alive',
           });
+          res.write('retry: 864000000\n');
           res.write(`event: snapshot\ndata: ${JSON.stringify({ state: histState })}\n\n`);
           res.write(
             `event: terminated\ndata: ${JSON.stringify({ reason: histState.status_reason ?? 'historical' })}\n\n`,
@@ -939,28 +1167,26 @@ export class EmbeddedServer {
           'Cache-Control': 'no-cache',
           Connection: 'keep-alive',
         });
-        let sseClosed = false;
-        const send = (event: string, data: unknown): void => {
-          // A runner/dispatcher event can fire after the client disconnects or
-          // after cleanup() has ended the response. Writing then throws
-          // ERR_STREAM_WRITE_AFTER_END inside an emitter callback (unhandled).
-          if (sseClosed || res.writableEnded || !res.writable) return;
-          try {
-            res.write(`event: ${event}\n`);
-            res.write(`data: ${JSON.stringify(data)}\n\n`);
-          } catch {
-            // Connection broke mid-write; stop sending. res 'close' fires
-            // cleanup() to detach listeners and end the response.
-            sseClosed = true;
-          }
-        };
+        const send = sseSender(res);
         send('snapshot', { state: ctx.runner.state });
+
+        if (ctx.runner.state.status === 'terminated' || ctx.runner.state.status === 'crashed') {
+          res.write('retry: 864000000\n');
+          send('terminated', { reason: ctx.runner.state.status_reason ?? ctx.runner.state.status });
+          res.end();
+          return;
+        }
 
         const onMessage = (env: unknown): void => send('message', env);
         const onState = (s: unknown): void => send('state', s);
         const onPush = (e: unknown): void => send('push', e);
         const onIterDone = (e: unknown): void => send('iter_done', e);
         const onTerm = (r: unknown): void => {
+          try {
+            res.write('retry: 864000000\n');
+          } catch {
+            /* ignore */
+          }
           send('terminated', { reason: r });
           cleanup();
         };
@@ -971,7 +1197,9 @@ export class EmbeddedServer {
         const onReviewerReply = (text: unknown): void => send('reviewer_reply', { text });
         const onCompact = (e: unknown): void => send('compact', e);
         const cleanup = (): void => {
-          sseClosed = true;
+          // sseSender stops writing on its own `close` listener; this just
+          // detaches the emitters so a long-lived run stops feeding a dead
+          // response.
           ctx.runner.off('message', onMessage);
           ctx.runner.off('state', onState);
           ctx.runner.off('push', onPush);
@@ -1023,7 +1251,21 @@ export class EmbeddedServer {
         // Validate run exists synchronously so 404 surfaces cleanly. After
         // this point we hand the message off to the runner and return.
         if (!this.manager.getAutoloop(id)) {
-          json(404, { ok: false, error: `Autoloop run '${id}' not found` });
+          // Only a run the store still holds can be resumed; anything else —
+          // a mistyped id included — is simply not found. MCP and CLI callers
+          // use this endpoint too, so the hint names the API, not a button.
+          let persisted = false;
+          try {
+            persisted = Boolean(this.manager.autoloopStatus(id));
+          } catch {
+            // A malformed id is refused by the store; that is "not found" too.
+          }
+          json(404, {
+            ok: false,
+            error: persisted
+              ? `Autoloop run '${id}' is not running in this process; resume it with POST /autoloop/${id}/resume`
+              : `Autoloop run '${id}' not found`,
+          });
           return;
         }
         this.manager.autoloopChat(id, text).catch((err) => {
@@ -1036,13 +1278,13 @@ export class EmbeddedServer {
         return;
       }
 
-      // ─── Autoloop — delete a run from the registry ────────────
+      // ─── Autoloop — delete a run ──────────────────────────────
       //
       // POST /autoloop/<run_id>/delete
       //
-      // Stops the runner if still alive in this process, then scrubs the
-      // row from ~/.claw-orchestrator/autoloop-registry.jsonl. Ledger files
-      // under <workspace>/tasks/<run_id>/ are kept on disk for postmortem.
+      // Stops the loop if still alive in this process, then removes the run
+      // record. Ledger files under <workspace>/tasks/<run_id>/ are kept on disk
+      // for postmortem — deleting the run does not delete its artifacts.
       const v2DeleteMatch = path.match(/^\/autoloop\/([^/]+)\/delete$/);
       if (v2DeleteMatch) {
         const id = v2DeleteMatch[1];
@@ -1070,19 +1312,59 @@ export class EmbeddedServer {
       // runs that ended via terminate, NOT for autoloopDelete), Claude will
       // resume the original conversation. Otherwise a fresh Planner is
       // spawned and the dashboard replays chat.jsonl visually.
+      // ─── Autoloop — what a resume needs before it can run ─────
+      //
+      // GET /autoloop/<run_id>/resume-requirements
+      //
+      // Names the roles whose engine was `custom`, so a caller (the dashboard's
+      // Resume button, in practice) knows to supply a secret reference for each
+      // instead of sending an empty body and failing. Role names only — the
+      // engine kind is already in the run's spec, and no credential is involved.
+      const v2ResumeReqMatch = path.match(/^\/autoloop\/([^/]+)\/resume-requirements$/);
+      if (v2ResumeReqMatch) {
+        try {
+          json(200, { ok: true, ...this.manager.autoloopResumeRequirements(v2ResumeReqMatch[1]) });
+        } catch (err) {
+          json(autoloopErrorStatus(err), { ok: false, error: (err as Error).message });
+        }
+        return;
+      }
+
       const v2ResumeMatch = path.match(/^\/autoloop\/([^/]+)\/resume$/);
       if (v2ResumeMatch) {
         const id = v2ResumeMatch[1];
-        const resumeRejection = rejectCustomEngineOverHttp(body);
-        if (resumeRejection) {
-          json(400, { ok: false, error: resumeRejection });
-          return;
-        }
         try {
-          // No custom-engine configs here by design (see rejectCustomEngineOverHttp).
-          // A run whose roles used custom engines therefore cannot be resumed over
-          // HTTP; autoloopResume reports that as a caller error, not a 500.
-          const state = await this.manager.autoloopResume(id, {});
+          for (const unsupported of ['allow_decrease', 'activity_lease_ms', 'autoloop_hard_timeout_ms']) {
+            if (Object.prototype.hasOwnProperty.call(body, unsupported)) {
+              throw new Error(`${unsupported} is not supported by Autoloop resume`);
+            }
+          }
+          const sendTimeoutMs = body.send_timeout_ms as number | undefined;
+          validateAutoloopTimeoutConfig({ sendTimeoutMs });
+          const pendingDispatchId = body.pending_dispatch_id as string | undefined;
+          if (
+            pendingDispatchId !== undefined &&
+            (typeof pendingDispatchId !== 'string' || pendingDispatchId.length === 0)
+          ) {
+            throw new Error('pendingDispatchId must be a non-empty string');
+          }
+          if (pendingDispatchId !== undefined && sendTimeoutMs === undefined) {
+            throw new Error('pendingDispatchId requires a sendTimeoutMs increase');
+          }
+          // Custom-engine configs still never cross the wire. What crosses is a
+          // *name* the server resolves from its own environment
+          // (CLAWO_CUSTOM_ENGINE_<REF>), so a run whose roles used a custom
+          // engine can be resumed remotely after a crash — which it could not be
+          // before, because the material it needed had nowhere to come from.
+          const refs = resolveSecretRefs({
+            plannerCustomEngine: body.plannerCustomEngineRef as string | undefined,
+            coderCustomEngine: body.coderCustomEngineRef as string | undefined,
+            reviewerCustomEngine: body.reviewerCustomEngineRef as string | undefined,
+          });
+          const resumeOptions = refs as NonNullable<Parameters<SessionManager['autoloopResume']>[1]>;
+          if (sendTimeoutMs !== undefined) resumeOptions.sendTimeoutMs = sendTimeoutMs;
+          if (pendingDispatchId !== undefined) resumeOptions.pendingDispatchId = pendingDispatchId;
+          const state = await this.manager.autoloopResume(id, resumeOptions);
           json(200, { ok: true, state });
         } catch (err) {
           json(autoloopErrorStatus(err), { ok: false, error: (err as Error).message });
@@ -1106,15 +1388,12 @@ export class EmbeddedServer {
           'Cache-Control': 'no-cache',
           Connection: 'keep-alive',
         });
+        const sendUa = sseSender(res);
         let unsub: (() => void) | null = null;
         try {
-          unsub = ua.subscribe(runId, (ev: unknown) => {
-            res.write(`event: ultraapp\n`);
-            res.write(`data: ${JSON.stringify(ev)}\n\n`);
-          });
+          unsub = ua.subscribe(runId, (ev: unknown) => sendUa('ultraapp', ev));
         } catch (e) {
-          res.write(`event: error\n`);
-          res.write(`data: ${JSON.stringify({ message: (e as Error).message })}\n\n`);
+          sendUa('error', { message: (e as Error).message });
           res.end();
           return;
         }

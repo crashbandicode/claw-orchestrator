@@ -8,7 +8,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
 import * as http from 'node:http';
 import * as net from 'node:net';
-import { EmbeddedServer } from '../embedded-server.js';
+import { EmbeddedServer, __sseSenderForTest as sseSenderForTest } from '../embedded-server.js';
 import type { SessionManager } from '../session-manager.js';
 import { useIsolatedHome } from './helpers/isolate-home.js';
 
@@ -285,6 +285,180 @@ describe('EmbeddedServer', () => {
     });
   });
 
+  // ── The network surface must not be able to name a binary to spawn.
+  //
+  //    `rejectCustomEngineOverHttp` was wired into /autoloop/new and
+  //    /autoloop/<id>/resume and matched three snake_case keys. `/session/start`
+  //    had no guard at all and `session_start` spells the field `customEngine`,
+  //    so the object reached `startSession()` verbatim (measured: HTTP 200, the
+  //    full `{bin, args.extra}` handed over) and from there
+  //    `PersistentCustomSession` spawns `bin`. The guard is now shape-matched
+  //    and runs on every body in `route()`, so the next route added cannot
+  //    reintroduce it by being forgotten.
+  describe('custom engine over HTTP', () => {
+    it('refuses a customEngine body on /session/start without reaching startSession', async () => {
+      await server.start();
+
+      const res = await request(port, '/session/start', {
+        method: 'POST',
+        body: {
+          name: 'pwned',
+          cwd: '/tmp',
+          engine: 'custom',
+          customEngine: { name: 'x', bin: '/bin/sh', args: { extra: ['-c', 'touch /tmp/proof'] } },
+        },
+      });
+
+      expect(res.status).toBe(400);
+      expect(String((res.body as { error?: string }).error)).toContain('customEngine');
+      // The point of the assertion: refusing after the spawn would be no refusal.
+      expect(manager.startSession).not.toHaveBeenCalled();
+    });
+
+    // Yesterday this asserted the opposite, and the reversal is deliberate.
+    // The guard's own reason is that a custom engine "names an executable to
+    // spawn" — but `engine: 'codex'` spawns one too and is allowed here, so
+    // spawning was never the line. Arbitrary argv is, and a preset id cannot
+    // carry any: it selects one of the descriptions this package ships. Keeping
+    // it refused would also leave `-e custom` unreachable from the CLI, which
+    // is how the first outside contributor discovered the path was dead.
+    it('accepts a customEngine given as a preset id', async () => {
+      await server.start();
+
+      const res = await request(port, '/session/start', {
+        method: 'POST',
+        body: { name: 'preset-ok', cwd: '/tmp', engine: 'custom', customEngine: 'zcode' },
+      });
+
+      expect(res.status).not.toBe(400);
+      expect(manager.startSession).toHaveBeenCalled();
+    });
+
+    // A body may describe this shape instead of carrying one. An OpenAI-style
+    // `tools` array is JSON Schema, and this package's own `autoloop_start`
+    // schema declares `planner_custom_engine` — so matching "any object under a
+    // custom-engine key" rejected every tool-bearing turn through the
+    // OpenAI-compatible endpoint with a 400. A tool-free request passed, which
+    // is why a curl smoke test never showed it.
+    it('accepts a tool schema that merely declares custom-engine properties', async () => {
+      await server.start();
+
+      const res = await request(port, '/session/start', {
+        method: 'POST',
+        body: {
+          name: 'schema-ok',
+          cwd: '/tmp',
+          tools: [
+            {
+              type: 'function',
+              function: {
+                name: 'autoloop_start',
+                parameters: {
+                  type: 'object',
+                  properties: {
+                    planner_custom_engine: {
+                      type: 'object',
+                      description: 'Custom engine config.',
+                      properties: { bin: { type: 'string' }, name: { type: 'string' } },
+                    },
+                  },
+                },
+              },
+            },
+          ],
+        },
+      });
+
+      expect(res.status).not.toBe(400);
+      expect(manager.startSession).toHaveBeenCalled();
+    });
+
+    it('refuses a nested custom engine, wherever in the body it sits', async () => {
+      await server.start();
+
+      const res = await request(port, '/session/start', {
+        method: 'POST',
+        body: { name: 'n', agents: [{ name: 'a' }, { name: 'b', customEngine: { bin: '/bin/sh' } }] },
+      });
+
+      expect(res.status).toBe(400);
+      expect(String((res.body as { error?: string }).error)).toContain('agents[1].customEngine');
+      expect(manager.startSession).not.toHaveBeenCalled();
+    });
+
+    it('still refuses the snake_case autoloop spellings', async () => {
+      await server.start();
+
+      for (const key of ['planner_custom_engine', 'coder_custom_engine', 'reviewer_custom_engine']) {
+        const res = await request(port, '/autoloop/new', {
+          method: 'POST',
+          body: { goal: 'g', [key]: { bin: '/bin/sh' } },
+        });
+        expect(res.status).toBe(400);
+        expect(String((res.body as { error?: string }).error)).toContain(key);
+      }
+    });
+
+    it('leaves an ordinary body alone', async () => {
+      await server.start();
+
+      // Guarding every body means a false positive would break every route, so
+      // the negative case is the other half of the assertion.
+      const res = await request(port, '/session/start', {
+        method: 'POST',
+        body: { name: 'ok', cwd: '/tmp', engine: 'codex', model: 'gpt-5.1-codex' },
+      });
+
+      expect(res.status).toBe(200);
+      expect(manager.startSession).toHaveBeenCalled();
+    });
+  });
+
+  // ── An SSE event that fires after the client hangs up must not throw.
+  //
+  //    Every one of these endpoints writes from an EventEmitter callback, and an
+  //    event can land between the socket closing and the `close` handler
+  //    detaching the listener. `res.write` then throws
+  //    ERR_STREAM_WRITE_AFTER_END inside the emitter callback, where nothing
+  //    catches it. Only the autoloop handler was guarded.
+  describe('SSE after the client disconnects', () => {
+    it('swallows a write to a response that has already ended', async () => {
+      await server.start();
+
+      // Reach in for the guarded sender the routes use, and drive it against a
+      // response that is already finished — which is what the emitter callback
+      // does when it fires one tick too late.
+      const res = new http.ServerResponse({ method: 'GET', url: '/x' } as never);
+      const chunks: string[] = [];
+      res.write = ((c: string) => {
+        chunks.push(c);
+        return true;
+      }) as never;
+      const send = sseSenderForTest(res);
+      send('hello', { a: 1 });
+      expect(chunks.length).toBe(2);
+
+      // Now the socket goes away.
+      res.emit('close');
+      expect(() => send('after', { a: 2 })).not.toThrow();
+      expect(chunks.length).toBe(2);
+    });
+
+    it('stops after a write throws rather than throwing again on the next event', () => {
+      const res = new http.ServerResponse({ method: 'GET', url: '/x' } as never);
+      let calls = 0;
+      res.write = (() => {
+        calls++;
+        throw new Error('write after end');
+      }) as never;
+      const send = sseSenderForTest(res);
+
+      expect(() => send('one', {})).not.toThrow();
+      expect(() => send('two', {})).not.toThrow();
+      expect(calls).toBe(1);
+    });
+  });
+
   describe('rate limiting', () => {
     it('allows requests within rate limit', async () => {
       process.env.OPENCLAW_RATE_LIMIT = '5';
@@ -440,6 +614,17 @@ describe('EmbeddedServer', () => {
       expect(res.status).toBe(200);
       expect(res.headers['access-control-allow-methods']).toContain('POST');
     });
+
+    // A browser sends a custom header only if the preflight allows it. The
+    // OpenAI-compat client keys and resets its conversation with these two.
+    it('allows the session headers the OpenAI-compat endpoint reads', async () => {
+      await server.start();
+
+      const res = await request(port, '/v1/chat/completions', { method: 'OPTIONS' });
+      const allowed = String(res.headers['access-control-allow-headers']).toLowerCase();
+      expect(allowed).toContain('x-session-id');
+      expect(allowed).toContain('x-session-reset');
+    });
   });
 
   describe('error handling', () => {
@@ -463,5 +648,101 @@ describe('EmbeddedServer', () => {
       expect(res.status).toBe(400);
       expect((res.body as Record<string, string>).error).toContain('Invalid JSON');
     });
+  });
+});
+
+// A run can be known to the store without running in this process — after a
+// restart, or once it has ended. These routes have to say which, and a stream
+// for a run that has already ended has to end rather than wait forever.
+describe('EmbeddedServer — autoloop runs that are not running here', () => {
+  let server: EmbeddedServer;
+  let manager: SessionManager;
+  let port: number;
+
+  const persistedState = { run_id: 'r1', status: 'terminated', status_reason: 'goal met', iter: 3 };
+
+  beforeEach(async () => {
+    process.env.OPENCLAW_SERVER_TOKEN = 'disabled';
+    delete process.env.OPENCLAW_RATE_LIMIT;
+    delete process.env.OPENCLAW_CORS_ORIGINS;
+    manager = createMockManager();
+    port = await getFreePort();
+    server = new EmbeddedServer(manager, port);
+  });
+
+  afterAll(() => {
+    delete process.env.OPENCLAW_SERVER_TOKEN;
+  });
+
+  afterEach(async () => {
+    await server.stop();
+  });
+
+  /** Fail fast instead of waiting out the test timeout on a stream that never ends. */
+  function within<T>(p: Promise<T>, ms = 2_000): Promise<T> {
+    return Promise.race([
+      p,
+      new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`no response within ${ms}ms`)), ms)),
+    ]);
+  }
+
+  it('reports whether a run is live on /state', async () => {
+    const m = manager as unknown as Record<string, unknown>;
+    m.autoloopStatus = vi.fn().mockReturnValue(persistedState);
+    m.getAutoloop = vi.fn().mockReturnValue(undefined);
+    await server.start();
+
+    const persisted = await request(port, '/autoloop/r1/state');
+    expect(persisted.status).toBe(200);
+    expect(persisted.body).toMatchObject({ ok: true, live: false });
+
+    (m.getAutoloop as ReturnType<typeof vi.fn>).mockReturnValue({ runner: { state: persistedState } });
+    const live = await request(port, '/autoloop/r1/state');
+    expect(live.body).toMatchObject({ ok: true, live: true });
+  });
+
+  it('ends the event stream of a live run that has already terminated', async () => {
+    const m = manager as unknown as Record<string, unknown>;
+    m.getAutoloop = vi.fn().mockReturnValue({ runner: { state: persistedState, on: vi.fn(), off: vi.fn() } });
+    await server.start();
+
+    const res = await within(request(port, '/autoloop/r1/events'));
+    const text = String(res.body);
+    expect(text).toContain('event: snapshot');
+    expect(text).toContain('event: terminated');
+    expect(text).toContain('goal met');
+    // Tells EventSource not to reconnect to a stream that can only end again.
+    expect(text).toContain('retry: 864000000');
+  });
+
+  it('answers a chat to a stored but idle run with how to resume it', async () => {
+    const m = manager as unknown as Record<string, unknown>;
+    m.getAutoloop = vi.fn().mockReturnValue(undefined);
+    m.autoloopStatus = vi.fn().mockReturnValue(persistedState);
+    await server.start();
+
+    const res = await request(port, '/autoloop/r1/chat', { method: 'POST', body: { text: 'hi' } });
+    expect(res.status).toBe(404);
+    expect((res.body as { error: string }).error).toBe(
+      "Autoloop run 'r1' is not running in this process; resume it with POST /autoloop/r1/resume",
+    );
+  });
+
+  it('answers a chat to an unknown or malformed run id with a plain not found', async () => {
+    const m = manager as unknown as Record<string, unknown>;
+    m.getAutoloop = vi.fn().mockReturnValue(undefined);
+    m.autoloopStatus = vi.fn().mockReturnValue(undefined);
+    await server.start();
+
+    const unknown = await request(port, '/autoloop/nope/chat', { method: 'POST', body: { text: 'hi' } });
+    expect(unknown.status).toBe(404);
+    expect((unknown.body as { error: string }).error).toBe("Autoloop run 'nope' not found");
+
+    (m.autoloopStatus as ReturnType<typeof vi.fn>).mockImplementation(() => {
+      throw new Error('Invalid run id');
+    });
+    const malformed = await request(port, '/autoloop/bad..id/chat', { method: 'POST', body: { text: 'hi' } });
+    expect(malformed.status).toBe(404);
+    expect((malformed.body as { error: string }).error).toBe("Autoloop run 'bad..id' not found");
   });
 });

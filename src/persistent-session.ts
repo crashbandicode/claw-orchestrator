@@ -6,6 +6,7 @@
  */
 
 import { spawn, ChildProcess } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import * as readline from 'node:readline';
 import * as fs from 'node:fs';
@@ -49,6 +50,10 @@ interface InternalStats {
   tokensIn: number;
   tokensOut: number;
   cachedTokens: number;
+  /** Prompt tokens written into the cache; excluded from `tokensIn` by the API. */
+  cacheCreationTokens: number;
+  /** Of `cacheCreationTokens`, the part written with the 1-hour TTL. */
+  cacheCreation1hTokens: number;
   costUsd: number;
   startTime: string | null;
   lastActivity: string | null;
@@ -72,6 +77,36 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
   private _streamCallbacks: StreamCallbacks | null = null;
   private _contextHighFired = false;
   private _realModel: string | null = null;
+  /**
+   * Usage already applied for the assistant message being streamed. Its
+   * `message_delta` events carry that message's running total, so each one
+   * contributes only what it added since the last.
+   */
+  private _msgProvisional = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
+  /**
+   * Usage applied so far for the turn in flight, across every message in it.
+   * The turn's `result` reports the same tokens once more, so this is taken
+   * back out before the authoritative figure lands.
+   */
+  private _turnApplied = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
+  /**
+   * Last `total_cost_usd` seen from the current CLI process. That field is the
+   * session running total, not the turn's cost — three consecutive turns on one
+   * process read 0.02377 then 0.047559 — so spend advances by the difference.
+   */
+  private _lastReportedCost: number | null = null;
+  /** Spend accumulated from the engine's own per-process running totals. */
+  private _engineCostUsd = 0;
+  /** Set when the process was spawned with `--resume`: its first total is inherited, not ours. */
+  private _costBaselinePending = false;
+  /** Context window the engine reported for the model it actually used. */
+  private _engineContextWindow: number | null = null;
+  /** Model id the CLI reported in its init event — what answers when no `model` was set. */
+  private _engineModel: string | undefined;
+  /** Ids of messages this session wrote whose result has not arrived yet. */
+  private _unanswered = new Set<string>();
+  /** Full prompt size of the last turn: input + cached reads + cache writes. */
+  private _lastTurnPromptTokens = 0;
 
   public sessionId?: string;
   public stats: InternalStats;
@@ -93,6 +128,8 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       tokensIn: 0,
       tokensOut: 0,
       cachedTokens: 0,
+      cacheCreationTokens: 0,
+      cacheCreation1hTokens: 0,
       costUsd: 0,
       startTime: null,
       lastActivity: null,
@@ -121,8 +158,9 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
    * expressed as settings keys rather than flags.
    *
    * Two live here today:
-   *   - `ultracode` enables dynamic workflows. It is a settings key, NOT an
-   *     `--effort` value (the CLI rejects `--effort ultracode`).
+   *   - `ultracode` enables dynamic workflows. Passed as the settings key rather
+   *     than `--effort ultracode` (accepted since 2.1.203), so it composes with a
+   *     separately chosen `effort`.
    *   - `crossSessionInbound` sets this session's policy for peer messages from
    *     other Claude Code sessions on the machine.
    *
@@ -182,6 +220,10 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
 
     // Resume / fork
     const resumeId = this.options.claudeResumeId || this.options.resumeSessionId;
+    // A resumed process inherits the spend of the turns it is resuming, so the
+    // first `total_cost_usd` it reports is not this process's own. See
+    // `_applyReportedCost`.
+    this._costBaselinePending = !!resumeId;
     if (resumeId) {
       args.push('--resume', resumeId);
       if (this.options.forkSession) args.push('--fork-session');
@@ -230,8 +272,17 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       for (const dir of this.options.addDir) args.push('--add-dir', dir);
     }
 
-    // Effort
-    if (this.options.effort && this.options.effort !== 'auto') args.push('--effort', this.options.effort);
+    // Effort. Claude Code's ladder tops out at `max` (it names the set in its
+    // own warning), and an unknown value is only warned about before the turn
+    // runs at the default — so `ultra`, which only Codex has, clamps here
+    // rather than silently losing the caller's intent to the default.
+    if (this.options.effort && this.options.effort !== 'auto') {
+      args.push('--effort', this.options.effort === 'ultra' ? 'max' : this.options.effort);
+    }
+
+    // Restricted mode. Structural rather than cooperative: the command-running
+    // tools are removed from the session instead of being denied on request.
+    if (this.options.restricted) args.push('--restricted');
 
     // Auto mode
     if (this.options.enableAutoMode || this.options.permissionMode === 'auto') args.push('--enable-auto-mode');
@@ -269,7 +320,17 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     if (this.options.includeHookEvents) args.push('--include-hook-events');
     // CLI 2.1.211+: surface subagent output in the parent stream.
     if (this.options.forwardSubagentText) args.push('--forward-subagent-text');
-    if (this.options.permissionPromptTool) args.push('--permission-prompt-tool', this.options.permissionPromptTool);
+    if (this.options.permissionPromptTool) {
+      args.push('--permission-prompt-tool', this.options.permissionPromptTool);
+    } else {
+      // Nobody is attached to answer a prompt in this spawn shape: no TTY, and
+      // no prompt tool. Before CLI 2.1.259 a tool call the permission mode did
+      // not already decide would sit waiting for an answer that could never
+      // come — the session hung until its turn timeout. `none` makes that
+      // deterministic: the call is denied, the model sees the denial and can
+      // adapt, and the permission mode still decides everything else.
+      args.push('--permission-prompts', 'none');
+    }
 
     // Smart default: bare mode auto-enables exclude-dynamic-system-prompt-sections for better cache hits
     const shouldExcludeDynamic =
@@ -348,6 +409,8 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     }
 
     // Spawn
+    // A new process answers none of the old one's messages.
+    this._unanswered.clear();
     this.proc = spawn(resolvedBin, args, {
       cwd: this.options.cwd,
       env: spawnEnv,
@@ -470,6 +533,8 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
         if (event.subtype === 'init') {
           this.sessionId = event.session_id;
           this.stats.startTime = new Date().toISOString();
+          const initModel = (event as Record<string, unknown>).model;
+          if (typeof initModel === 'string' && initModel) this._engineModel = initModel;
           const pluginErrors = (event as Record<string, unknown>).plugin_errors;
           if (Array.isArray(pluginErrors) && pluginErrors.length > 0) {
             this.stats.pluginErrors = pluginErrors as Array<{ plugin: string; reason: string }>;
@@ -489,19 +554,17 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
         if (!inner) break;
         const innerType = inner.type as string;
 
-        if (innerType === 'content_block_start') {
-          const block = (inner as Record<string, unknown>).content_block as Record<string, unknown> | undefined;
-          if (block?.type === 'tool_use') {
-            this.stats.toolCalls++;
-            const toolEvent = { tool: { name: block.name, input: {} } };
-            try {
-              this._streamCallbacks?.onToolUse?.(toolEvent);
-            } catch (err) {
-              this.emit(SESSION_EVENT.LOG, `[stream callback error] onToolUse: ${(err as Error).message}`);
-            }
-            this.emit(SESSION_EVENT.TOOL_USE, toolEvent);
-          }
+        if (innerType === 'message_start') {
+          // A turn can contain several assistant messages (one per tool round),
+          // and each carries its own `message_delta` usage series starting from
+          // zero. Reset the per-message baseline so the next delta is measured
+          // against this message, not the previous one.
+          this._msgProvisional = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
         } else if (innerType === 'content_block_delta') {
+          // No tool_use handling on `content_block_start`: the same block arrives
+          // again, with the same id and its full input, as an `assistant` event
+          // (measured on 2.1.274). Reporting it from both counted every tool call
+          // twice and sent ACP clients two tool_call updates, the first with no input.
           const delta = (inner as Record<string, unknown>).delta as Record<string, unknown> | undefined;
           if (delta?.type === 'text_delta' && delta.text) {
             try {
@@ -513,12 +576,14 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
           }
         } else if (innerType === 'message_delta') {
           const usage = (inner as Record<string, unknown>).usage as Record<string, number> | undefined;
-          if (usage) {
-            this.stats.tokensIn += usage.input_tokens || 0;
-            this.stats.tokensOut += usage.output_tokens || 0;
-            this.stats.cachedTokens += usage.cache_read_input_tokens || 0;
-            this._updateCost();
-          }
+          // Provisional: `message_delta` carries the running usage of the
+          // assistant message being streamed, and the turn's `result` reports
+          // the very same tokens again. Counting both doubled every figure —
+          // measured against the CLI on a real turn, the engine reported
+          // in=2/out=4/cache_read=47371 and getStats() returned 4/8/94742.
+          // Apply it live so a long turn still moves, and remember how much so
+          // `result` can take it back before applying the authoritative number.
+          if (usage) this._applyTurnUsage(usage, false);
         }
         this.emit(SESSION_EVENT.STREAM_EVENT, event);
         break;
@@ -526,6 +591,16 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
 
       case 'user':
         this.stats.turns++;
+        // Tool results come back inside a user message, not as a top-level
+        // `tool_result` event, so a failed tool is only visible here.
+        if (Array.isArray(event.message?.content)) {
+          for (const block of event.message.content as Array<Record<string, unknown>>) {
+            if (block?.type === 'tool_result' && block.is_error === true) {
+              this.stats.toolErrors++;
+              this._fireHook('onToolError', { tool: block.tool_use_id, error: block.content });
+            }
+          }
+        }
         this.emit(SESSION_EVENT.USER_ECHO, event);
         break;
 
@@ -587,31 +662,39 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
 
       case 'result': {
         const usage = (event as Record<string, unknown>).usage as Record<string, number> | undefined;
-        if (usage) {
-          this.stats.tokensIn += usage.input_tokens || 0;
-          this.stats.tokensOut += usage.output_tokens || 0;
-          this.stats.cachedTokens += usage.cache_read_input_tokens || 0;
-          this._updateCost();
-        }
+        if (usage) this._applyTurnUsage(usage, true);
+        this._applyReportedCost((event as Record<string, unknown>).total_cost_usd);
+        this._captureContextWindow((event as Record<string, unknown>).modelUsage);
+        // A turn this session did not send ends with a result too: a background
+        // workflow reporting back, or a message from another session. It answers no
+        // send, so it must not resolve the one waiting — which would hand that caller
+        // the other turn's reply — nor count as that send's success. Its usage and
+        // cost above are real and stay counted.
+        const unsolicited = !this._answersOwnMessage(event);
         // The result event is the only place the outcome is known, and it arrives once
         // per send — unlike the `user` echo that drives `turns`, which the CLI also
         // emits per tool-result batch. `is_error` is read as truthy on purpose: for a
         // persistent `custom` engine this event comes from an arbitrary CLI.
-        if (!(event.is_error || event.stop_reason === 'error')) {
+        if (!unsolicited && !(event.is_error || event.stop_reason === 'error')) {
           this.stats.turnsSucceeded++;
         }
         this.emit(SESSION_EVENT.RESULT, event);
-        this.emit(SESSION_EVENT.TURN_COMPLETE, event);
+        if (unsolicited) this.emit(SESSION_EVENT.UNSOLICITED_RESULT, event);
+        else this.emit(SESSION_EVENT.TURN_COMPLETE, event);
         this._fireHook('onTurnComplete', {
           text: event.result,
           usage,
           stopReason: (event as Record<string, unknown>).stop_reason,
         });
 
-        const totalTokens = this.stats.tokensIn + this.stats.tokensOut;
-        if (totalTokens > CONTEXT_HIGH_THRESHOLD && !this._contextHighFired) {
+        // The prompt the last turn actually carried, not the session's summed
+        // `input_tokens` — the latter excludes cached reads, so on a resumed
+        // conversation it stays near zero and this hook never fires however
+        // full the context gets.
+        const contextTokens = this._lastTurnPromptTokens;
+        if (contextTokens > CONTEXT_HIGH_THRESHOLD && !this._contextHighFired) {
           this._contextHighFired = true;
-          this._fireHook('onContextHigh', { tokensUsed: totalTokens, threshold: CONTEXT_HIGH_THRESHOLD });
+          this._fireHook('onContextHigh', { tokensUsed: contextTokens, threshold: CONTEXT_HIGH_THRESHOLD });
         }
         const stopReason = (event as Record<string, unknown>).stop_reason;
         if (stopReason === 'error' || stopReason === 'rate_limit') {
@@ -635,9 +718,20 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
 
     const requestId = ++this.currentRequestId;
 
+    // A turn that died before its `result` leaves a partial baseline behind.
+    // Clearing both here means the next turn measures from zero rather than
+    // discounting itself by the abandoned turn's tokens.
+    this._msgProvisional = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
+    this._turnApplied = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
+
     let finalMessage = typeof message === 'string' ? message : message;
     if (typeof finalMessage === 'string') {
-      if (options.effort === 'high' || options.effort === 'xhigh' || options.effort === 'max') {
+      if (
+        options.effort === 'high' ||
+        options.effort === 'xhigh' ||
+        options.effort === 'max' ||
+        options.effort === 'ultra'
+      ) {
         finalMessage = `ultrathink\n\n${finalMessage}`;
       }
       if (options.plan) {
@@ -648,8 +742,13 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       }
     }
 
+    // The CLI echoes this id back on the result that answers the message
+    // (`user_message_uuids`), which is how a result is matched to its send.
+    const uuid = randomUUID();
+    this._unanswered.add(uuid);
     const payload = {
       type: 'user',
+      uuid,
       message: {
         role: 'user',
         content: typeof finalMessage === 'string' ? [{ type: 'text', text: finalMessage }] : finalMessage,
@@ -671,7 +770,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     if (options.waitForComplete) {
       this._isBusy = true;
       try {
-        return await this._waitForTurnComplete(options.timeout || TURN_TIMEOUT_MS);
+        return await this._waitForTurnComplete(options.timeout || TURN_TIMEOUT_MS, uuid);
       } finally {
         this._isBusy = false;
         if (options.callbacks) this._streamCallbacks = null;
@@ -683,7 +782,33 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
 
   // ─── Wait for Turn Complete ──────────────────────────────────────────────
 
-  private _waitForTurnComplete(timeout: number): Promise<TurnResult> {
+  /**
+   * Whether a result answers a message this session wrote.
+   *
+   * Measured on 2.1.274: a result carries the ids of the messages it answers in
+   * `user_message_uuids`, and a turn the CLI started on its own (a finished
+   * background workflow, `origin: {kind: 'task-notification'}`) carries none. The
+   * ids decide when present — including a message the CLI folds into a turn it
+   * started itself. Without them, which is what an older CLI or a custom engine
+   * emits, a non-human `origin` is the only sign of a turn nobody sent.
+   */
+  private _answersOwnMessage(event: StreamEvent): boolean {
+    const e = event as Record<string, unknown>;
+    const ids = Array.isArray(e.user_message_uuids)
+      ? e.user_message_uuids.filter((id): id is string => typeof id === 'string')
+      : typeof e.user_message_uuid === 'string'
+        ? [e.user_message_uuid]
+        : [];
+    if (ids.length > 0) {
+      let own = false;
+      for (const id of ids) own = this._unanswered.delete(id) || own;
+      return own;
+    }
+    const origin = e.origin as { kind?: unknown } | undefined;
+    return !origin || origin.kind === 'human';
+  }
+
+  private _waitForTurnComplete(timeout: number, uuid: string): Promise<TurnResult> {
     return new Promise((resolve, reject) => {
       let settled = false;
       let streamedText = '';
@@ -710,11 +835,25 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       };
       this.on(SESSION_EVENT.TOOL_USE, onToolUse);
 
+      // Text and tools streamed before a turn this send did not start are that
+      // turn's, not this reply's fallback.
+      const onUnsolicited = () => {
+        streamedText = '';
+        allAssistantText = '';
+        toolNames.length = 0;
+      };
+
+      // No longer waiting, so a result that arrives for it later is not this
+      // session's to hand to the next send.
+      const abandon = () => this._unanswered.delete(uuid);
+      this.on(SESSION_EVENT.UNSOLICITED_RESULT, onUnsolicited);
+
       const cleanup = () => {
         clearTimeout(timer);
         this.removeListener(SESSION_EVENT.TEXT, onText);
         this.removeListener(SESSION_EVENT.ASSISTANT, onAssistant);
         this.removeListener(SESSION_EVENT.TOOL_USE, onToolUse);
+        this.removeListener(SESSION_EVENT.UNSOLICITED_RESULT, onUnsolicited);
         this.removeListener(SESSION_EVENT.TURN_COMPLETE, onTurnComplete);
         this.removeListener(SESSION_EVENT.ERROR, onError);
         this.removeListener(SESSION_EVENT.CLOSE, onClose);
@@ -724,11 +863,24 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
         if (settled) return;
         settled = true;
         cleanup();
+        abandon();
         reject(new Error('Timeout waiting for response'));
       }, timeout);
 
       const onTurnComplete = (event: StreamEvent) => {
         if (settled) return;
+        // The answer to another message this session wrote — one sent without
+        // waiting, such as an inbox delivery — is not this send's reply.
+        const e = event as Record<string, unknown>;
+        const ids = Array.isArray(e.user_message_uuids)
+          ? e.user_message_uuids
+          : typeof e.user_message_uuid === 'string'
+            ? [e.user_message_uuid]
+            : [];
+        if (ids.length > 0 && !ids.includes(uuid)) {
+          onUnsolicited();
+          return;
+        }
         settled = true;
         cleanup();
         let text =
@@ -744,6 +896,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
         if (settled) return;
         settled = true;
         cleanup();
+        abandon();
         reject(err);
       };
 
@@ -751,6 +904,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
         if (settled) return;
         settled = true;
         cleanup();
+        abandon();
         const text = streamedText || allAssistantText.trim() || '';
         resolve({
           text,
@@ -763,7 +917,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
         });
       };
 
-      this.once(SESSION_EVENT.TURN_COMPLETE, onTurnComplete);
+      this.on(SESSION_EVENT.TURN_COMPLETE, onTurnComplete);
       this.once(SESSION_EVENT.ERROR, onError);
       this.once(SESSION_EVENT.CLOSE, onClose);
     });
@@ -785,17 +939,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       startTime: this.stats.startTime,
       lastActivity: this.stats.lastActivity,
       // Approximate context window utilization based on model's known window size.
-      // Claude Code doesn't expose exact context usage via the JSON protocol,
-      // so this is a best-effort heuristic. May overcount because cumulative
-      // token counts include the full conversation history replayed each turn.
-      contextPercent: Math.min(
-        100,
-        Math.round(
-          ((this.stats.tokensIn + this.stats.tokensOut) /
-            getContextWindow(this.options.resolvedModel || this.options.model || 'claude-sonnet-4-6')) *
-            100,
-        ),
-      ),
+      contextPercent: this._contextPercent(),
       retries: this.stats.retries,
       lastRetryError: this.stats.lastRetryError,
       sessionId: this.sessionId,
@@ -820,10 +964,11 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
   }
 
   getCost(): CostBreakdown {
-    const pricing = getModelPricing(this.options.model);
+    const model = this.options.model || this._engineModel;
+    const pricing = getModelPricing(model);
     const nonCachedIn = Math.max(0, this.stats.tokensIn - this.stats.cachedTokens);
     return {
-      model: this.options.model || 'default',
+      model: model || 'default',
       tokensIn: this.stats.tokensIn,
       tokensOut: this.stats.tokensOut,
       cachedTokens: this.stats.cachedTokens,
@@ -900,11 +1045,165 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
 
   // ─── Private ─────────────────────────────────────────────────────────────
 
+  /**
+   * Fold one turn's usage into the running totals.
+   *
+   * The CLI reports the same tokens twice per turn — once on the streaming
+   * `message_delta`, once on the terminal `result` — so the two callers are not
+   * additive. Provisional usage is applied as it streams and taken back out
+   * when the authoritative figure arrives.
+   *
+   * The Anthropic shape is exclusive: `input_tokens` counts neither the cached
+   * reads nor the cache writes, both of which are reported alongside it. On the
+   * turn measured while writing this, `input_tokens` was 2 against 47,371
+   * cached reads — which is why the prompt size is the sum, not `input_tokens`.
+   */
+  private _applyTurnUsage(usage: Record<string, unknown>, authoritative: boolean): void {
+    const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    const creation = (usage.cache_creation as Record<string, unknown> | undefined) ?? {};
+    const reported = {
+      in: num(usage.input_tokens),
+      out: num(usage.output_tokens),
+      cacheRead: num(usage.cache_read_input_tokens),
+      cacheCreate: num(usage.cache_creation_input_tokens),
+      cacheCreate1h: num(creation.ephemeral_1h_input_tokens),
+    };
+    // A streaming delta reports its message's running total, so it contributes
+    // the difference since the last one. The terminal `result` reports the
+    // whole turn, so it contributes whatever the turn has not already applied.
+    const baseline = authoritative ? this._turnApplied : this._msgProvisional;
+    const delta = {
+      in: reported.in - baseline.in,
+      out: reported.out - baseline.out,
+      cacheRead: reported.cacheRead - baseline.cacheRead,
+      cacheCreate: reported.cacheCreate - baseline.cacheCreate,
+      cacheCreate1h: reported.cacheCreate1h - baseline.cacheCreate1h,
+    };
+
+    // Floors, because these are a third party's numbers: a series that restarts
+    // where we did not expect it must not drive a running total negative.
+    this.stats.tokensIn = Math.max(0, this.stats.tokensIn + delta.in);
+    this.stats.tokensOut = Math.max(0, this.stats.tokensOut + delta.out);
+    this.stats.cachedTokens = Math.max(0, this.stats.cachedTokens + delta.cacheRead);
+    this.stats.cacheCreationTokens = Math.max(0, this.stats.cacheCreationTokens + delta.cacheCreate);
+    this.stats.cacheCreation1hTokens = Math.max(0, this.stats.cacheCreation1hTokens + delta.cacheCreate1h);
+
+    if (authoritative) {
+      this._lastTurnPromptTokens = reported.in + reported.cacheRead + reported.cacheCreate;
+      this._msgProvisional = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
+      this._turnApplied = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
+    } else {
+      this._msgProvisional = reported;
+      this._turnApplied = {
+        in: this._turnApplied.in + delta.in,
+        out: this._turnApplied.out + delta.out,
+        cacheRead: this._turnApplied.cacheRead + delta.cacheRead,
+        cacheCreate: this._turnApplied.cacheCreate + delta.cacheCreate,
+        cacheCreate1h: this._turnApplied.cacheCreate1h + delta.cacheCreate1h,
+      };
+    }
+    this._updateCost();
+  }
+
+  /**
+   * Take the engine's own spend figure when it offers one.
+   *
+   * `total_cost_usd` is cache-aware in a way the registry formula is not: on a
+   * turn with 31,435 one-hour cache writes the CLI reported $0.322428 while the
+   * formula produced $0.016 — a 20x under-report, on the number `maxBudgetUsd`
+   * gates against. It is also the session running total rather than the turn's
+   * cost, so spend advances by the difference.
+   *
+   * What that total covers changed in Claude Code 2.1.277: a headless process
+   * started with `--resume` used to begin at zero, and now restores the totals
+   * the resumed session saved at exit. Measured on 2.1.278 — a turn reporting
+   * $0.363044, resumed in a new process, reported $0.386463 for a turn whose
+   * own usage was $0.023419. Reading that first figure as this process's spend
+   * charges the whole history again, on every model switch and every session
+   * recovery, and `maxBudgetUsd` then trips against a number the session never
+   * spent. So a resumed process's first report is taken as a baseline, and the
+   * turn carrying it keeps the registry estimate `_applyTurnUsage` already
+   * computed: that is off by the cache-write premium for one turn, where the
+   * alternative is off by everything the session spent before this process.
+   */
+  private _applyReportedCost(reported: unknown): void {
+    if (typeof reported !== 'number' || !Number.isFinite(reported) || reported < 0) return;
+    // In proxy mode the CLI is pointed at another provider's model while being
+    // told it is running `opus`, so the figure it computes is Opus list price
+    // for someone else's tokens. Fall back to the registry, which at least
+    // knows which model was really asked for.
+    if (this._realModel) return;
+    const previous = this._lastReportedCost;
+    if (this._costBaselinePending) {
+      this._costBaselinePending = false;
+      // Only the first report of the resumed process is ambiguous. A later
+      // respawn already has a figure to subtract, so its difference is this
+      // turn's cost and needs no special case.
+      if (previous === null) {
+        this._lastReportedCost = reported;
+        this._engineCostUsd = this.stats.costUsd;
+        return;
+      }
+    }
+    const delta = previous === null || reported < previous ? reported : reported - previous;
+    this._lastReportedCost = reported;
+    this._engineCostUsd += delta;
+    this.stats.costUsd = this._engineCostUsd;
+  }
+
+  /**
+   * Record the context window the engine reports for the model it actually ran.
+   *
+   * Preferring it over the registry closes the gap the registry keeps drifting
+   * into, and matches what the codex-app session already does with
+   * `tokenUsage.modelContextWindow`.
+   */
+  private _captureContextWindow(modelUsage: unknown): void {
+    if (!modelUsage || typeof modelUsage !== 'object') return;
+    for (const entry of Object.values(modelUsage as Record<string, unknown>)) {
+      const w = (entry as Record<string, unknown> | null)?.contextWindow;
+      if (typeof w === 'number' && w > 0) {
+        this._engineContextWindow = w;
+        return;
+      }
+    }
+  }
+
+  /**
+   * How full the model's context is, measured on the last turn's prompt.
+   *
+   * Both halves used to be wrong in the same direction. The numerator summed
+   * `tokensIn + tokensOut` across the session, but Anthropic's `input_tokens`
+   * excludes cached reads and cache writes — which is where a resumed
+   * conversation's entire history sits — so a turn carrying a 47k prompt
+   * reported 2 input tokens and the metric read 0%. The denominator came from
+   * the registry, which is exactly the number that keeps drifting; the engine
+   * now reports the window it is enforcing, so prefer it and keep the registry
+   * as the fallback.
+   */
+  private _contextPercent(): number {
+    if (this._lastTurnPromptTokens <= 0) return 0;
+    const window =
+      this._engineContextWindow ??
+      getContextWindow(this.options.resolvedModel || this.options.model || 'claude-sonnet-4-6');
+    if (!window) return 0;
+    return Math.min(100, Math.round((this._lastTurnPromptTokens / window) * 100));
+  }
+
   private _updateCost(): void {
+    // Only reached when the engine did not report its own spend — a custom CLI
+    // driven through this class, or a turn that ended before `result`.
+    if (this._lastReportedCost !== null) return;
     const pricing = getModelPricing(this.options.model);
-    const nonCachedIn = Math.max(0, this.stats.tokensIn - this.stats.cachedTokens);
+    // Anthropic bills cache writes above the input rate and the premium depends
+    // on the TTL: 1.25x for the 5-minute cache, 2x for the 1-hour one. Leaving
+    // them out entirely is what made the old estimate collapse on cached
+    // sessions, where the writes are most of what a turn pays for.
+    const cacheCreate5h = Math.max(0, this.stats.cacheCreationTokens - this.stats.cacheCreation1hTokens);
     this.stats.costUsd =
-      (nonCachedIn / 1_000_000) * pricing.input +
+      (this.stats.tokensIn / 1_000_000) * pricing.input +
+      (cacheCreate5h / 1_000_000) * pricing.input * 1.25 +
+      (this.stats.cacheCreation1hTokens / 1_000_000) * pricing.input * 2 +
       (this.stats.cachedTokens / 1_000_000) * (pricing.cached ?? 0) +
       (this.stats.tokensOut / 1_000_000) * pricing.output;
   }

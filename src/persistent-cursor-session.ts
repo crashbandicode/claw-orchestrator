@@ -22,6 +22,7 @@ import { estimateTokens } from './models.js';
 import { sanitizeSecrets } from './sanitize.js';
 import { SESSION_EVENT } from './constants.js';
 import { BaseOneShotSession } from './base-oneshot-session.js';
+import { loadCursorModelCatalog, resolveCursorModelEffort } from './cursor-model-effort.js';
 
 /**
  * Enforced read-only for Cursor Agent.
@@ -126,8 +127,17 @@ export class PersistentCursorSession extends BaseOneShotSession {
    */
   private cursorChatId?: string;
 
+  protected override _continuesConversation(): boolean {
+    return !!this.cursorChatId;
+  }
+
   constructor(config: SessionConfig, cursorBin?: string) {
-    super(config, cursorBin || process.env.CURSOR_BIN || 'agent', {
+    // `cursor-agent` before `agent`: Cursor's installer provides both names, but
+    // `agent` is generic enough that another vendor can claim it — xAI's Grok
+    // installer does exactly that, symlinking `agent` to its own binary, which
+    // then rejects `--force`/`--trust`/`--workspace` and fails the turn with
+    // "unexpected argument". The specific name is the one Cursor owns.
+    super(config, cursorBin || process.env.CURSOR_BIN || 'cursor-agent', {
       enginePrefix: 'cursor',
       defaultModel: 'claude-sonnet-4-6',
       defaultModelDisplay: 'cursor-default',
@@ -173,6 +183,14 @@ export class PersistentCursorSession extends BaseOneShotSession {
   }
 
   protected _run(message: string, options: SessionSendOptions): Promise<TurnResult> {
+    try {
+      return this._spawnTurn(message, options);
+    } catch (err) {
+      return Promise.reject(err);
+    }
+  }
+
+  private _spawnTurn(message: string, options: SessionSendOptions): Promise<TurnResult> {
     // agent -p <prompt> [--force | --mode plan] --trust --output-format stream-json
     const readOnly = this.options.sandboxMode === 'read-only';
     const args: string[] = ['-p', message];
@@ -191,7 +209,24 @@ export class PersistentCursorSession extends BaseOneShotSession {
     // between concurrent sessions.
     if (this.cursorChatId) args.push('--resume', this.cursorChatId);
 
-    if (this.options.model) args.push('--model', this.options.model);
+    const invocation = resolveCursorInvocation(this.engineBin);
+    // Cursor has no `--effort` flag. Session and per-turn effort are applied by
+    // selecting a same-family catalog id or parameterized `--model` from the
+    // live `--list-models` list (cached; tests inject the catalog).
+    const turnEffort = options.effort ?? this.options.effort;
+    if (turnEffort && turnEffort !== 'auto') {
+      const resolved = resolveCursorModelEffort({
+        model: this.options.model,
+        effort: turnEffort,
+        catalog: loadCursorModelCatalog(invocation),
+      });
+      if (!resolved) {
+        throw new Error(`Cursor effort '${turnEffort}' resolved to no --model value`);
+      }
+      args.push('--model', resolved);
+    } else if (this.options.model) {
+      args.push('--model', this.options.model);
+    }
     // Workspace directory (prefer --workspace over cwd for explicit path)
     if (this.options.cwd) args.push('--workspace', this.options.cwd);
 
@@ -208,7 +243,6 @@ export class PersistentCursorSession extends BaseOneShotSession {
       let settled = false;
       let gotUsageFromEvents = false;
 
-      const invocation = resolveCursorInvocation(this.engineBin);
       const proc = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
         cwd: spawnCwd,
         env: { ...process.env, ...invocation.env },

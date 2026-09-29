@@ -51,6 +51,7 @@ Agents cannot interfere with each other's files. All integration happens via `gi
 ### Consensus Voting
 
 Every agent must include `[CONSENSUS: YES]` or `[CONSENSUS: NO]` at the end of each round's response. The council continues until:
+
 - **All agents vote YES** — consensus reached
 - **Max rounds reached** — timeout
 - **Aborted** — user intervention
@@ -79,18 +80,19 @@ import { SessionManager } from '@enderfga/claw-orchestrator';
 
 const manager = new SessionManager();
 
-const session = manager.councilStart(
-  'Build a REST API with authentication',
-  {
-    agents: [
-      { name: 'Planner', emoji: '🟠', persona: 'Technical planner focused on requirements decomposition and architecture' },
-      { name: 'Generator', emoji: '🟢', persona: 'Implementation engineer focused on shipping correct code per plan' },
-      { name: 'Evaluator', emoji: '🔵', persona: 'Independent quality gate focused on verification and acceptance' },
-    ],
-    maxRounds: 10,
-    projectDir: '/tmp/my-api-project',
-  }
-);
+const session = await manager.councilStart('Build a REST API with authentication', {
+  agents: [
+    {
+      name: 'Planner',
+      emoji: '🟠',
+      persona: 'Technical planner focused on requirements decomposition and architecture',
+    },
+    { name: 'Generator', emoji: '🟢', persona: 'Implementation engineer focused on shipping correct code per plan' },
+    { name: 'Evaluator', emoji: '🔵', persona: 'Independent quality gate focused on verification and acceptance' },
+  ],
+  maxRounds: 10,
+  projectDir: '/tmp/my-api-project',
+});
 
 console.log(`Council started: ${session.id}`);
 // Poll for status
@@ -113,15 +115,15 @@ Agents can use different engines and models:
 
 ## Council Tools
 
-| Tool | Description |
-|------|-------------|
-| `council_start` | Start a council. Runs in background, returns session ID immediately. |
-| `council_status` | Get current status (running/consensus/max_rounds/error), responses, votes. |
-| `council_abort` | Stop all agent sessions and terminate the council. |
-| `council_inject` | Inject a user message into all agents' prompts in the next round. |
+| Tool             | Description                                                                             |
+| ---------------- | --------------------------------------------------------------------------------------- |
+| `council_start`  | Start a council. Runs in background, returns session ID immediately.                    |
+| `council_status` | Get current status (running/consensus/max_rounds/error), responses, votes.              |
+| `council_abort`  | Stop all agent sessions and terminate the council.                                      |
+| `council_inject` | Inject a user message into all agents' prompts in the next round.                       |
 | `council_review` | Review completed council output: changed files, branches, plan status, agent summaries. |
-| `council_accept` | Accept work and clean up: remove worktrees, branches, plan.md, reviews/. |
-| `council_reject` | Reject work: rewrite plan.md with feedback for the council to retry. |
+| `council_accept` | Accept work and clean up: remove worktrees, branches, plan.md, reviews/.                |
+| `council_reject` | Reject work: rewrite plan.md with feedback for the council to retry.                    |
 
 ## Post-Processing Lifecycle
 
@@ -134,6 +136,7 @@ After a council reaches consensus or hits max rounds, use the review/accept/reje
 ```
 
 Returns a structured report:
+
 - **changedFiles**: all files modified by the council with insertion/deletion counts
 - **branches**: remaining `council/*` branches
 - **worktrees**: remaining council worktrees
@@ -148,7 +151,10 @@ Returns a structured report:
 ```
 
 Cleans up all council scaffolding:
-- Removes all `council/*` worktrees and `.worktrees/` directory
+
+- Removes the worktrees under `{projectDir}/.worktrees/`, and that directory —
+  selection is by containment, so a worktree of yours that merely has `council`
+  somewhere in its path is never touched
 - Deletes all `council/*` branches
 - Removes `plan.md` and `reviews/` directory
 - Sets council status to `accepted`
@@ -163,19 +169,19 @@ Rewrites `plan.md` with rejection feedback and commits it. All worktrees and bra
 
 ## Configuration
 
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `maxRounds` | 15 | Maximum collaboration rounds |
-| `agentTimeoutMs` | 1,800,000 (30 min) | Per-agent timeout per round |
-| `maxTurnsPerAgent` | 30 | Max tool turns per agent per round |
-| `maxBudgetUsd` | — | API spend limit per agent |
+| Parameter          | Default            | Description                        |
+| ------------------ | ------------------ | ---------------------------------- |
+| `maxRounds`        | 15                 | Maximum collaboration rounds       |
+| `agentTimeoutMs`   | 1,800,000 (30 min) | Per-agent timeout per round        |
+| `maxTurnsPerAgent` | 50                 | Max tool turns per agent per round |
+| `maxBudgetUsd`     | —                  | API spend limit per agent          |
 
 ### defaultPermissionMode
 
 Optional. Sets the default permission mode for council agents when individual agents don't specify one. Defaults to `bypassPermissions`.
 
 ```typescript
-manager.councilStart('task', {
+await manager.councilStart('task', {
   agents: [...],
   maxRounds: 10,
   projectDir: '/project',
@@ -185,26 +191,77 @@ manager.councilStart('task', {
 
 Permission priority: agent-level `permissionMode` > `defaultPermissionMode` > `'bypassPermissions'`
 
-> **Note (Claude CLI 2.1.121+):** When agent personas are persisted as Claude agent files with frontmatter, the `permissionMode`, `tools`, and `disallowedTools` fields are now **enforced** by `--agent` and `--print` modes (previously advisory). If you write agent files with restrictive `tools` lists, expect those agents to refuse calls to other tools at runtime.
-
 ## System Prompt
 
-The council system prompt is loaded from `configs/council-system-prompt.md` and supports hot-editing. It includes 9 charter sections tuned through extensive multi-agent collaboration testing:
+The council system prompt is loaded from `configs/council-system-prompt.md` and supports hot-editing. It has 9 charter sections:
 
-| Section | Purpose |
-|---------|---------|
-| §0 No Hallucination | Agents must use tools, never fabricate results |
-| §1 Plan First | Two-phase protocol with plan.md |
-| §2 Parallel Coordination | Claim/done protocol for concurrent work |
-| §3 Truth in Git | Git state over conversation memory |
-| §4 Merge to Main | Local only, never push |
-| §5 Cross-Review | Structured APPROVE/REQUEST_CHANGES |
-| §6 Auto-Conflict Resolution | Never stop on merge conflicts |
-| §7 Action Over Words | Never ask permission, just work |
-| §8 Efficient Tool Use | Minimum necessary principle |
+| Section                           | Purpose                                        |
+| --------------------------------- | ---------------------------------------------- |
+| §0 Must Use Tools to Execute      | Agents must use tools, never fabricate results |
+| §1 Blueprint First                | Two-phase protocol with plan.md                |
+| §2 Parallel Coordination          | Claim/done protocol for concurrent work        |
+| §3 Truth in Git                   | Git state over conversation memory             |
+| §4 Integration Is Completion      | Local only, never push                         |
+| §5 Cross-Review                   | Structured APPROVE/REQUEST_CHANGES             |
+| §6 Autonomous Conflict Resolution | Never stop on merge conflicts                  |
+| §7 Action Over Words              | Never ask permission, just work                |
+| §8 Efficient Tool Use             | Minimum necessary principle                    |
 
-Placeholders: `{{emoji}}`, `{{name}}`, `{{persona}}`, `{{workDir}}`, `{{otherBranches}}`
+Placeholders: `{{emoji}}`, `{{name}}`, `{{persona}}`, `{{workDir}}`, `{{projectDir}}`, `{{otherBranches}}`
+
+The charter is each seat's only instruction channel, and it reaches every engine through `appendSystemPrompt`:
+natively on Claude Code and Grok, as the top of the seat's first message on Codex, Antigravity and OpenCode.
+Nothing is written into the worktrees.
 
 ## Transcript Logging
 
-All council sessions save transcripts to `~/.openclaw/council-logs/council-<timestamp>.md`. Completed councils remain queryable via `council_status` for 30 minutes after completion.
+All council sessions save transcripts to `~/.openclaw/council-logs/council-<timestamp>.md`. Transcripts are for humans to read; nothing parses them. Completed councils stay queryable via `council_status` indefinitely — the run record is on disk.
+
+## Votes end the rounds; contracts decide the verdict
+
+A council stops early when every agent votes YES, but the votes do not decide
+whether the work is acceptable. They are recorded on the run as
+`consensusVotes`, each with the parse `source` (`strict` / `variant` / `none`),
+so a loosely detected vote is visible as such.
+
+To have the result checked, give the run an acceptance contract and the runtime
+runs the checks itself:
+
+```jsonc
+workflow_start({
+  template: "council",
+  task: "Fix the failing integration tests",
+  agents: [{ name: "alice", engine: "claude" }, { name: "bob", engine: "codex" }],
+  contract: { checks: [{ type: "command", cmd: "npm", args: ["test"] }] }
+})
+```
+
+Without a contract the run completes `unverified` — nothing checked it.
+
+`councilStart`, `fanoutStart`, `ultraplanStart` and `ultrareviewStart` are
+async (each creates a durable run before returning); direct TypeScript callers
+need `await`.
+
+## Durable runs
+
+A council is a durable kernel run. `GET /council/list` (and the dashboard)
+returns real records from disk, across processes.
+
+`council_review` / `council_accept` / `council_reject` work after a restart:
+they act on the git state the council left behind, not on live agents.
+`council_inject` needs the live run and says so plainly when there is none.
+
+## Changed-file reporting
+
+`council_review` diffs against the **merge-base** of `HEAD` and the first
+`council/*` branch — the point where the council's work started — and includes
+files the agents created, which a tracked-file diff cannot see.
+
+Each `CouncilChangedFile` carries `change` — git's own account (`added` /
+`modified` / `deleted`). `status` is optional and stays undefined until a
+reviewer assesses the file.
+
+## Related
+
+- [`verification.md`](./verification.md) — acceptance contracts
+- [`workflow.md`](./workflow.md) — the council node inside a durable run

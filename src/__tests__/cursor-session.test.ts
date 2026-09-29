@@ -5,7 +5,7 @@
  * Uses vitest mocks for child_process.spawn to avoid spawning real processes.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
@@ -14,12 +14,17 @@ import { join } from 'node:path';
 
 // Mock child_process before importing the session
 const mockSpawn = vi.fn();
+const mockSpawnSync = vi.fn(() => {
+  throw new Error('cursor --list-models must be injected via setCursorModelCatalogForTests in unit tests');
+});
 vi.mock('node:child_process', () => ({
   spawn: (...args: unknown[]) => mockSpawn(...args),
+  spawnSync: (...args: unknown[]) => mockSpawnSync(...args),
 }));
 
 // Import after mocking
 const { PersistentCursorSession, resolveCursorInvocation } = await import('../persistent-cursor-session.js');
+const { setCursorModelCatalogForTests } = await import('../cursor-model-effort.js');
 
 // ─── Mock Process Helper ────────────────────────────────────────────────────
 
@@ -64,6 +69,12 @@ describe('PersistentCursorSession', () => {
     mockProc = createMockProcess();
     mockSpawn.mockReset();
     mockSpawn.mockReturnValue(mockProc);
+    mockSpawnSync.mockClear();
+    setCursorModelCatalogForTests(undefined);
+  });
+
+  afterEach(() => {
+    setCursorModelCatalogForTests(undefined);
   });
 
   // ─── start() ────────────────────────────────────────────────────────────
@@ -131,7 +142,7 @@ describe('PersistentCursorSession', () => {
     // omitting it made every turn amnesiac. Verified against 2026.08.11: without
     // the flag turn 2 has no memory of turn 1; with it, turn 2 recalls it.
     it('passes --resume with the harvested chat id on the second turn', async () => {
-      const session = new PersistentCursorSession({ name: 'test', cwd: '/tmp' });
+      const session = new PersistentCursorSession({ permissionMode: 'bypassPermissions', name: 'test', cwd: '/tmp' });
       await session.start();
 
       const p1 = session.send('first', { waitForComplete: true });
@@ -158,6 +169,7 @@ describe('PersistentCursorSession', () => {
 
     it('resumes a persisted cursor chat id from config', async () => {
       const session = new PersistentCursorSession({
+        permissionMode: 'bypassPermissions',
         name: 'test',
         cwd: '/tmp',
         resumeSessionId: 'cursor-live-chat-persisted',
@@ -494,6 +506,125 @@ describe('PersistentCursorSession', () => {
       const stats = session.getStats();
       expect(stats.turns).toBe(2);
       expect(stats.turnsSucceeded).toBe(1);
+    });
+  });
+
+  describe('model effort resolution', () => {
+    const catalog = [
+      'cursor-grok-4.6-low',
+      'cursor-grok-4.6-medium',
+      'cursor-grok-4.6-high',
+      'cursor-grok-4.6-xhigh',
+      'composer-2.5',
+      'claude-opus-5-5-high',
+      'claude-opus-5-5-xhigh',
+    ];
+
+    beforeEach(() => setCursorModelCatalogForTests(catalog));
+
+    function modelArg(args: string[]): string | undefined {
+      const i = args.indexOf('--model');
+      return i >= 0 ? args[i + 1] : undefined;
+    }
+
+    it('passes the effort-qualified catalog id for session xhigh', async () => {
+      const session = new PersistentCursorSession({
+        permissionMode: 'bypassPermissions',
+        name: 'test',
+        cwd: '/tmp',
+        model: 'cursor-grok-4.6-high',
+        effort: 'xhigh',
+      });
+      await session.start();
+      const p = session.send('hello', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await p;
+      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe('cursor-grok-4.6-xhigh');
+      expect(mockSpawnSync).not.toHaveBeenCalled();
+    });
+
+    it('applies a per-turn override without mutating session model or sticking', async () => {
+      const session = new PersistentCursorSession({
+        permissionMode: 'bypassPermissions',
+        name: 'test',
+        cwd: '/tmp',
+        model: 'cursor-grok-4.6-xhigh',
+        effort: 'xhigh',
+      });
+      await session.start();
+
+      const p1 = session.send('first', { waitForComplete: true, effort: 'low' });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await p1;
+
+      const proc2 = createMockProcess();
+      mockSpawn.mockReturnValue(proc2);
+      const p2 = session.send('second', { waitForComplete: true });
+      setTimeout(() => closeProc(proc2, 0), 10);
+      await p2;
+
+      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe('cursor-grok-4.6-low');
+      expect(modelArg(mockSpawn.mock.calls[1][1] as string[])).toBe('cursor-grok-4.6-xhigh');
+      expect(session.getEffort()).toBe('xhigh');
+    });
+
+    it('omits catalog lookup when effort is auto and passes the configured model through', async () => {
+      const session = new PersistentCursorSession({
+        permissionMode: 'bypassPermissions',
+        name: 'test',
+        cwd: '/tmp',
+        model: 'grok-4.7',
+        effort: 'auto',
+      });
+      await session.start();
+      const p = session.send('hello', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await p;
+      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe('grok-4.7');
+      expect(mockSpawnSync).not.toHaveBeenCalled();
+    });
+
+    it('rejects an unsupported effort instead of ignoring it', async () => {
+      const session = new PersistentCursorSession({
+        permissionMode: 'bypassPermissions',
+        name: 'test',
+        cwd: '/tmp',
+        model: 'composer-2.5',
+        effort: 'xhigh',
+      });
+      await session.start();
+      await expect(session.send('hello', { waitForComplete: true })).rejects.toThrow(/composer-2\.5/);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('rejects grok-4.7 + xhigh instead of switching to cursor-grok-4.6-xhigh', async () => {
+      const session = new PersistentCursorSession({
+        permissionMode: 'bypassPermissions',
+        name: 'test',
+        cwd: '/tmp',
+        model: 'grok-4.7',
+        effort: 'xhigh',
+      });
+      await session.start();
+      await expect(session.send('hello', { waitForComplete: true })).rejects.toThrow(/grok-4\.7/);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('parameterizes a listed unsuffixed base instead of requiring catalog effort suffixes', async () => {
+      setCursorModelCatalogForTests(['claude-opus-4-8', 'composer-2.5']);
+      const session = new PersistentCursorSession({
+        permissionMode: 'bypassPermissions',
+        name: 'test',
+        cwd: '/tmp',
+        model: 'claude-opus-4-8[context=1m]',
+        effort: 'high',
+      });
+      await session.start();
+      const p = session.send('hello', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await p;
+      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe('claude-opus-4-8[context=1m,effort=high]');
+      expect(mockSpawnSync).not.toHaveBeenCalled();
     });
   });
 });

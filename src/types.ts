@@ -33,12 +33,58 @@ export const MODEL_ALIASES: Record<string, string> = getAliases();
 // bypassPermissions, manual, dontAsk, plan"), verified against 2.1.206.
 export type PermissionMode = 'acceptEdits' | 'bypassPermissions' | 'default' | 'manual' | 'dontAsk' | 'plan' | 'auto';
 
-export type EffortLevel = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'auto';
+// Engines do not share one ladder, so a level is requested here and clamped by
+// whichever wrapper receives it. Claude Code takes low|medium|high|xhigh|max,
+// Codex adds `ultra` above `max`, Grok stops at `xhigh`, Antigravity at `high`,
+// and OpenCode forwards the level to its provider without validating it. Each
+// wrapper documents its own clamp; none of them silently drops the field.
+export const EFFORT_LEVELS = [
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+  'ultra',
+  'default',
+  'auto',
+] as const;
+export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 // ─── Engine ─────────────────────────────────────────────────────────────────
 
-export const ENGINE_TYPES = ['claude', 'codex', 'codex-app', 'gemini', 'agy', 'cursor', 'opencode', 'custom'] as const;
+export const ENGINE_TYPES = [
+  'claude',
+  'codex',
+  'codex-app',
+  'gemini',
+  'agy',
+  'cursor',
+  'grok',
+  'opencode',
+  'custom',
+] as const;
 export type EngineType = (typeof ENGINE_TYPES)[number];
+
+/** Common execution binding shared by every directly configured agent. */
+export interface AgentBinding {
+  engine?: EngineType;
+  model?: string;
+  effort?: EffortLevel;
+}
+
+/**
+ * The executables the built-in engines actually spawn — the defaults in each
+ * `persistent-*-session.ts` (`CODEX_BIN || 'codex'` and friends). Not derivable
+ * from ENGINE_TYPES: `codex-app` runs the `codex` binary and `cursor` runs
+ * `cursor-agent`. `custom` names its own and so cannot appear here.
+ *
+ * Kept as one list because orphan reaping matches a live process against it, and
+ * a name missing from that match is a CLI that survives a crash forever: `grok`
+ * was added as an engine without being added there.
+ */
+export const ENGINE_BINARY_NAMES = ['claude', 'codex', 'gemini', 'agy', 'cursor-agent', 'grok', 'opencode'] as const;
 
 /**
  * Does this engine carry conversation across sends on its own?
@@ -61,6 +107,9 @@ export type EngineType = (typeof ENGINE_TYPES)[number];
  * lasted, the autoloop replayed a character-capped (therefore truncating)
  * transcript to them on every turn, and the openai-compat bridge re-sent the
  * whole tool schema block, every tool result, and the system prompt every turn.
+ * grok resumes by its own session UUID (`--resume <id>`), verified the same way
+ * against 1.0.5: turn 2 answered with the number turn 1 was asked to remember.
+ *
  * This is an engine-capability claim, so check an entry with a real two-turn
  * recall test against the binary before trusting it.
  */
@@ -75,6 +124,7 @@ export function engineHasNativeConversation(
     case 'agy':
     case 'opencode':
     case 'cursor':
+    case 'grok':
       return true;
     case 'custom':
       // A persistent custom engine is a long-running stdin/stdout process, so it
@@ -209,6 +259,26 @@ export interface CustomEngineConfig {
 
 // ─── Session Config ──────────────────────────────────────────────────────────
 
+/**
+ * One entry of Claude Code's `--agents` JSON, passed to the CLI verbatim.
+ *
+ * Only `prompt` is required. The CLI's schema for this object grows from
+ * release to release — `tools`, `model`, `maxTurns`, `background`, `memory`,
+ * `isolation` and `effort` already sit beside the two fields this type used to
+ * name — so it stays open: a field the CLI adds reaches it without waiting for
+ * a change here.
+ */
+export interface AgentDefinition {
+  description?: string;
+  prompt: string;
+  /**
+   * Run the subagent without the user, project and local CLAUDE.md files
+   * (CLI 2.1.271+; managed policy still applies). Verified accepted by 2.1.271.
+   */
+  omitClaudeMd?: boolean;
+  [field: string]: unknown;
+}
+
 export interface SessionConfig {
   name: string;
   cwd: string;
@@ -229,7 +299,7 @@ export interface SessionConfig {
   // Permissions
   dangerouslySkipPermissions?: boolean;
   // Agents
-  agents?: Record<string, { description?: string; prompt: string }>;
+  agents?: Record<string, AgentDefinition>;
   agent?: string;
   // Session identity
   customSessionId?: string;
@@ -253,12 +323,32 @@ export interface SessionConfig {
   settings?: string;
   /**
    * Enable Claude Code "ultracode" / dynamic workflows for this session (Claude engine only).
-   * NOT a --effort value — the CLI rejects `--effort ultracode`. It is the `ultracode: true`
-   * settings key, merged into --settings (per Claude Code 2.1.x model-config docs). When on,
-   * Claude writes a JS orchestration script per substantive task and fans out to subagents.
+   * Passed as the `ultracode: true` settings key, merged into --settings. When on, Claude
+   * writes a JS orchestration script per substantive task and fans out to subagents.
+   *
+   * In this headless session a workflow runs in the background: the send resolves with the
+   * launch reply. Its completion arrives later as a turn this session did not send, which no
+   * send returns and `turnsSucceeded` does not count; its cost is counted.
    */
   ultracode?: boolean;
+  /**
+   * Do not save this session to disk.
+   *
+   * Two stores, one switch: the engine's own transcript (Claude Code gets
+   * `--no-session-persistence`; other CLIs have no equivalent flag) AND this
+   * orchestrator's session registry, which is what auto-resume reads. Setting
+   * only the first left the session in `~/.openclaw/claude-sessions.json`, so a
+   * later `session-start` under the same name silently reattached to the
+   * conversation the caller had asked not to keep.
+   */
   noSessionPersistence?: boolean;
+  /**
+   * Internal spelling of the registry half, for callers that create ephemeral
+   * sessions programmatically (the openai-compat bridge, the ACP adapter) and
+   * must not pass an engine flag that some CLI forks do not accept. Declared
+   * here so the check does not have to read it through a cast.
+   */
+  skipPersistence?: boolean;
   betas?: string | string[];
   enableAgentTeams?: boolean;
   // CLI 2.1.111 features
@@ -337,8 +427,39 @@ export interface SessionConfig {
    * permissions on the Codex side.
    */
   codexProfile?: string;
-  /** Custom engine configuration — required when engine is 'custom' */
-  customEngine?: CustomEngineConfig;
+  /**
+   * Codex only. Run without loading `$CODEX_HOME/config.toml`
+   * (`codex exec --ignore-user-config`), so an orchestrated run is decided by
+   * what the caller passed rather than by whatever the machine's own Codex
+   * config happens to say. Notably `model = …` in that file changes which model
+   * a session with no explicit model actually uses, while the ledger still
+   * records this engine's default. Auth continues to resolve from CODEX_HOME.
+   */
+  ignoreUserConfig?: boolean;
+  /**
+   * Claude Code only. Restricted mode (`--restricted`): the CLI removes the
+   * built-in tools that run commands or code — Bash, PowerShell, the REPL — plus
+   * WebFetch unless `tools` names them, and ignores user, project and local
+   * settings files.
+   *
+   * Deliberately separate from `sandboxMode: 'read-only'` rather than folded
+   * into it. Read-only maps to plan mode, which holds on its own: measured
+   * against 2.1.251, a plan-mode session refused a direct write, a shell write
+   * and a delegated subagent write. What `--restricted` adds is that the shell
+   * is not merely refused but absent — worth having on an untrusted prompt, and
+   * not something to switch on behind a caller's back, because dropping their
+   * settings files also drops their CLAUDE.md and hooks.
+   */
+  restricted?: boolean;
+  /**
+   * Custom engine configuration — required when engine is 'custom'.
+   *
+   * Either an inline config, or the id of a bundled community preset from
+   * `configs/engines/`. The preset form exists so a third-party CLI can be
+   * described once and shipped, rather than re-typed by every caller; see
+   * `src/engine-presets.ts` for what a preset promises and what it does not.
+   */
+  customEngine?: CustomEngineConfig | string;
   /**
    * Internal, content-free correlation metadata for external transcript
    * indexers. Public callers normally omit this; fanout/council populate it so
@@ -427,6 +548,8 @@ export interface SessionStats {
   cursorChatId?: string;
   /** OpenCode session ID captured from the run's JSON output. Reused via `--session` for multi-turn context. */
   opencodeSessionId?: string;
+  /** Grok Build session ID captured from the turn's JSON result. Reused via `--resume` for multi-turn context. */
+  grokSessionId?: string;
   /**
    * True when the most recent turn's token counts came from estimateTokens()
    * because the engine reported no usage. Cost derived from those counts is an
@@ -469,10 +592,18 @@ export interface SendOptions {
   onChunk?: (chunk: string) => void;
   onEvent?: (event: StreamEvent) => void;
   /**
-   * council id / fanout id / autoloop run id. Stamped onto the run-ledger row
-   * so a multi-agent run can be reassembled from the ledger afterwards.
+   * council id / fanout id / autoloop run id / workflow run id. Stamped onto the
+   * run-ledger row so a multi-agent run can be reassembled from the ledger.
    */
   parentRunId?: string;
+  /** Kernel node kind this turn belongs to (`agent`, `council`, `verifier`, …). */
+  nodeKind?: string;
+  /**
+   * Caller-declared task class, for later grouping in the ledger. Never inferred
+   * from the prompt — a guessed label would corrupt the comparison it exists to
+   * enable.
+   */
+  taskKind?: string;
 }
 
 // ─── Stream Events ───────────────────────────────────────────────────────────
@@ -517,6 +648,14 @@ export interface SessionInfo {
   orchestrationAgentKey?: string;
 }
 
+/** A tool call the engine refused to run during a turn. */
+export interface PermissionDenial {
+  toolName: string;
+  toolUseId?: string;
+  /** The arguments the model passed, as the engine reported them. */
+  input?: unknown;
+}
+
 export interface SendResult {
   output: string;
   sessionId?: string;
@@ -524,6 +663,19 @@ export interface SendResult {
   events: StreamEvent[];
   orchestrationRunId?: string;
   orchestrationAgentKey?: string;
+  /**
+   * Tool calls the engine blocked during this turn. Present only when there was
+   * at least one.
+   *
+   * Read this alongside `error`, not instead of it: a turn whose every tool call
+   * was denied still ends `subtype: 'success'` with `is_error: false`, so it
+   * counts in `turnsSucceeded` and sets no `error`. Measured against Claude Code
+   * 2.1.269 with `--permission-prompts none` (what a session gets when no prompt
+   * tool is configured): asked to write a file, the turn "succeeded", the Bash
+   * call appeared here, and no file was written. A caller that treats a
+   * successful turn as work done needs this field to know otherwise.
+   */
+  permissionDenials?: PermissionDenial[];
 }
 
 export interface GrepMatch {
@@ -712,24 +864,27 @@ export interface CouncilEvent {
   toolStatus?: 'start' | 'end';
 }
 
-export interface AgentPersona {
+export interface AgentPersona extends AgentBinding {
   name: string;
   emoji: string;
   persona: string;
-  engine?: EngineType;
   role?: string;
-  model?: string;
   baseUrl?: string;
   permissionMode?: PermissionMode;
   customEngine?: CustomEngineConfig;
-  /** Per-agent reasoning effort (council only; passed to the agent's session). */
-  effort?: EffortLevel;
+  /** Per-agent reasoning effort passed to the agent's session. */
   /** Per-agent ultracode / dynamic workflows (council, claude engine only). */
   ultracode?: boolean;
 }
 
 export interface CouncilConfig {
   name?: string;
+  /**
+   * Identity for this run, supplied by the kernel. Omitted, the council mints
+   * its own UUID — which then appears as the ledger's `parentRunId` instead of
+   * the run id everything else uses.
+   */
+  runId?: string;
   agents: AgentPersona[];
   maxRounds: number;
   projectDir: string;
@@ -737,6 +892,8 @@ export interface CouncilConfig {
   maxTurnsPerAgent?: number;
   maxBudgetUsd?: number;
   defaultPermissionMode?: PermissionMode;
+  /** Polled like `abort()`; set by the kernel so a cancelled or timed-out run stops opening sessions. */
+  signal?: { aborted: boolean };
 }
 
 export interface AgentResponse {
@@ -762,11 +919,28 @@ export interface CouncilSession {
 
 // ─── Council Post-Processing Types ─────────────────────────────────────────
 
+/**
+ * A reviewer's assessment of a changed file. This is a judgement, not a git
+ * fact — nothing in the orchestrator can compute it, and it is populated only
+ * when a reviewer supplies one.
+ */
 export type CouncilFileStatus = 'clean' | 'needs_rework' | 'redundant' | 'missing';
+
+/** What git says happened to the file. Computed, unlike `status`. */
+export type CouncilFileChange = 'added' | 'modified' | 'deleted';
 
 export interface CouncilChangedFile {
   file: string;
-  status: CouncilFileStatus;
+  /**
+   * Absent until a reviewer assesses the file.
+   *
+   * Through 5.1.0 this was hardcoded to `'clean'` for every entry, which read as
+   * "the council reviewed this and found nothing wrong" when in fact nothing had
+   * looked at it at all. An unassessed file now says so by being undefined.
+   */
+  status?: CouncilFileStatus;
+  /** Git's own account of the change. */
+  change?: CouncilFileChange;
   insertions: number;
   deletions: number;
   note?: string;
