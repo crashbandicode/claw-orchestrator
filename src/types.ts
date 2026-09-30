@@ -753,7 +753,7 @@ export interface ISession {
   // ── Lifecycle ───────────────────────────────────────────────────────────
   /** Initialise the engine subprocess. Engine-specific; config passed via constructor. */
   start(): Promise<this>;
-  stop(): void;
+  stop(): void | Promise<void>;
   pause(): void;
   resume(): void;
 

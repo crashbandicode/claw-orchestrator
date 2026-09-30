@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.6.0-memento.2] - 2026-09-30
+
+### Fixed
+
+- Return and persist the full native Codex thread ID for `codex-app`, including automatic resume, model changes, and tool changes.
+- Wait for the old Codex app-server to exit before acknowledging stop or restarting after a model/tool change, preventing an immediate resume from racing its active writer.
+- Reject failed or mismatched Codex app-server resumes instead of silently opening a fresh conversation. Explain how to replace legacy Claw wrapper IDs with `stats.codexThreadId` and clean up the failed startup process.
+
 ## [7.6.0-memento.1] - 2026-09-29
 
 ### Changed

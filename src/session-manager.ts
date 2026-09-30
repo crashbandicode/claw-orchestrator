@@ -1470,7 +1470,7 @@ export class SessionManager {
     if (managed.orchestration.runKind === 'session') {
       this._emitOrchestrationRunStatus(managed.orchestration, terminalStatus === 'failed' ? 'failed' : 'completed');
     }
-    managed.session.stop();
+    await managed.session.stop();
     this.sessions.delete(name);
     // Remove PID tracking
     this._activePids.delete(name);
@@ -1589,7 +1589,7 @@ export class SessionManager {
     }
 
     const oldConfig = { ...managed.config };
-    managed.session.stop();
+    await managed.session.stop();
     this.sessions.delete(name);
 
     try {
@@ -1668,7 +1668,7 @@ export class SessionManager {
       if (newDisallowed) newDisallowed = newDisallowed.filter((t) => !removeSet.has(t));
     }
 
-    managed.session.stop();
+    await managed.session.stop();
     this.sessions.delete(name);
 
     try {
@@ -1928,7 +1928,7 @@ export class SessionManager {
     // Stop all sessions
     for (const [name, managed] of this.sessions) {
       try {
-        managed.session.stop();
+        await managed.session.stop();
       } catch {
         // Best-effort — session may already be dead; must not block cleanup
       }
@@ -2764,7 +2764,7 @@ export class SessionManager {
 
   /**
    * Return only IDs that can actually resume the engine. Agy and Codex expose
-   * harvested conversation/thread IDs; their BaseOneShot sessionId values are
+   * harvested conversation/thread IDs; legacy wrapper sessionId values are
    * synthetic wrapper identifiers and must never be persisted for resume.
    */
   private _sessionResumeId(engine: EngineType | undefined, session: ISession): string | undefined {
@@ -2775,6 +2775,9 @@ export class SessionManager {
     if (engine === 'codex') {
       return (session as { threadId?: string }).threadId;
     }
+    if (engine === 'codex-app') {
+      return (session as { codexThreadId?: string }).codexThreadId;
+    }
     if (engine === 'cursor') {
       return session.getStats().cursorChatId;
     }
@@ -2784,6 +2787,7 @@ export class SessionManager {
   private _storedResumeId(engine: EngineType | undefined, id: string | undefined): string | undefined {
     if (engine === 'agy') return isAgyConversationId(id) ? id : undefined;
     if (engine === 'codex') return id && !/^codex-\d+-/.test(id) ? id : undefined;
+    if (engine === 'codex-app') return id && !id.startsWith('codex-app-') ? id : undefined;
     if (engine === 'grok') return id && !/^grok-\d+-/.test(id) ? id : undefined;
     return id;
   }

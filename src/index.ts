@@ -410,7 +410,7 @@ const plugin = {
           resumeSessionId: {
             type: 'string',
             description:
-              'Resume an existing Claude Code session by its ID (e.g. from ~/.claude/sessions/). Replays conversation history via session/load instead of starting fresh.',
+              'Resume an existing native engine session. For codex-app, use the full stats.codexThreadId (also returned as stats.sessionId), never a legacy codex-app wrapper ID. A failed or mismatched Codex resume returns an error without starting a new thread.',
           },
         },
       },

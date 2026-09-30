@@ -27,6 +27,7 @@ class MockSession extends EventEmitter implements ISession {
   sessionId?: string;
   conversationId?: string;
   threadId?: string;
+  codexThreadId?: string;
   private _isReady = true;
   private _isPaused = false;
   private _isBusy = false;
@@ -71,7 +72,7 @@ class MockSession extends EventEmitter implements ISession {
     return this;
   }
 
-  stop(): void {
+  stop(): void | Promise<void> {
     this.stopCalled++;
   }
 
@@ -120,6 +121,7 @@ class MockSession extends EventEmitter implements ISession {
       contextPercent: 5,
       retries: 0,
       sessionId: this.sessionId,
+      codexThreadId: this.codexThreadId,
       uptime: 60,
     };
   }
@@ -175,6 +177,9 @@ function patchCreateSession(manager: InstanceType<typeof SessionManager>): void 
   (manager as any)._createSession = (_engine: string, _config: SessionConfig): ISession => {
     const mock = new MockSession();
     if (_engine === 'agy' && _config.resumeSessionId) mock.conversationId = _config.resumeSessionId;
+    if (_engine === 'codex-app') {
+      mock.codexThreadId = _config.resumeSessionId || '019c6dcb-93ad-7dc1-b531-418d213b8761';
+    }
     mockSessions.push(mock);
     createdConfigs.push(_config);
     return mock;
@@ -2446,6 +2451,27 @@ describe('SessionManager', () => {
       });
     });
 
+    it('awaits asynchronous engine shutdown before acknowledging stop', async () => {
+      await mgr.startSession({ name: 'app-stopping', cwd: '/tmp', engine: 'codex-app' });
+      let finish!: () => void;
+      vi.spyOn(lastMock(), 'stop').mockImplementation(
+        () =>
+          new Promise<void>((resolve) => {
+            finish = resolve;
+          }),
+      );
+      let stopped = false;
+      const stopping = mgr.stopSession('app-stopping').then(() => {
+        stopped = true;
+      });
+      await Promise.resolve();
+      expect(stopped).toBe(false);
+      finish();
+      await stopping;
+      expect(stopped).toBe(true);
+      expect(() => mgr.getStatus('app-stopping')).toThrow('not found');
+    });
+
     it('persists and restores the real Codex thread ID', async () => {
       await mgr.startSession({ name: 'codex-persist', cwd: '/tmp', engine: 'codex', sandboxMode: 'read-only' });
       lastMock().threadId = '019c6dcb-93ad-7dc1-b531-418d213b8761';
@@ -2459,6 +2485,51 @@ describe('SessionManager', () => {
         sandboxMode: 'read-only',
         resumeSessionId: '019c6dcb-93ad-7dc1-b531-418d213b8761',
       });
+    });
+
+    it('returns and persists the native codex-app ID before any turn and auto-resumes it', async () => {
+      const id = '019c6dcb-93ad-7dc1-b531-418d213b8761';
+      const info = await mgr.startSession({ name: 'app-persist', cwd: '/tmp', engine: 'codex-app' });
+      // The mock deliberately retains a synthetic wrapper sessionId. The manager
+      // must choose the engine-native identity even when those two values differ.
+      expect(info.claudeSessionId).toBe(id);
+      expect(info.stats.codexThreadId).toBe(id);
+      expect(mgr.listPersistedSessions().find((p) => p.name === 'app-persist')?.claudeSessionId).toBe(id);
+      const sent = await mgr.sendMessage('app-persist', 'hello');
+      expect(sent.sessionId).toBe(id);
+      await mgr.stopSession('app-persist', { keepPersisted: true });
+      const resumed = await mgr.startSession({ name: 'app-persist', cwd: '/tmp' });
+      expect(createdConfigs.at(-1)).toMatchObject({ engine: 'codex-app', resumeSessionId: id });
+      expect(resumed.claudeSessionId).toBe(id);
+    });
+
+    it.each(['model', 'tools'] as const)('keeps native codex-app identity across a %s restart', async (change) => {
+      const id = '019c6dcb-93ad-7dc1-b531-418d213b8761';
+      await mgr.startSession({ name: 'app-restart', cwd: '/tmp', engine: 'codex-app', model: 'gpt-6-astra' });
+      if (change === 'model') await mgr.switchModel('app-restart', 'gpt-6-sol');
+      else await mgr.updateTools('app-restart', { allowedTools: ['Read'] });
+      expect(createdConfigs.at(-1)?.resumeSessionId).toBe(id);
+      expect(mgr.getStatus('app-restart').claudeSessionId).toBe(id);
+    });
+
+    it('preserves a failed legacy resume record and releases its reserved session slot', async () => {
+      await mgr.startSession({ name: 'app-legacy', cwd: '/tmp', engine: 'codex-app' });
+      await mgr.stopSession('app-legacy', { keepPersisted: true });
+      const record = mgr.listPersistedSessions().find((p) => p.name === 'app-legacy')!;
+      record.claudeSessionId = 'codex-app-019c6dcb-legacy';
+      const slots = mgr.freeSessionSlots();
+      const start = vi
+        .spyOn(MockSession.prototype, 'start')
+        .mockRejectedValueOnce(new Error('Cannot resume codex-app wrapper ID; use stats.codexThreadId'));
+      try {
+        await expect(mgr.startSession({ name: 'app-legacy' })).rejects.toThrow('use stats.codexThreadId');
+        expect(createdConfigs.at(-1)?.resumeSessionId).toBe(record.claudeSessionId);
+        expect(mgr.listPersistedSessions().find((p) => p.name === 'app-legacy')).toEqual(record);
+        expect(mgr.freeSessionSlots()).toBe(slots);
+        expect(() => mgr.getStatus('app-legacy')).toThrow('not found');
+      } finally {
+        start.mockRestore();
+      }
     });
 
     it('persists the agy conversation UUID after first send and never the synthetic session ID', async () => {
