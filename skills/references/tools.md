@@ -341,7 +341,13 @@ Returns `{ ok, text, goal }`.
 
 To **resume** a codex-app thread, start a session with `engine: "codex-app"` and
 `resumeSessionId: "<threadId>"` — it loads the existing thread via `thread/resume` instead of
-opening a fresh one.
+opening a fresh one. Record `stats.codexThreadId` from `session_start` or session status;
+`codex-app` also returns this full native ID as `stats.sessionId` and `session_send.sessionId`.
+Check that a resumed session returns the requested `stats.codexThreadId` before sending work.
+A failed resume or different returned thread ID is an error; Claw never substitutes a new
+conversation. Legacy `codex-app-<prefix>-<timestamp>` wrapper IDs are not resumable and cannot
+be expanded safely. Recover the original full native ID from the prior session's stats or
+Codex thread list. To intentionally start fresh, use a new session name without a resume ID.
 
 ---
 

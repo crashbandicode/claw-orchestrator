@@ -1,4 +1,4 @@
-> Memento fork: this release integrates upstream 7.6.0 while retaining Memento lifecycle reporting, Cursor support, native host launch fixes, and configurable/unlimited session capacity. Native and OpenCode effort settings are delivered through each engine's supported interface. See [effort validation](skills/references/memento-effort-validation.md) for tested routes and provider limitations.
+> Memento fork: this release integrates upstream 7.6.0 while retaining Memento lifecycle reporting, Cursor support, native host launch fixes, and configurable/unlimited session capacity. Native and OpenCode effort settings are delivered through each engine's supported interface. See [effort validation](skills/references/memento-effort-validation.md) for tested routes and provider limitations. Codex app-server resumes use full native thread IDs and fail explicitly if the original thread cannot be resumed; see [session resume](skills/references/sessions.md#session-resume--fork).
 
 <p align="center">
   <img src="./assets/banner.jpg" alt="Claw Orchestrator" width="100%">

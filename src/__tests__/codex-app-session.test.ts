@@ -38,7 +38,13 @@ function createMockProc(responder: (msg: WrittenMsg) => Record<string, unknown> 
   };
   proc.stdout = new Readable({ read() {} });
   proc.stderr = new EventEmitter();
-  proc.kill = vi.fn();
+  proc.kill = vi.fn(() => {
+    queueMicrotask(() => {
+      proc.emit('exit', 0);
+      proc.emit('close', 0);
+    });
+    return true;
+  });
   proc.pid = 7777;
   proc.written = written;
   proc.stdin = {
@@ -95,6 +101,25 @@ describe('PersistentCodexAppServerSession v2 RPCs', () => {
   it('thread/start handshake captures the thread id', async () => {
     const session = await startSession(createMockProc(defaultResponder()));
     expect(session.codexThreadId).toBe('t1');
+    expect(session.sessionId).toBe('t1');
+  });
+
+  it('waits for app-server close before acknowledging stop so resume cannot race its writer', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    proc.kill.mockImplementation(() => true);
+    let closed = false;
+    const stopping = session.stop().then(() => {
+      closed = true;
+    });
+    await Promise.resolve();
+    expect(closed).toBe(false);
+    expect(session.isReady).toBe(false);
+    expect(proc.kill).toHaveBeenCalledWith('SIGTERM');
+    proc.emit('exit', 0);
+    proc.emit('close', 0);
+    await stopping;
+    expect(closed).toBe(true);
   });
 
   it('interrupt() sends turn/interrupt {threadId,turnId} for the active turn', async () => {
@@ -291,13 +316,14 @@ describe('PersistentCodexAppServerSession v2 RPCs', () => {
     });
     await session.start();
     expect(session.codexThreadId).toBe('t-prev');
+    expect(session.sessionId).toBe('t-prev');
     expect(proc.written.some((m) => m.method === 'thread/resume')).toBe(true);
     expect(proc.written.some((m) => m.method === 'thread/start')).toBe(false);
     const resume = proc.written.find((m) => m.method === 'thread/resume');
     expect(resume?.params).toMatchObject({ threadId: 't-prev' });
   });
 
-  it('falls back to thread/start when thread/resume fails (stale id)', async () => {
+  it('rejects thread/resume failure without thread/start, READY, or leftover process', async () => {
     const proc = createMockProc((msg) => {
       if (msg.method === 'initialize') return {};
       if (msg.method === 'thread/resume') return { __rpcError: 'thread not found' };
@@ -312,9 +338,197 @@ describe('PersistentCodexAppServerSession v2 RPCs', () => {
       engine: 'codex-app',
       resumeSessionId: 'stale-id',
     });
-    await session.start();
-    expect(session.codexThreadId).toBe('fresh1');
+    const ready = vi.fn();
+    session.on('ready', ready);
+    await expect(session.start()).rejects.toThrow(/not started|no fresh thread/i);
+    expect(ready).not.toHaveBeenCalled();
+    expect(session.isReady).toBe(false);
+    expect(session.pid).toBeUndefined();
+    expect(session.codexThreadId).toBeUndefined();
+    expect(session.sessionId).toBeUndefined();
     expect(proc.written.some((m) => m.method === 'thread/resume')).toBe(true);
+    expect(proc.written.some((m) => m.method === 'thread/start')).toBe(false);
+    expect(proc.kill).toHaveBeenCalled();
+  });
+
+  it('rejects a resume when the response thread id differs', async () => {
+    const proc = createMockProc((msg) => {
+      if (msg.method === 'initialize') return {};
+      if (msg.method === 'thread/resume') return { thread: { id: 'other-thread' } };
+      return {};
+    });
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      resumeSessionId: 't-prev',
+    });
+    const ready = vi.fn();
+    session.on('ready', ready);
+    await expect(session.start()).rejects.toThrow(/identity mismatch/i);
+    expect(ready).not.toHaveBeenCalled();
+    expect(session.isReady).toBe(false);
+    expect(proc.written.some((m) => m.method === 'thread/start')).toBe(false);
+    expect(proc.kill).toHaveBeenCalled();
+  });
+
+  it('rejects a resume when no thread id is returned', async () => {
+    const proc = createMockProc((msg) => {
+      if (msg.method === 'initialize') return {};
+      if (msg.method === 'thread/resume') return {};
+      return {};
+    });
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      resumeSessionId: 't-prev',
+    });
+    const ready = vi.fn();
+    session.on('ready', ready);
+    await expect(session.start()).rejects.toThrow(/did not return a thread id/i);
+    expect(ready).not.toHaveBeenCalled();
+    expect(session.isReady).toBe(false);
+    expect(proc.written.some((m) => m.method === 'thread/start')).toBe(false);
+    expect(proc.kill).toHaveBeenCalled();
+  });
+
+  it('rejects a resume when a thread/started notification id differs', async () => {
+    const spawned: { proc: ReturnType<typeof createMockProc> } = {
+      proc: undefined as unknown as ReturnType<typeof createMockProc>,
+    };
+    spawned.proc = createMockProc((msg) => {
+      if (msg.method === 'initialize') return {};
+      if (msg.method === 'thread/resume') {
+        spawned.proc.stdout.push(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'thread/started',
+            params: { thread: { id: 'other-thread' } },
+          }) + '\n',
+        );
+        return { thread: { id: 't-prev' } };
+      }
+      return {};
+    });
+    const proc = spawned.proc;
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      resumeSessionId: 't-prev',
+    });
+    const ready = vi.fn();
+    session.on('ready', ready);
+    await expect(session.start()).rejects.toThrow(/identity mismatch/i);
+    expect(ready).not.toHaveBeenCalled();
+    expect(session.isReady).toBe(false);
+    expect(proc.written.some((m) => m.method === 'thread/start')).toBe(false);
+    expect(proc.kill).toHaveBeenCalled();
+  });
+
+  it('resumes when the native thread id matches the requested resume id', async () => {
+    const nativeId = '019c6dcb-93ad-7dc1-b531-418d213b8761';
+    const proc = createMockProc((msg) => {
+      if (msg.method === 'initialize') return {};
+      if (msg.method === 'thread/resume') return { thread: { id: nativeId } };
+      return {};
+    });
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      resumeSessionId: nativeId,
+    });
+    await session.start();
+    expect(session.isReady).toBe(true);
+    expect(session.sessionId).toBe(nativeId);
+    expect(session.codexThreadId).toBe(nativeId);
+    expect(proc.written.some((m) => m.method === 'thread/start')).toBe(false);
+  });
+
+  it('resumes when thread/started carries the matching native id and the RPC result does not', async () => {
+    const nativeId = '019c6dcb-93ad-7dc1-b531-418d213b8761';
+    const spawned: { proc: ReturnType<typeof createMockProc> } = {
+      proc: undefined as unknown as ReturnType<typeof createMockProc>,
+    };
+    spawned.proc = createMockProc((msg) => {
+      if (msg.method === 'initialize') return {};
+      if (msg.method === 'thread/resume') {
+        spawned.proc.stdout.push(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            method: 'thread/started',
+            params: { thread: { id: nativeId } },
+          }) + '\n',
+        );
+        return {};
+      }
+      return {};
+    });
+    const proc = spawned.proc;
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      resumeSessionId: nativeId,
+    });
+    await session.start();
+    expect(session.sessionId).toBe(nativeId);
+    expect(session.codexThreadId).toBe(nativeId);
+    expect(proc.written.some((m) => m.method === 'thread/start')).toBe(false);
+  });
+
+  it('rejects a Claw wrapper key without guessing a UUID or starting fresh', async () => {
+    const proc = createMockProc(defaultResponder());
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+      resumeSessionId: 'codex-app-019c6dcb-m1k2n3',
+    });
+    const ready = vi.fn();
+    session.on('ready', ready);
+    await expect(session.start()).rejects.toThrow(/wrapper key/i);
+    expect(ready).not.toHaveBeenCalled();
+    expect(session.isReady).toBe(false);
+    expect(mockSpawn).not.toHaveBeenCalled();
+    expect(proc.written.length).toBe(0);
+    expect(proc.written.some((m) => m.method === 'thread/start')).toBe(false);
+    expect(proc.written.some((m) => m.method === 'thread/resume')).toBe(false);
+  });
+
+  it('exposes the full native thread id as sessionId on a fresh start', async () => {
+    const nativeId = '019c6dcb-93ad-7dc1-b531-418d213b8761';
+    const proc = createMockProc((msg) => {
+      if (msg.method === 'initialize') return {};
+      if (msg.method === 'thread/start') return { thread: { id: nativeId } };
+      return {};
+    });
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexAppServerSession({
+      permissionMode: 'bypassPermissions',
+      name: 't',
+      cwd: '/tmp',
+      engine: 'codex-app',
+    });
+    await session.start();
+    expect(session.sessionId).toBe(nativeId);
+    expect(session.codexThreadId).toBe(nativeId);
+    expect(session.sessionId).not.toMatch(/^codex-app-/);
+    expect(proc.written.some((m) => m.method === 'thread/resume')).toBe(false);
     expect(proc.written.some((m) => m.method === 'thread/start')).toBe(true);
   });
 

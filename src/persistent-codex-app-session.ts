@@ -104,6 +104,16 @@ interface TurnCompletedNotification {
   turn: { id: string; status: string };
 }
 
+/** Historical Claw public key `codex-app-<8>-<timestamp>`. Not a Codex thread id. */
+function isCodexAppWrapperKey(id: string): boolean {
+  return id.startsWith('codex-app-');
+}
+
+function threadIdFromResumeResult(result: { thread?: { id?: string } } | undefined): string | undefined {
+  const id = result?.thread?.id;
+  return typeof id === 'string' && id.length > 0 ? id : undefined;
+}
+
 // ─── PersistentCodexAppServerSession ───────────────────────────────────────
 
 interface PendingRequest {
@@ -117,6 +127,7 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
   private codexBin: string;
   private proc: ChildProcess | null = null;
   private _rl: readline.Interface | null = null;
+  private _stopping: Promise<void> | null = null;
   private _isReady = false;
   private _isPaused = false;
   private _isBusy = false;
@@ -127,6 +138,8 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
 
   // Per-session state populated by notifications
   private threadId?: string;
+  /** Thread ids observed from thread/started and handshake responses before READY. */
+  private _startupThreadIds: string[] = [];
   /**
    * Set when `start()` opened a fresh thread and `appendSystemPrompt` is set.
    * Nothing passes it to `thread/start`, so the instructions ride on the first
@@ -196,47 +209,63 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
       if (!fs.existsSync(this.options.cwd)) fs.mkdirSync(this.options.cwd, { recursive: true });
     }
 
-    const args = ['app-server', '--listen', 'stdio://', '--enable', 'goals'];
-    const invocation = resolveWindowsNodeInvocation(this.codexBin);
-    this.proc = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
-      cwd: this.options.cwd,
-      env: { ...process.env },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      windowsHide: process.platform === 'win32',
-    });
+    const resumeId = this.options.resumeSessionId?.trim() || undefined;
+    if (resumeId && isCodexAppWrapperKey(resumeId)) {
+      throw new Error(
+        `Cannot resume Codex app-server from Claw wrapper key '${resumeId}'. Pass the full Codex thread UUID from stats.codexThreadId; wrapper keys of the form codex-app-<prefix>-<timestamp> are not native thread ids and are not guessed.`,
+      );
+    }
 
-    this._rl = readline.createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });
-    this._rl.on('line', (line) => this._handleLine(line));
+    try {
+      const args = ['app-server', '--listen', 'stdio://', '--enable', 'goals'];
+      const invocation = resolveWindowsNodeInvocation(this.codexBin);
+      this.proc = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
+        cwd: this.options.cwd,
+        env: { ...process.env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: process.platform === 'win32',
+      });
 
-    this.proc.stderr?.on('data', (data: Buffer) => {
-      this.emit(SESSION_EVENT.LOG, `[codex-app-stderr] ${data.toString()}`);
-    });
+      this._rl = readline.createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });
+      this._rl.on('line', (line) => this._handleLine(line));
 
-    this.proc.on('exit', (code) => {
-      this._isReady = false;
-      // Reject any pending requests so callers don't hang.
-      for (const pending of this.pendingRequests.values()) {
-        pending.reject(new Error(`codex app-server exited (code=${code}) before responding`));
-      }
-      this.pendingRequests.clear();
-      if (this.turnReject) {
-        this.turnReject(new Error(`codex app-server exited mid-turn (code=${code})`));
-        this.turnReject = null;
-        this.turnResolve = null;
-      }
-      this.emit(SESSION_EVENT.CLOSE, code ?? 0);
-    });
+      this.proc.stderr?.on('data', (data: Buffer) => {
+        this.emit(SESSION_EVENT.LOG, `[codex-app-stderr] ${data.toString()}`);
+      });
 
-    // 1. initialize
+      this.proc.on('exit', (code) => {
+        this._isReady = false;
+        // Reject any pending requests so callers don't hang.
+        for (const pending of this.pendingRequests.values()) {
+          pending.reject(new Error(`codex app-server exited (code=${code}) before responding`));
+        }
+        this.pendingRequests.clear();
+        if (this.turnReject) {
+          this.turnReject(new Error(`codex app-server exited mid-turn (code=${code})`));
+          this.turnReject = null;
+          this.turnResolve = null;
+        }
+        this.emit(SESSION_EVENT.CLOSE, code ?? 0);
+      });
+
+      await this._handshake(resumeId);
+      return this;
+    } catch (err) {
+      await this._abortStartup();
+      throw err;
+    }
+  }
+
+  /**
+   * initialize → thread/resume or thread/start. Session effort belongs in
+   * `config.model_reasoning_effort` (ThreadStartParams has no top-level effort).
+   * An explicit resume never falls back to a fresh thread.
+   */
+  private async _handshake(resumeId: string | undefined): Promise<void> {
     await this._request('initialize', {
       clientInfo: { name: 'claw-orchestrator', title: null, version: '3.0.0' },
     });
 
-    // 2. thread/start — captures threadId both from the response and the
-    //    `thread/started` notification (which arrives before the response per
-    //    observed protocol semantics). ThreadStartParams (codex 0.155.1
-    //    generate-json-schema) has no top-level `effort`; session effort goes
-    //    in `config.model_reasoning_effort`. Per-turn overrides use `turn/start`.
     const startParams: Record<string, unknown> = {
       cwd: this.options.cwd,
       model: this.options.model,
@@ -244,60 +273,117 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     };
     const sessionEffort = this._rpcEffort(this.options.effort);
     if (sessionEffort) startParams.config = { model_reasoning_effort: sessionEffort };
-    // When resuming a known thread, use `thread/resume` (loads prior turns)
-    // instead of `thread/start` (which opens a fresh thread). A stale/unknown
-    // thread id (e.g. a wrong-engine id from auto-resume, or a thread that no
-    // longer exists) degrades gracefully to a fresh thread rather than failing
-    // the whole session.
-    const resumeId = this.options.resumeSessionId;
-    let threadResp: { thread?: { id?: string } };
+
+    let threadResp: { thread?: { id?: string }; reasoningEffort?: string | null };
     let resumed = false;
     if (resumeId) {
       try {
         threadResp = (await this._request('thread/resume', { threadId: resumeId, ...startParams })) as {
           thread?: { id?: string };
+          reasoningEffort?: string | null;
         };
-        resumed = true;
       } catch (err) {
-        this.emit(SESSION_EVENT.LOG, `[codex-app] thread/resume failed (${(err as Error).message}); starting fresh`);
-        threadResp = (await this._request('thread/start', startParams)) as { thread?: { id?: string } };
+        throw new Error(
+          `Failed to resume Codex app-server thread '${resumeId}': ${(err as Error).message}. The session was not started; no fresh thread was created.`,
+        );
       }
+      this._noteStartupThreadId(threadIdFromResumeResult(threadResp));
+      this._assertResumeIdentity(resumeId);
+      this.threadId = resumeId;
+      resumed = true;
     } else {
-      threadResp = (await this._request('thread/start', startParams)) as { thread?: { id?: string } };
+      threadResp = (await this._request('thread/start', startParams)) as {
+        thread?: { id?: string };
+        reasoningEffort?: string | null;
+      };
+      this._noteStartupThreadId(threadIdFromResumeResult(threadResp));
+      if (!this.threadId && threadResp?.thread?.id) {
+        this.threadId = threadResp.thread.id;
+      }
+      if (!this.threadId) {
+        throw new Error('codex app-server did not return a thread id from thread/start');
+      }
     }
-    if (!this.threadId && threadResp?.thread?.id) {
-      this.threadId = threadResp.thread.id;
-    }
-    if (!this.threadId) {
-      throw new Error('codex app-server did not return a thread id from thread/start');
-    }
-    const initialEffort = (threadResp as { reasoningEffort?: string | null }).reasoningEffort;
+
+    const initialEffort = threadResp.reasoningEffort;
     this._sessionDefaultEffort = typeof initialEffort === 'string' ? initialEffort : sessionEffort;
     this._instructionsPending = !resumed && !!this.options.appendSystemPrompt?.trim();
 
-    this.sessionId = `codex-app-${this.threadId.slice(0, 8)}-${Date.now().toString(36)}`;
+    this.sessionId = this.threadId;
     this._startTime = new Date().toISOString();
     this._isReady = true;
     this.emit(SESSION_EVENT.READY);
     this.emit(SESSION_EVENT.INIT, { type: 'system', subtype: 'init', session_id: this.sessionId });
-    return this;
   }
 
-  stop(): void {
+  private _noteStartupThreadId(id: string | undefined): void {
+    if (typeof id === 'string' && id.length > 0) this._startupThreadIds.push(id);
+  }
+
+  private _assertResumeIdentity(resumeId: string): void {
+    const ids = [...new Set(this._startupThreadIds)];
+    if (ids.length === 0) {
+      throw new Error(
+        `Codex app-server thread/resume did not return a thread id for '${resumeId}'. The session was not started; no fresh thread was created.`,
+      );
+    }
+    const mismatch = ids.find((id) => id !== resumeId);
+    if (mismatch) {
+      throw new Error(
+        `Codex app-server thread/resume identity mismatch: requested '${resumeId}', got '${mismatch}'. The session was not started; no fresh thread was created.`,
+      );
+    }
+  }
+
+  /** Kill the app-server we spawned, close readline, and drop pending RPCs. */
+  private async _abortStartup(): Promise<void> {
+    for (const pending of this.pendingRequests.values()) {
+      pending.reject(new Error('codex app-server startup aborted'));
+    }
+    this.pendingRequests.clear();
+    this.threadId = undefined;
+    this.sessionId = undefined;
+    this._startupThreadIds.length = 0;
+    this._isReady = false;
+    await this.stop();
+  }
+
+  stop(): Promise<void> {
+    if (this._stopping) return this._stopping;
     if (this._rl) {
       this._rl.close();
       this._rl = null;
     }
-    if (this.proc) {
-      try {
-        this.proc.kill('SIGTERM');
-      } catch {
-        // Already gone.
-      }
-      this.proc = null;
-    }
+    const proc = this.proc;
+    this.proc = null;
     this._isReady = false;
     this._isPaused = false;
+    if (!proc || proc.exitCode != null || proc.signalCode != null) return Promise.resolve();
+
+    // Codex holds an exclusive thread writer until app-server exits. Do not
+    // acknowledge stop (or restart for model/tools) while that writer is alive.
+    this._stopping = new Promise<void>((resolve) => {
+      const forceKill = setTimeout(() => {
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          // The close event below remains the completion signal.
+        }
+      }, 5000);
+      forceKill.unref();
+      proc.once('close', () => {
+        clearTimeout(forceKill);
+        resolve();
+      });
+      try {
+        proc.kill('SIGTERM');
+      } catch {
+        // An already-exiting process will still emit close.
+      }
+    }).finally(() => {
+      this._stopping = null;
+    });
+    return this._stopping;
   }
 
   pause(): void {
@@ -439,7 +525,10 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     switch (method) {
       case 'thread/started': {
         const p = params as ThreadStartedNotification;
-        if (p.thread?.id && !this.threadId) this.threadId = p.thread.id;
+        if (p.thread?.id) {
+          this._noteStartupThreadId(p.thread.id);
+          if (!this.threadId) this.threadId = p.thread.id;
+        }
         break;
       }
       case 'turn/started': {

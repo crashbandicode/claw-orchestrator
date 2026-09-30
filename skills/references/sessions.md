@@ -83,6 +83,18 @@ await manager.startSession({
 
 > `claude continue/respawn/stop/logs` are not headless subcommands — session continuation is via `resumeSessionId`/`forkSession`. Use the `claude_agents_list` tool (`claude agents --json`) to enumerate Claude Code background agent sessions.
 
+For `codex-app`, use the full native Codex thread ID from `stats.codexThreadId` as
+`resumeSessionId`. The public `stats.sessionId`, send result `sessionId`, and persisted
+resume record carry that same native ID. Automatic resume and restarts for model/tool
+changes preserve it. Compare the returned thread ID with the requested ID before sending.
+
+Claw rejects a failed or mismatched resume and stops the failed startup process. It does
+not fall back to a new conversation. Old `codex-app-<prefix>-<timestamp>` wrapper IDs lack
+the full native identity; use the original thread's stats or Codex thread list to recover
+its full ID. An old persisted record with that wrapper ID also fails visibly and remains
+available for correction. Start a new name without `resumeSessionId` only when fresh
+context is intended.
+
 ### Handing off to another engine
 
 `resumeSessionId` and `forkSession` continue a conversation on the engine that holds it. To continue
