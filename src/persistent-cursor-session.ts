@@ -136,6 +136,19 @@ export class PersistentCursorSession extends BaseOneShotSession {
     return !!this.cursorChatId;
   }
 
+  /**
+   * Record Cursor's own chat id at most once and announce it immediately.
+   * System init can fire again on later turns and on `--resume`; those repeats
+   * must not emit a second identity.
+   */
+  private _adoptNativeChatId(raw: unknown): void {
+    if (raw == null) return;
+    const id = String(raw).replace(/^cursor-live-/, '');
+    if (!id || this.cursorChatId) return;
+    this.cursorChatId = id;
+    this.emit(SESSION_EVENT.NATIVE_IDENTITY, id);
+  }
+
   constructor(config: SessionConfig, cursorBin?: string) {
     // `cursor-agent` before `agent`: Cursor's installer provides both names, but
     // `agent` is generic enough that another vendor can claim it — xAI's Grok
@@ -374,8 +387,9 @@ export class PersistentCursorSession extends BaseOneShotSession {
       case 'system':
         // Init event — extract session_id if available
         // The raw id is what `--resume` expects; the prefixed one is our
-        // display/persistence handle.
-        if (event.session_id && !this.cursorChatId) this.cursorChatId = String(event.session_id);
+        // display/persistence handle. Announce native identity as soon as the
+        // stream names it, not when the turn later completes.
+        if (event.session_id) this._adoptNativeChatId(event.session_id);
         if (event.session_id && !this.sessionId?.startsWith('cursor-live-')) {
           this.sessionId = `cursor-live-${event.session_id}`;
         }

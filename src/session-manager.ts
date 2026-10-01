@@ -261,6 +261,8 @@ interface ManagedSession {
   orchestration: OrchestrationAgentContext;
   orchestrationBoundNativeId?: string;
   orchestrationLastStatus: OrchestrationAgentStatus;
+  /** Bound `SESSION_EVENT.NATIVE_IDENTITY` listener; removed on stop/restart. */
+  nativeIdentityListener?: (...args: unknown[]) => void;
   /**
    * Sends recorded in the run ledger for this session in this process — the
    * row's `turn` index. Not `stats.turns`: on claude that counts every `user`
@@ -855,6 +857,7 @@ export class SessionManager {
       this._persistSession(name, managed);
     }
 
+    this._wireNativeIdentity(managed);
     this._bindOrchestrationIdentity(managed);
     this._setOrchestrationAgentStatus(managed, 'idle');
 
@@ -1470,6 +1473,7 @@ export class SessionManager {
     if (managed.orchestration.runKind === 'session') {
       this._emitOrchestrationRunStatus(managed.orchestration, terminalStatus === 'failed' ? 'failed' : 'completed');
     }
+    this._unwireNativeIdentity(managed);
     await managed.session.stop();
     this.sessions.delete(name);
     // Remove PID tracking
@@ -1589,6 +1593,7 @@ export class SessionManager {
     }
 
     const oldConfig = { ...managed.config };
+    this._unwireNativeIdentity(managed);
     await managed.session.stop();
     this.sessions.delete(name);
 
@@ -1668,6 +1673,7 @@ export class SessionManager {
       if (newDisallowed) newDisallowed = newDisallowed.filter((t) => !removeSet.has(t));
     }
 
+    this._unwireNativeIdentity(managed);
     await managed.session.stop();
     this.sessions.delete(name);
 
@@ -1928,6 +1934,7 @@ export class SessionManager {
     // Stop all sessions
     for (const [name, managed] of this.sessions) {
       try {
+        this._unwireNativeIdentity(managed);
         await managed.session.stop();
       } catch {
         // Best-effort — session may already be dead; must not block cleanup
@@ -2466,8 +2473,8 @@ export class SessionManager {
     this.persistedSessions.set(name, {
       name,
       // Persist engine/sandbox configuration independently from native
-      // identity. Cursor and Codex only reveal a resumable id on their first
-      // turn; a stop/restart before that must not silently become Claude.
+      // identity. Cursor announces a resumable id on system init of the first
+      // turn; until then a stop/restart must not silently become Claude.
       claudeSessionId: resumeSessionId || existing?.claudeSessionId || '',
       cwd: managed.cwd,
       model: managed.config.resolvedModel || managed.config.model,
@@ -2714,10 +2721,32 @@ export class SessionManager {
     this._orchestrationEvents.emit('run.status', context, { runStatus: status });
   }
 
+  private _wireNativeIdentity(managed: ManagedSession): void {
+    if (managed.nativeIdentityListener) return;
+    const listener = (..._args: unknown[]): void => {
+      // Ignore events from a session that has already been replaced (model
+      // switch / tool restart) or removed from the map.
+      if (this.sessions.get(managed.config.name) !== managed) return;
+      this._bindOrchestrationIdentity(managed);
+    };
+    managed.nativeIdentityListener = listener;
+    managed.session.on(SESSION_EVENT.NATIVE_IDENTITY, listener);
+  }
+
+  private _unwireNativeIdentity(managed: ManagedSession): void {
+    const listener = managed.nativeIdentityListener;
+    if (!listener) return;
+    managed.session.removeListener(SESSION_EVENT.NATIVE_IDENTITY, listener);
+    managed.nativeIdentityListener = undefined;
+  }
+
   private _bindOrchestrationIdentity(managed: ManagedSession): void {
     const nativeSessionId = this._managedResumeId(managed);
     if (!nativeSessionId || nativeSessionId === managed.orchestrationBoundNativeId) return;
     managed.orchestrationBoundNativeId = nativeSessionId;
+    if (!managed.skipPersistence) {
+      this._persistSession(managed.config.name, managed);
+    }
     this._orchestrationEvents.emit('agent.identity_bound', managed.orchestration, {
       nativeSessionId,
       agentStatus: managed.orchestrationLastStatus,
@@ -4026,6 +4055,7 @@ export class SessionManager {
       if (now - managed.lastActivity > ttlMs) {
         this.logger.info(`Cleaning up idle in-memory session: ${name}`);
         try {
+          this._unwireNativeIdentity(managed);
           managed.session.stop();
         } catch {
           // Best-effort — session may already be dead; must not block TTL cleanup

@@ -124,6 +124,12 @@ export const SESSION_EVENT = {
   USER_ECHO: 'user_echo',
   ASSISTANT: 'assistant',
   EVENT: 'event',
+  /**
+   * Engine-neutral: a resumable native thread/chat id became known.
+   * Payload is the id string. SessionManager binds orchestration identity
+   * immediately; do not wait for turn completion.
+   */
+  NATIVE_IDENTITY: 'native_identity',
 } as const;
 
 export type SessionEventName = (typeof SESSION_EVENT)[keyof typeof SESSION_EVENT];

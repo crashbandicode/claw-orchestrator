@@ -95,6 +95,13 @@ its full ID. An old persisted record with that wrapper ID also fails visibly and
 available for correction. Start a new name without `resumeSessionId` only when fresh
 context is intended.
 
+For `cursor`, the native chat id arrives on the CLI's system-init event, which can be
+long before the first turn completes. SessionManager listens for the engine-neutral
+`native_identity` session event and writes `agent.identity_bound` as soon as that id is
+known. The same id is not bound twice if system init repeats or the session is resumed
+with `--resume`. Model switch and tool restart drop the old listener and attach a new
+one on the replacement session.
+
 ### Handing off to another engine
 
 `resumeSessionId` and `forkSession` continue a conversation on the engine that holds it. To continue

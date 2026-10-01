@@ -20,6 +20,8 @@ import type {
   CostBreakdown,
   EffortLevel,
 } from '../types.js';
+import { SESSION_EVENT } from '../constants.js';
+import { defaultOrchestrationOutboxFile, type OrchestrationLifecycleEvent } from '../orchestration-events.js';
 
 // ─── Mock ISession ──────────────────────────────────────────────────────────
 
@@ -39,6 +41,7 @@ class MockSession extends EventEmitter implements ISession {
   stopCalled = 0;
   sendCalls: Array<{ message: string | unknown[]; options?: SessionSendOptions }> = [];
   compactCalls: string[] = [];
+  cursorChatId?: string;
   /** Overrides the result event this session resolves with. */
   nextEvent?: Record<string, unknown>;
   /** Test seam for exercising real SessionManager/dispatcher send outcomes. */
@@ -122,6 +125,7 @@ class MockSession extends EventEmitter implements ISession {
       retries: 0,
       sessionId: this.sessionId,
       codexThreadId: this.codexThreadId,
+      cursorChatId: this.cursorChatId,
       uptime: 60,
     };
   }
@@ -177,6 +181,9 @@ function patchCreateSession(manager: InstanceType<typeof SessionManager>): void 
   (manager as any)._createSession = (_engine: string, _config: SessionConfig): ISession => {
     const mock = new MockSession();
     if (_engine === 'agy' && _config.resumeSessionId) mock.conversationId = _config.resumeSessionId;
+    if (_engine === 'cursor' && _config.resumeSessionId && !/^cursor-\d+-/.test(_config.resumeSessionId)) {
+      mock.cursorChatId = _config.resumeSessionId.replace(/^cursor-live-/, '');
+    }
     if (_engine === 'codex-app') {
       mock.codexThreadId = _config.resumeSessionId || '019c6dcb-93ad-7dc1-b531-418d213b8761';
     }
@@ -280,6 +287,25 @@ function createManager(overrides?: Record<string, unknown>): InstanceType<typeof
 
 function lastMock(): MockSession {
   return mockSessions[mockSessions.length - 1];
+}
+
+const NATIVE_CURSOR_ID = 'd9133160-dd01-402e-8dbb-8166263fff40';
+
+function identityBoundEvents(runId?: string): OrchestrationLifecycleEvent[] {
+  const file = defaultOrchestrationOutboxFile();
+  if (!fs.existsSync(file)) return [];
+  return fs
+    .readFileSync(file, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as OrchestrationLifecycleEvent)
+    .filter((e) => e.event === 'agent.identity_bound' && (!runId || e.run_id === runId));
+}
+
+function sessionRunId(manager: unknown, name: string): string {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return (manager as any).sessions.get(name).orchestration.runId as string;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -2610,6 +2636,80 @@ describe('SessionManager', () => {
       const version = mgr.getVersion();
       expect(typeof version).toBe('string');
       expect(version.length).toBeGreaterThan(0);
+    });
+  });
+
+  describe('early native identity', () => {
+    it('binds the exact Cursor chat id before the first turn completes', async () => {
+      await mgr.startSession({ name: 'early-native', cwd: '/tmp', engine: 'cursor' });
+      const mock = lastMock();
+      const runId = sessionRunId(mgr, 'early-native');
+      expect(identityBoundEvents(runId)).toHaveLength(0);
+
+      let boundDuringSend = 0;
+      mock.sendImplementation = async () => {
+        mock.cursorChatId = NATIVE_CURSOR_ID;
+        mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
+        const bound = identityBoundEvents(runId);
+        boundDuringSend = bound.length;
+        expect(bound[0]?.native_session_id).toBe(NATIVE_CURSOR_ID);
+        expect(bound[0]?.agent_status).toBe('running');
+        return { text: 'still going', event: { type: 'result', result: 'done' } };
+      };
+
+      const result = await mgr.sendMessage('early-native', 'hello');
+      expect(boundDuringSend).toBe(1);
+      expect(identityBoundEvents(runId)).toHaveLength(1);
+      expect(result.sessionId).toBe(NATIVE_CURSOR_ID);
+    });
+
+    it('keeps a single identity across repeated native_identity events', async () => {
+      await mgr.startSession({ name: 'repeat-native', cwd: '/tmp', engine: 'cursor' });
+      const mock = lastMock();
+      const runId = sessionRunId(mgr, 'repeat-native');
+      mock.cursorChatId = NATIVE_CURSOR_ID;
+      mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
+      mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
+      mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
+      const bound = identityBoundEvents(runId);
+      expect(bound).toHaveLength(1);
+      expect(bound[0]?.native_session_id).toBe(NATIVE_CURSOR_ID);
+    });
+
+    it('binds a same-thread Cursor resume at start and ignores the same id later', async () => {
+      await mgr.startSession({
+        name: 'resume-native',
+        cwd: '/tmp',
+        engine: 'cursor',
+        resumeSessionId: `cursor-live-${NATIVE_CURSOR_ID}`,
+      });
+      const runId = sessionRunId(mgr, 'resume-native');
+      expect(identityBoundEvents(runId).map((e) => e.native_session_id)).toEqual([NATIVE_CURSOR_ID]);
+      lastMock().emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
+      expect(identityBoundEvents(runId)).toHaveLength(1);
+    });
+
+    it('drops the native identity listener on stop', async () => {
+      await mgr.startSession({ name: 'detach-native', cwd: '/tmp', engine: 'cursor' });
+      const mock = lastMock();
+      const runId = sessionRunId(mgr, 'detach-native');
+      await mgr.stopSession('detach-native');
+      mock.cursorChatId = NATIVE_CURSOR_ID;
+      mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
+      expect(identityBoundEvents(runId)).toHaveLength(0);
+    });
+
+    it('rewires native identity after switchModel and ignores the old session', async () => {
+      await mgr.startSession({ name: 'switch-native', cwd: '/tmp', engine: 'cursor' });
+      const old = lastMock();
+      old.cursorChatId = NATIVE_CURSOR_ID;
+      old.setBusy(false);
+      await mgr.switchModel('switch-native', 'composer-2.5');
+      const runId = sessionRunId(mgr, 'switch-native');
+      const before = identityBoundEvents(runId).length;
+      expect(before).toBeGreaterThanOrEqual(1);
+      old.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
+      expect(identityBoundEvents(runId)).toHaveLength(before);
     });
   });
 });

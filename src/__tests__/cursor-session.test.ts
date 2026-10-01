@@ -11,6 +11,7 @@ import { Readable } from 'node:stream';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { SESSION_EVENT } from '../constants.js';
 
 // Mock child_process before importing the session
 const mockSpawn = vi.fn();
@@ -674,6 +675,87 @@ describe('PersistentCursorSession', () => {
       await p;
       expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe('claude-opus-4-8[context=1m,effort=high]');
       expect(mockSpawnSync).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('native identity', () => {
+    const nativeId = 'd9133160-dd01-402e-8dbb-8166263fff40';
+
+    it('emits native_identity with the exact chat id before the turn completes', async () => {
+      const session = new PersistentCursorSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+      });
+      await session.start();
+
+      const seen = new Promise<string>((resolve) => {
+        session.once(SESSION_EVENT.NATIVE_IDENTITY, (id: unknown) => resolve(String(id)));
+      });
+      const sendPromise = session.send('hello', { waitForComplete: true });
+      await vi.waitFor(() => expect(mockSpawn).toHaveBeenCalled());
+      feedLines(mockProc, [JSON.stringify({ type: 'system', subtype: 'init', session_id: nativeId })]);
+
+      await expect(seen).resolves.toBe(nativeId);
+      expect(session.getStats().cursorChatId).toBe(nativeId);
+
+      let finished = false;
+      const done = sendPromise.then((result) => {
+        finished = true;
+        return result;
+      });
+      await Promise.resolve();
+      expect(finished).toBe(false);
+
+      closeProc(mockProc, 0);
+      await done;
+      expect(finished).toBe(true);
+    });
+
+    it('emits a single native identity across repeated system init events', async () => {
+      const session = new PersistentCursorSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+      });
+      await session.start();
+
+      const ids: string[] = [];
+      session.on(SESSION_EVENT.NATIVE_IDENTITY, (id: unknown) => ids.push(String(id)));
+      const sendPromise = session.send('hello', { waitForComplete: true });
+      await vi.waitFor(() => expect(mockSpawn).toHaveBeenCalled());
+      feedLines(mockProc, [
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: nativeId }),
+        JSON.stringify({ type: 'system', subtype: 'init', session_id: nativeId }),
+        JSON.stringify({ type: 'system', session_id: nativeId }),
+      ]);
+      await vi.waitFor(() => expect(ids).toEqual([nativeId]));
+      closeProc(mockProc, 0);
+      await sendPromise;
+      expect(ids).toEqual([nativeId]);
+      expect(session.getStats().cursorChatId).toBe(nativeId);
+    });
+
+    it('does not re-emit native identity when resuming the same Cursor thread', async () => {
+      const session = new PersistentCursorSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+        resumeSessionId: `cursor-live-${nativeId}`,
+      });
+      await session.start();
+      expect(session.getStats().cursorChatId).toBe(nativeId);
+
+      const ids: string[] = [];
+      session.on(SESSION_EVENT.NATIVE_IDENTITY, (id: unknown) => ids.push(String(id)));
+      const sendPromise = session.send('hello', { waitForComplete: true });
+      await vi.waitFor(() => expect(mockSpawn).toHaveBeenCalled());
+      feedLines(mockProc, [JSON.stringify({ type: 'system', subtype: 'init', session_id: nativeId })]);
+      await vi.waitFor(() => expect(session.getStats().cursorChatId).toBe(nativeId));
+      expect(ids).toEqual([]);
+      closeProc(mockProc, 0);
+      await sendPromise;
+      expect(ids).toEqual([]);
     });
   });
 });

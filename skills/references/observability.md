@@ -11,6 +11,15 @@ The run ledger is the durable record of every turn across restarts: what ran, on
 which engine, for how much. `maxBudgetUsd` is enforced in `SessionManager`, which
 every engine passes through, not only through Claude Code's `--max-budget-usd`.
 
+## Memento lifecycle outbox
+
+Identity for external conversation indexers is a separate JSONL outbox
+(`~/.claw-orchestrator/memento-events/v1/events.jsonl`, or `CLAWO_MEMENTO_OUTBOX`).
+`agent.identity_bound` carries `native_session_id` when a resumable engine thread
+is known. For Cursor that can be during the first turn — as soon as system init
+names the chat id — not only after `send` resolves. Repeating the same id does
+not emit a second bind. Disable with `CLAWO_MEMENTO_EVENTS=0`.
+
 ## The ledger
 
 - Location: `~/.claw-orchestrator/runs/YYYY-MM-DD.jsonl` (override with
