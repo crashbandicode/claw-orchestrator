@@ -22,7 +22,12 @@ import { estimateTokens } from './models.js';
 import { sanitizeSecrets } from './sanitize.js';
 import { SESSION_EVENT } from './constants.js';
 import { BaseOneShotSession } from './base-oneshot-session.js';
-import { loadCursorModelCatalog, resolveCursorModelEffort } from './cursor-model-effort.js';
+import {
+  loadCursorModelCatalog,
+  resolveCursorModelEffort,
+  resolveCursorParameterizedModelEffort,
+} from './cursor-model-effort.js';
+import { loadCursorParameterizedCatalog } from './cursor-parameterized-catalog.js';
 
 /**
  * Enforced read-only for Cursor Agent.
@@ -190,7 +195,7 @@ export class PersistentCursorSession extends BaseOneShotSession {
     }
   }
 
-  private _spawnTurn(message: string, options: SessionSendOptions): Promise<TurnResult> {
+  private async _spawnTurn(message: string, options: SessionSendOptions): Promise<TurnResult> {
     // agent -p <prompt> [--force | --mode plan] --trust --output-format stream-json
     const readOnly = this.options.sandboxMode === 'read-only';
     const args: string[] = ['-p', message];
@@ -212,14 +217,23 @@ export class PersistentCursorSession extends BaseOneShotSession {
     const invocation = resolveCursorInvocation(this.engineBin);
     // Cursor has no `--effort` flag. Session and per-turn effort are applied by
     // selecting a same-family catalog id or parameterized `--model` from the
-    // live `--list-models` list (cached; tests inject the catalog).
+    // live catalog. --list-models omits newer parameterized models, so a miss
+    // uses Cursor's ACP discovery without creating a chat or running inference.
     const turnEffort = options.effort ?? this.options.effort;
     if (turnEffort && turnEffort !== 'auto') {
-      const resolved = resolveCursorModelEffort({
-        model: this.options.model,
-        effort: turnEffort,
-        catalog: loadCursorModelCatalog(invocation),
-      });
+      let resolved: string | undefined;
+      try {
+        resolved = resolveCursorModelEffort({
+          model: this.options.model,
+          effort: turnEffort,
+          catalog: loadCursorModelCatalog(invocation),
+        });
+      } catch (legacyError) {
+        if (!this.options.model) throw legacyError;
+        const catalog = await loadCursorParameterizedCatalog(invocation);
+        if (!this.isReady) throw new Error('Cursor session stopped during model discovery');
+        resolved = resolveCursorParameterizedModelEffort(this.options.model, turnEffort, catalog);
+      }
       if (!resolved) {
         throw new Error(`Cursor effort '${turnEffort}' resolved to no --model value`);
       }

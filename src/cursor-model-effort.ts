@@ -12,6 +12,7 @@
 import { spawnSync } from 'node:child_process';
 
 import type { EffortLevel } from './types.js';
+import type { CursorParameterizedModel } from './cursor-parameterized-catalog.js';
 
 /** Effort tokens that appear in Cursor catalog ids, longest-first. */
 const CATALOG_EFFORT_TOKEN =
@@ -37,7 +38,7 @@ export interface ResolveCursorModelEffortInput {
 }
 
 let catalogOverride: readonly string[] | undefined;
-const catalogCache = new Map<string, string[]>();
+const catalogCache = new Map<string, { ids: string[]; expiresAt: number }>();
 
 /** Test hook. Pass `undefined` to restore live listing. */
 export function setCursorModelCatalogForTests(ids?: readonly string[]): void {
@@ -188,6 +189,52 @@ export function resolveCursorModelEffort(input: ResolveCursorModelEffortInput): 
   return chosen.id;
 }
 
+/** Resolve from Cursor's ACP catalog when its legacy text listing omits a model. */
+export function resolveCursorParameterizedModelEffort(
+  model: string,
+  effort: EffortLevel,
+  catalog: readonly CursorParameterizedModel[],
+): string {
+  const parameterized = parseParameterizedCursorModel(model);
+  const parsed = parseCursorModelId(parameterized?.base ?? model);
+  const fast = parsed.family.endsWith('-fast');
+  const entry = catalog.find((row) => row.value === parsed.family || (fast && `${row.value}-fast` === parsed.family));
+  if (!entry)
+    throw new Error(`Cursor parameterized catalog has no model '${parsed.family}'. Refusing to substitute a model.`);
+  const thoughts = entry.configOptions.filter((option) => option.category === 'thought_level');
+  if (thoughts.length !== 1) throw new Error(`Cursor model '${entry.value}' has no unambiguous effort parameter.`);
+  const thought = thoughts[0];
+  const wanted = catalogEffortNamesForRequest(effort);
+  const chosen =
+    thought.options.find((option) => option.value === effort) ??
+    thought.options.find((option) => wanted.includes(option.value));
+  if (!chosen)
+    throw new Error(
+      `Unsupported Cursor effort '${effort}' for model '${entry.value}'. Listed efforts: ${thought.options.map((option) => option.value).join(', ')}. Refusing to downgrade effort.`,
+    );
+  const explicit = { ...parameterized?.params };
+  // Callers historically used effort=...; the native catalog supplies the real key.
+  if (thought.id !== 'effort' && explicit.effort !== undefined) delete explicit.effort;
+  explicit[thought.id] = chosen.value;
+  if (fast) explicit.fast = 'true';
+  for (const key of Object.keys(explicit)) {
+    if (!entry.configOptions.some((option) => option.id === key)) {
+      throw new Error(`Unsupported Cursor parameter '${key}' for model '${entry.value}'.`);
+    }
+  }
+  const params: Record<string, string> = {};
+  for (const option of entry.configOptions) {
+    const value =
+      explicit[option.id] ??
+      (option.id === 'fast' && option.options.some((v) => v.value === 'false') ? 'false' : option.currentValue);
+    if (!option.options.some((candidate) => candidate.value === value)) {
+      throw new Error(`Unsupported Cursor parameter '${option.id}=${value}' for model '${entry.value}'.`);
+    }
+    params[option.id] = value;
+  }
+  return formatParameterized(entry.value, params, Object.keys(params));
+}
+
 function catalogCacheKey(invocation: CursorCommandInvocation): string {
   return `${invocation.command}\0${invocation.prefixArgs.join('\0')}`;
 }
@@ -200,7 +247,7 @@ export function loadCursorModelCatalog(invocation: CursorCommandInvocation): str
   if (catalogOverride) return [...catalogOverride];
   const key = catalogCacheKey(invocation);
   const hit = catalogCache.get(key);
-  if (hit) return hit;
+  if (hit && hit.expiresAt > Date.now()) return hit.ids;
   const result = spawnSync(invocation.command, [...invocation.prefixArgs, '--list-models'], {
     encoding: 'utf8',
     timeout: 30_000,
@@ -214,6 +261,6 @@ export function loadCursorModelCatalog(invocation: CursorCommandInvocation): str
     throw new Error(`cursor --list-models exited ${result.status}${detail ? `: ${detail}` : ''}`);
   }
   const ids = parseCursorModelList(result.stdout || '');
-  catalogCache.set(key, ids);
+  catalogCache.set(key, { ids, expiresAt: Date.now() + 300_000 });
   return ids;
 }

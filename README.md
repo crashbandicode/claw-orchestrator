@@ -145,3 +145,5 @@ See [`CONTRIBUTING.md`](./CONTRIBUTING.md). Run `npm run build && npm run lint &
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).
+
+Cursor effort discovery uses both its legacy CLI listing and native ACP parameterized catalog. Grok 4.7 and other parameterized models retain their exact requested effort even when omitted from `--list-models`; discovery does not create an agent conversation.

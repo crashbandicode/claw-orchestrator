@@ -17,6 +17,10 @@ const mockSpawn = vi.fn();
 const mockSpawnSync = vi.fn(() => {
   throw new Error('cursor --list-models must be injected via setCursorModelCatalogForTests in unit tests');
 });
+const mockParameterizedCatalog = vi.fn();
+vi.mock('../cursor-parameterized-catalog.js', () => ({
+  loadCursorParameterizedCatalog: (...args: unknown[]) => mockParameterizedCatalog(...args),
+}));
 vi.mock('node:child_process', () => ({
   spawn: (...args: unknown[]) => mockSpawn(...args),
   spawnSync: (...args: unknown[]) => mockSpawnSync(...args),
@@ -70,6 +74,8 @@ describe('PersistentCursorSession', () => {
     mockSpawn.mockReset();
     mockSpawn.mockReturnValue(mockProc);
     mockSpawnSync.mockClear();
+    mockParameterizedCatalog.mockReset();
+    mockParameterizedCatalog.mockResolvedValue([]);
     setCursorModelCatalogForTests(undefined);
   });
 
@@ -607,6 +613,49 @@ describe('PersistentCursorSession', () => {
       });
       await session.start();
       await expect(session.send('hello', { waitForComplete: true })).rejects.toThrow(/grok-4\.7/);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('launches the exact parameterized Grok 4.7 effort when the legacy listing omits it', async () => {
+      mockParameterizedCatalog.mockResolvedValue([
+        {
+          value: 'grok-4.7',
+          configOptions: [
+            { id: 'context', currentValue: '256k', options: [{ value: '256k' }] },
+            {
+              id: 'reasoning_effort',
+              category: 'thought_level',
+              currentValue: 'high',
+              options: [{ value: 'high' }, { value: 'xhigh' }],
+            },
+            { id: 'fast', currentValue: 'false', options: [{ value: 'false' }, { value: 'true' }] },
+          ],
+        },
+      ]);
+      const session = new PersistentCursorSession({ name: 'test', cwd: '/tmp', model: 'grok-4.7', effort: 'xhigh' });
+      await session.start();
+      const pending = session.send('hello', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await pending;
+      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe(
+        'grok-4.7[context=256k,reasoning_effort=xhigh,fast=false]',
+      );
+      expect(mockParameterizedCatalog).toHaveBeenCalledOnce();
+    });
+
+    it('does not launch inference if the session is stopped during discovery', async () => {
+      let finish!: (value: unknown[]) => void;
+      mockParameterizedCatalog.mockReturnValue(
+        new Promise((resolve) => {
+          finish = resolve;
+        }),
+      );
+      const session = new PersistentCursorSession({ name: 'test', cwd: '/tmp', model: 'grok-4.7', effort: 'xhigh' });
+      await session.start();
+      const pending = session.send('hello', { waitForComplete: true });
+      session.stop();
+      finish([]);
+      await expect(pending).rejects.toThrow(/stopped during model discovery/);
       expect(mockSpawn).not.toHaveBeenCalled();
     });
 

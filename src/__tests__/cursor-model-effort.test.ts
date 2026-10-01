@@ -3,8 +3,81 @@ import {
   parseCursorModelId,
   parseCursorModelList,
   resolveCursorModelEffort,
+  resolveCursorParameterizedModelEffort,
   setCursorModelCatalogForTests,
 } from '../cursor-model-effort.js';
+import type { CursorParameterizedModel } from '../cursor-parameterized-catalog.js';
+
+const PARAMETERIZED: CursorParameterizedModel[] = [
+  {
+    value: 'grok-4.7',
+    name: 'Grok 4.7',
+    configOptions: [
+      {
+        id: 'context',
+        category: 'model_config',
+        type: 'select',
+        currentValue: '256k',
+        options: [{ value: '256k' }, { value: '500k' }],
+      },
+      {
+        id: 'reasoning_effort',
+        category: 'thought_level',
+        type: 'select',
+        currentValue: 'high',
+        options: ['low', 'medium', 'high', 'xhigh'].map((value) => ({ value })),
+      },
+      {
+        id: 'fast',
+        category: 'model_config',
+        type: 'select',
+        currentValue: 'false',
+        options: [{ value: 'false' }, { value: 'true' }],
+      },
+    ],
+  },
+];
+
+describe('Cursor parameterized model effort', () => {
+  it.each(['low', 'medium', 'high', 'xhigh'] as const)('uses the advertised native effort key for %s', (effort) => {
+    expect(resolveCursorParameterizedModelEffort('grok-4.7', effort, PARAMETERIZED)).toBe(
+      `grok-4.7[context=256k,reasoning_effort=${effort},fast=false]`,
+    );
+  });
+  it('preserves explicit context and fast settings while changing effort', () => {
+    expect(
+      resolveCursorParameterizedModelEffort(
+        'grok-4.7[context=500k,reasoning_effort=low,fast=true]',
+        'xhigh',
+        PARAMETERIZED,
+      ),
+    ).toBe('grok-4.7[context=500k,reasoning_effort=xhigh,fast=true]');
+  });
+  it('accepts an effort-qualified native slug without switching model versions', () => {
+    expect(resolveCursorParameterizedModelEffort('grok-4.7-high', 'xhigh', PARAMETERIZED)).toBe(
+      'grok-4.7[context=256k,reasoning_effort=xhigh,fast=false]',
+    );
+    expect(() => resolveCursorParameterizedModelEffort('grok-4.8', 'xhigh', PARAMETERIZED)).toThrow(/no model/);
+    expect(() => resolveCursorParameterizedModelEffort('grok-4.7', 'max', PARAMETERIZED)).toThrow(
+      /Refusing to downgrade/,
+    );
+  });
+  it('does not silently heal unsupported non-effort parameters', () => {
+    expect(() => resolveCursorParameterizedModelEffort('grok-4.7[context=1m]', 'xhigh', PARAMETERIZED)).toThrow(
+      /context=1m/,
+    );
+    expect(() => resolveCursorParameterizedModelEffort('grok-4.7[imaginary=true]', 'xhigh', PARAMETERIZED)).toThrow(
+      /imaginary/,
+    );
+  });
+  it('does not fabricate effort support for a model that has none', () => {
+    expect(() =>
+      resolveCursorParameterizedModelEffort('composer-2.5', 'xhigh', [
+        { value: 'composer-2.5', name: 'Composer', configOptions: [] },
+      ]),
+    ).toThrow(/no unambiguous effort/);
+  });
+});
 
 const CATALOG = [
   'composer-2.5',

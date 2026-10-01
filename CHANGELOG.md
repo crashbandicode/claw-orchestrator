@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.6.0-memento.3] - 2026-10-01
+
+### Fixed
+
+- Discover Cursor models omitted from its legacy text listing through the native ACP parameterized catalog, including Grok 4.7 at low, medium, high, and xhigh.
+- Use each model's advertised effort parameter and retain explicit context and speed settings. Reject unsupported models, parameters, and efforts without substituting a model or silently downgrading.
+- Cache discovery lazily with expiry and close catalog-only processes without opening agent conversations or running inference.
+
 ## [7.6.0-memento.2] - 2026-09-30
 
 ### Fixed
