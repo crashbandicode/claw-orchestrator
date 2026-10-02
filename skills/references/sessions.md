@@ -337,3 +337,5 @@ see [`workflow.md`](./workflow.md).
 
 `SendOptions` also accepts `nodeKind` and `taskKind`, both stamped onto the run
 ledger row. `taskKind` is caller-declared and never inferred from the prompt.
+
+Claude system init and OpenCode’s first session-bearing stream event now also publish native identity immediately. OpenCode identity and resume results use the raw native session ID; a synthetic wrapper handle is never a native identity. Existing MCP connections load this change on their next normal reconnect.

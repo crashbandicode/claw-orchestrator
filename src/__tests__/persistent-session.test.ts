@@ -104,6 +104,28 @@ describe('PersistentClaudeSession', () => {
   });
 
   describe('start()', () => {
+    it('announces native identity during a long first turn, once per id', async () => {
+      const start = session.start();
+      vi.advanceTimersByTime(3000);
+      await start;
+      const identities = vi.fn();
+      session.on(SESSION_EVENT.NATIVE_IDENTITY, identities);
+      let completed = false;
+      const send = session.send('hello', { waitForComplete: true }).then(() => {
+        completed = true;
+      });
+      emitInitEvent(mockProc, '11111111-2222-4333-8444-555555555555');
+      emitInitEvent(mockProc, '11111111-2222-4333-8444-555555555555');
+      expect(identities).toHaveBeenCalledExactlyOnceWith('11111111-2222-4333-8444-555555555555');
+      expect(completed).toBe(false);
+      mockProc.stdout.emit(
+        'data',
+        Buffer.from(JSON.stringify({ type: 'result', subtype: 'success', result: 'hello' }) + '\n'),
+      );
+      await send;
+      session.stop();
+    });
+
     it('spawns CLI and becomes ready on init event', async () => {
       const startPromise = session.start();
       // Simulate init event

@@ -531,7 +531,10 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     switch (type) {
       case 'system':
         if (event.subtype === 'init') {
-          this.sessionId = event.session_id;
+          if (event.session_id && event.session_id !== this.sessionId) {
+            this.sessionId = event.session_id;
+            this.emit(SESSION_EVENT.NATIVE_IDENTITY, this.sessionId);
+          }
           this.stats.startTime = new Date().toISOString();
           const initModel = (event as Record<string, unknown>).model;
           if (typeof initModel === 'string' && initModel) this._engineModel = initModel;
