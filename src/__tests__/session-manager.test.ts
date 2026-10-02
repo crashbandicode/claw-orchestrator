@@ -42,6 +42,7 @@ class MockSession extends EventEmitter implements ISession {
   sendCalls: Array<{ message: string | unknown[]; options?: SessionSendOptions }> = [];
   compactCalls: string[] = [];
   cursorChatId?: string;
+  opencodeSessionId?: string;
   /** Overrides the result event this session resolves with. */
   nextEvent?: Record<string, unknown>;
   /** Test seam for exercising real SessionManager/dispatcher send outcomes. */
@@ -126,6 +127,7 @@ class MockSession extends EventEmitter implements ISession {
       sessionId: this.sessionId,
       codexThreadId: this.codexThreadId,
       cursorChatId: this.cursorChatId,
+      opencodeSessionId: this.opencodeSessionId,
       uptime: 60,
     };
   }
@@ -2640,6 +2642,42 @@ describe('SessionManager', () => {
   });
 
   describe('early native identity', () => {
+    it('ignores the synthetic OpenCode handle and binds the native id during send', async () => {
+      await mgr.startSession({ name: 'early-opencode', cwd: '/tmp', engine: 'opencode' });
+      const mock = lastMock();
+      const runId = sessionRunId(mgr, 'early-opencode');
+      expect(identityBoundEvents(runId)).toHaveLength(0);
+      mock.sendImplementation = async () => {
+        mock.opencodeSessionId = 'ses_native_early';
+        mock.sessionId = 'opencode-live-ses_native_early';
+        mock.emit(SESSION_EVENT.NATIVE_IDENTITY, 'ses_native_early');
+        expect(identityBoundEvents(runId)).toMatchObject([
+          { native_session_id: 'ses_native_early', agent_status: 'running' },
+        ]);
+        return { text: 'hello', event: { type: 'result' } };
+      };
+      const result = await mgr.sendMessage('early-opencode', 'hello');
+      expect(result.sessionId).toBe('ses_native_early');
+      expect(identityBoundEvents(runId)).toHaveLength(1);
+    });
+
+    it('publishes Claude init identity while the turn is still in flight', async () => {
+      await mgr.startSession({ name: 'early-claude', cwd: '/tmp', engine: 'claude' });
+      const mock = lastMock();
+      const runId = sessionRunId(mgr, 'early-claude');
+      mock.sendImplementation = async () => {
+        mock.sessionId = NATIVE_CURSOR_ID;
+        mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
+        expect(identityBoundEvents(runId).at(-1)).toMatchObject({
+          native_session_id: NATIVE_CURSOR_ID,
+          agent_status: 'running',
+        });
+        return { text: 'hello', event: { type: 'result' } };
+      };
+      await mgr.sendMessage('early-claude', 'hello');
+      expect(identityBoundEvents(runId).filter((e) => e.native_session_id === NATIVE_CURSOR_ID)).toHaveLength(1);
+    });
+
     it('binds the exact Cursor chat id before the first turn completes', async () => {
       await mgr.startSession({ name: 'early-native', cwd: '/tmp', engine: 'cursor' });
       const mock = lastMock();

@@ -730,6 +730,25 @@ describe('PersistentOpencodeSession', () => {
   });
 
   describe('session id capture', () => {
+    it('announces identity on the first stream envelope before completion, only once', async () => {
+      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp', permissionMode: 'bypassPermissions' });
+      await session.start();
+      const identities = vi.fn();
+      session.on('native_identity', identities);
+      let completed = false;
+      const send = session.send('hi', { waitForComplete: true }).then(() => {
+        completed = true;
+      });
+      const identity = new Promise<void>((resolve) => session.once('native_identity', () => resolve()));
+      feedLines(mockProc, [envelope('step_start', {}), envelope('step_start', {})]);
+      await identity;
+      expect(completed).toBe(false);
+      expect(identities).toHaveBeenCalledExactlyOnceWith(SID);
+      expect(session.getStats().opencodeSessionId).toBe(SID);
+      closeProc(mockProc, 0);
+      await send;
+    });
+
     it('captures sessionID from event envelope', async () => {
       const session = new PersistentOpencodeSession({
         name: 'test',

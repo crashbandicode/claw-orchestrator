@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.6.0-memento.5] - 2026-10-02
+
+### Fixed
+
+- Publish Claude native identity on system init and OpenCode native identity on its first stream event, so long first turns and resumes can link live transcripts without waiting for completion.
+- Keep OpenCode's synthetic wrapper handle out of native identity events and resume keys; use its captured native session ID instead.
+
 ## [7.6.0-memento.4] - 2026-10-01
 
 ### Fixed

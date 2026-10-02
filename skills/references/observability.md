@@ -261,3 +261,5 @@ clawo runs --parent wf-abc123        # every turn of one workflow run
 
 - [`verification.md`](./verification.md) — what a contract is and how a verdict is produced
 - [`workflow.md`](./workflow.md) — where run records live
+
+Claude system init and OpenCode’s first session-bearing stream event now also publish native identity immediately. OpenCode identity and resume results use the raw native session ID; a synthetic wrapper handle is never a native identity. Existing MCP connections load this change on their next normal reconnect.

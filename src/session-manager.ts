@@ -2810,6 +2810,9 @@ export class SessionManager {
     if (engine === 'cursor') {
       return session.getStats().cursorChatId;
     }
+    if (engine === 'opencode') {
+      return session.getStats().opencodeSessionId;
+    }
     return session.sessionId;
   }
 
@@ -2817,6 +2820,9 @@ export class SessionManager {
     if (engine === 'agy') return isAgyConversationId(id) ? id : undefined;
     if (engine === 'codex') return id && !/^codex-\d+-/.test(id) ? id : undefined;
     if (engine === 'codex-app') return id && !id.startsWith('codex-app-') ? id : undefined;
+    if (engine === 'opencode') {
+      return id && !/^opencode-\d+-/.test(id) ? id.replace(/^opencode-live-/, '') : undefined;
+    }
     if (engine === 'grok') return id && !/^grok-\d+-/.test(id) ? id : undefined;
     return id;
   }

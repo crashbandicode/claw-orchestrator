@@ -356,6 +356,7 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
     if (sid && !this.opencodeSessionId) this.opencodeSessionId = sid;
     if (sid && !this.sessionId?.startsWith('opencode-live-')) {
       this.sessionId = `opencode-live-${sid}`;
+      this.emit(SESSION_EVENT.NATIVE_IDENTITY, sid);
     }
 
     const part = event.part as Record<string, unknown> | undefined;
