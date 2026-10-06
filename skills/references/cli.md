@@ -97,7 +97,14 @@ clawo session-start [name] [options]
 | `--betas <headers>`             | Beta headers (comma-separated)                                                              |
 | `--enable-agent-teams`          | Enable agent teams                                                                          |
 | `--enable-auto-mode`            | Enable auto permission mode                                                                 |
-| `--resume-session-id <id>`      | Resume an existing session by ID                                                            |
+| `--resume-session-id <id>`      | Resume an existing native session by id. This is not a `host::name` handle.                 |
+| `--host <alias>`                | Configured execution-host alias. See [remote-sessions.md](./remote-sessions.md).            |
+| `--operation-id <id>`           | Stable broker operation id                                                                  |
+| `--wait-timeout <ms>`           | Controller wait. Distinct from the native execution timeout.                                |
+| `--parent-machine-id <uuid>`    | Origin Memento machine UUID                                                                 |
+| `--parent-session-id <id>`      | Parent native session id                                                                    |
+| `--parent-tool-id <id>`         | `codex`, `claude_code`, `cursor`, or `opencode`                                             |
+| `--origin-host <name>`          | Source host display name                                                                    |
 | `--base-url <url>`              | Custom API endpoint (for proxy)                                                             |
 | `--add-dir <dirs>`              | Comma-separated additional working directories                                              |
 | `--custom-engine <preset>`      | With `-e custom`: the id of a bundled engine preset (see [`clawo engines`](#clawo-engines)) |
@@ -115,7 +122,10 @@ clawo session-send <name> <message> [options]
 | `--effort <level>`   | Override effort for this message |
 | `--plan`             | Enable plan mode                 |
 | `-s, --stream`       | Collect streaming chunks         |
-| `-t, --timeout <ms>` | Timeout (default 300000)         |
+| `-t, --timeout <ms>` | Native execution timeout (default 300000) |
+| `--host <alias>`     | Configured execution-host alias |
+| `--operation-id <id>` | Stable broker operation id |
+| `--wait-timeout <ms>` | Controller wait, distinct from `--timeout` |
 
 ### session-stop
 
@@ -189,6 +199,18 @@ clawo rules-create <name> [--description <desc>] [--content <text>] [--paths <gl
 clawo session-team-list <name>
 clawo session-team-send <name> <teammate> <message>
 ```
+
+## Remote broker
+
+```bash
+clawo remote-broker [--config <path>] [--ttl-minutes <n>] [--max-sessions <n>]
+clawo thread-register <name> --native-session-id <id> [--host <alias>] [--parent-tool-id <id>] [--operation-id <id>]
+clawo thread-mailbox-send <name> <message> --from <identity> [--host <alias>] [--message-id <id>] [--operation-id <id>]
+clawo thread-mailbox-wait <name> [--host <alias>] [--wait-timeout <ms>] [--operation-id <id>]
+clawo thread-mailbox-ack <messageId> [--host <alias>] [--operation-id <id>]
+```
+
+`remote-broker` is the execution-host process. The other commands are controller calls. Config, qualified names, and the operation-id rules are in [remote-sessions.md](./remote-sessions.md). With remote sockets disabled, `thread-*` commands exit because a manual mailbox requires the broker. `session-*` commands then keep using the local HTTP API.
 
 ## Tools Without a CLI Command
 

@@ -54,10 +54,10 @@ interface PersistedSession {
   lastActivity: number;
 }
 
-function loadPersistedSessions(): Map<string, PersistedSession> {
+function loadPersistedSessions(file = PERSIST_FILE): Map<string, PersistedSession> {
   try {
-    if (!fs.existsSync(PERSIST_FILE)) return new Map();
-    const raw = fs.readFileSync(PERSIST_FILE, 'utf8');
+    if (!fs.existsSync(file)) return new Map();
+    const raw = fs.readFileSync(file, 'utf8');
     const arr: PersistedSession[] = JSON.parse(raw);
     const now = Date.now();
     // Filter out entries older than disk TTL
@@ -69,24 +69,28 @@ function loadPersistedSessions(): Map<string, PersistedSession> {
 }
 
 // Atomic write: write to .tmp then rename to avoid corrupt reads on crash
-function savePersistedSessions(sessions: Map<string, PersistedSession>, logger?: Logger): void {
+function savePersistedSessions(sessions: Map<string, PersistedSession>, logger?: Logger, file = PERSIST_FILE): void {
   try {
-    fs.mkdirSync(PERSIST_DIR, { recursive: true });
+    fs.mkdirSync(path.dirname(file), { recursive: true });
     const arr = Array.from(sessions.values());
-    const tmp = PERSIST_FILE + '.tmp';
+    const tmp = file + '.tmp';
     fs.writeFileSync(tmp, JSON.stringify(arr, null, 2));
-    fs.renameSync(tmp, PERSIST_FILE);
+    fs.renameSync(tmp, file);
   } catch (err) {
     (logger || createConsoleLogger('SessionManager')).warn('Failed to persist sessions:', (err as Error).message);
   }
 }
 
 // Async version for hot-path (sendMessage, TTL cleanup)
-function savePersistedSessionsAsync(sessions: Map<string, PersistedSession>, logger?: Logger): void {
+function savePersistedSessionsAsync(
+  sessions: Map<string, PersistedSession>,
+  logger?: Logger,
+  file = PERSIST_FILE,
+): void {
   const log = logger || createConsoleLogger('SessionManager');
   const arr = Array.from(sessions.values());
-  const tmp = PERSIST_FILE + '.tmp';
-  fs.mkdir(PERSIST_DIR, { recursive: true }, (mkdirErr) => {
+  const tmp = file + '.tmp';
+  fs.mkdir(path.dirname(file), { recursive: true }, (mkdirErr) => {
     if (mkdirErr) {
       log.error('Failed to create persist dir:', mkdirErr.message);
       return;
@@ -96,7 +100,7 @@ function savePersistedSessionsAsync(sessions: Map<string, PersistedSession>, log
         log.error('Failed to write session file:', writeErr.message);
         return;
       }
-      fs.rename(tmp, PERSIST_FILE, (renameErr) => {
+      fs.rename(tmp, file, (renameErr) => {
         if (renameErr) {
           log.error('Failed to rename session file:', renameErr.message);
           // Clean up orphan tmp file
@@ -193,6 +197,8 @@ import {
   type RuleInfo,
   type StreamEvent,
   type ISession,
+  PARENT_TOOL_IDS,
+  type ParentToolId,
   type OrchestrationAgentContext,
   type OrchestrationAgentStatus,
   type OrchestrationRunStatus,
@@ -207,6 +213,7 @@ import {
   overrideModelPricing,
   ENGINE_BINARY_NAMES,
 } from './types.js';
+import { parentSessionIdFromDelegateMarker } from './remote/delegate-marker.js';
 import { resolveAlias, isClaudeModel, lookupModel } from './models.js';
 import { isAgyConversationId } from './agy-conversation.js';
 import { Council } from './council.js';
@@ -578,6 +585,8 @@ export class SessionManager {
    * a fan-out's agents — passed it, and the cap limited nothing.
    */
   private _startsInFlight = 0;
+  /** Remote operations accepted but not yet finished. Idle TTL must not reap them. */
+  private _sessionHolds = new Map<string, number>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private pluginConfig: PluginConfig;
   private persistedSessions: Map<string, PersistedSession>;
@@ -592,13 +601,23 @@ export class SessionManager {
   /** cwd → detected language, so the manifest probe runs once per directory. */
   private _repoLangCache = new Map<string, string | undefined>();
   private logger: Logger;
+  private readonly _persistFile: string;
+  private readonly _pidFile: string;
   private _ultraappManager: UltraappManager | null = null;
   private _ultraappRouter: UltraappRouter | null = null;
   private _ultraappRuntimeMode: 'host' | 'docker' = 'host';
   private _orchestrationEvents: OrchestrationEventWriter;
   private _startedOrchestrationRuns = new Map<string, OrchestrationAgentContext>();
 
-  constructor(config?: Partial<PluginConfig>, logger?: Logger) {
+  constructor(config?: Partial<PluginConfig> & { stateDirectory?: string }, logger?: Logger) {
+    if (config?.stateDirectory !== undefined) {
+      if (!path.isAbsolute(config.stateDirectory)) throw new Error('stateDirectory must be an absolute path');
+      this._persistFile = path.join(config.stateDirectory, 'claude-sessions.json');
+      this._pidFile = path.join(config.stateDirectory, 'session-pids.json');
+    } else {
+      this._persistFile = PERSIST_FILE;
+      this._pidFile = SessionManager.PID_FILE;
+    }
     const maxConcurrentSessions =
       config?.maxConcurrentSessions ?? Number(process.env.CLAWO_MAX_CONCURRENT_SESSIONS?.trim() || '5');
     if (!Number.isSafeInteger(maxConcurrentSessions) || maxConcurrentSessions < 0) {
@@ -623,12 +642,12 @@ export class SessionManager {
     }
 
     // Load persisted session registry from disk
-    this.persistedSessions = loadPersistedSessions();
+    this.persistedSessions = loadPersistedSessions(this._persistFile);
     // Clean up orphaned child processes from a previous unclean exit
     this._cleanupOrphanedPids();
     // Debounced async writer — at most one write per 5 seconds on hot paths
     this._debouncedSave = makeDebounced(
-      () => savePersistedSessionsAsync(this.persistedSessions, this.logger),
+      () => savePersistedSessionsAsync(this.persistedSessions, this.logger, this._persistFile),
       DEBOUNCED_SAVE_MS,
     );
 
@@ -878,7 +897,8 @@ export class SessionManager {
     const link = new Promise<void>((resolve) => {
       releaseChain = resolve;
     });
-    managed.sendChain = prior.then(() => link).catch(() => link);
+    const tail = prior.then(() => link).catch(() => link);
+    managed.sendChain = tail;
     try {
       await prior;
     } catch {
@@ -891,11 +911,17 @@ export class SessionManager {
     // calling send() on a detached/stopped session (TOCTOU on the sessions map).
     if (this.sessions.get(name) !== managed) {
       releaseChain();
-      if (managed.sendChain === link) managed.sendChain = undefined;
+      if (managed.sendChain === tail) managed.sendChain = undefined;
       throw new Error(`Session '${name}' was stopped while a prior turn was in flight`);
+    }
+    if (managed.session.isBusy) {
+      releaseChain();
+      if (managed.sendChain === tail) managed.sendChain = undefined;
+      throw new Error(`Session '${name}' has a native turn still in progress`);
     }
 
     try {
+      this._noteDelegateMarker(managed, message);
       managed.lastActivity = Date.now();
 
       // Spend cap, enforced here rather than per-engine. Claude Code also gets
@@ -1023,7 +1049,7 @@ export class SessionManager {
     } finally {
       releaseChain();
       // If this was the tail of the chain, clear it so memory doesn't grow.
-      if (managed.sendChain === link) managed.sendChain = undefined;
+      if (managed.sendChain === tail) managed.sendChain = undefined;
     }
   }
 
@@ -1485,7 +1511,7 @@ export class SessionManager {
       // should still allow /autoloop/<id>/resume to reattach the Planner's
       // Claude conversation) pass keepPersisted: true.
       this.persistedSessions.delete(name);
-      savePersistedSessions(this.persistedSessions, this.logger);
+      savePersistedSessions(this.persistedSessions, this.logger, this._persistFile);
     }
   }
 
@@ -1952,7 +1978,7 @@ export class SessionManager {
       this._proxyPort = null;
     }
     // Persist final state (TTL-expired sessions already removed by cleanup)
-    savePersistedSessions(this.persistedSessions, this.logger);
+    savePersistedSessions(this.persistedSessions, this.logger, this._persistFile);
   }
 
   // ─── Codex /goal helpers (codex-app engine only) ─────────────────────
@@ -2493,7 +2519,7 @@ export class SessionManager {
 
   private _savePids(): void {
     try {
-      const dir = path.dirname(SessionManager.PID_FILE);
+      const dir = path.dirname(this._pidFile);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       // The PID file is host-shared: any SessionManager (gateway, dashboard,
       // standalone test runner) writes here. We MUST NOT overwrite entries
@@ -2502,7 +2528,7 @@ export class SessionManager {
       // they're orphans and kill them. Read-merge-write keyed by ownerPid.
       let existing: Record<string, unknown> = {};
       try {
-        existing = JSON.parse(fs.readFileSync(SessionManager.PID_FILE, 'utf8')) as Record<string, unknown>;
+        existing = JSON.parse(fs.readFileSync(this._pidFile, 'utf8')) as Record<string, unknown>;
       } catch {
         /* missing or malformed — start fresh */
       }
@@ -2534,7 +2560,7 @@ export class SessionManager {
       for (const [name, pid] of this._activePids) {
         merged[name] = { pid, ownerPid: process.pid, since: now };
       }
-      fs.writeFileSync(SessionManager.PID_FILE, JSON.stringify(merged));
+      fs.writeFileSync(this._pidFile, JSON.stringify(merged));
     } catch {
       /* best effort */
     }
@@ -2572,8 +2598,8 @@ export class SessionManager {
 
   private _cleanupOrphanedPids(): void {
     try {
-      if (!fs.existsSync(SessionManager.PID_FILE)) return;
-      const data = JSON.parse(fs.readFileSync(SessionManager.PID_FILE, 'utf8')) as Record<string, unknown>;
+      if (!fs.existsSync(this._pidFile)) return;
+      const data = JSON.parse(fs.readFileSync(this._pidFile, 'utf8')) as Record<string, unknown>;
       for (const [name, raw] of Object.entries(data)) {
         // Resolve entry shape: legacy = number; current = { pid, ownerPid, since }.
         let pid: number;
@@ -2683,6 +2709,15 @@ export class SessionManager {
       engine: managed.config.engine,
       orchestrationRunId: managed.orchestration.runId,
       orchestrationAgentKey: managed.orchestration.agentKey,
+      localName: name,
+      ...(managed.orchestration.parentMachineId ? { parentMachineId: managed.orchestration.parentMachineId } : {}),
+      ...(managed.orchestration.parentSessionId ? { parentSessionId: managed.orchestration.parentSessionId } : {}),
+      ...(managed.orchestration.parentToolId ? { parentToolId: managed.orchestration.parentToolId } : {}),
+      ...(managed.orchestration.originHost ? { originHost: managed.orchestration.originHost } : {}),
+      ...(managed.orchestration.executionHost ? { executionHost: managed.orchestration.executionHost } : {}),
+      ...(managed.orchestration.remoteSessionHandle
+        ? { remoteSessionHandle: managed.orchestration.remoteSessionHandle }
+        : {}),
     };
     if (managed.config.maxBudgetUsd) {
       info.budgetUsd = managed.config.maxBudgetUsd;
@@ -2698,6 +2733,12 @@ export class SessionManager {
   ): OrchestrationAgentContext {
     const supplied = config.orchestration;
     const runId = supplied?.runId || `session-${randomUUID().slice(0, 12)}`;
+    const parentToolId = this._knownParentTool(config.parentToolId) ?? this._knownParentTool(supplied?.parentToolId);
+    const parentMachineId = config.parentMachineId || supplied?.parentMachineId;
+    const parentSessionId = config.parentSessionId || supplied?.parentSessionId;
+    const originHost = config.originHost || supplied?.originHost;
+    const executionHost = config.executionHost || supplied?.executionHost;
+    const remoteSessionHandle = config.remoteSessionHandle || supplied?.remoteSessionHandle;
     return {
       runId,
       runKind: supplied?.runKind || 'session',
@@ -2708,7 +2749,29 @@ export class SessionManager {
       model: config.resolvedModel || config.model,
       effort: config.effort,
       cwd: config.cwd,
+      ...(parentMachineId ? { parentMachineId } : {}),
+      ...(parentSessionId ? { parentSessionId } : {}),
+      ...(parentToolId ? { parentToolId } : {}),
+      ...(originHost ? { originHost } : {}),
+      ...(executionHost ? { executionHost } : {}),
+      ...(remoteSessionHandle ? { remoteSessionHandle } : {}),
     };
+  }
+
+  private _knownParentTool(value: ParentToolId | undefined): ParentToolId | undefined {
+    if (!value) return undefined;
+    return (PARENT_TOOL_IDS as readonly string[]).includes(value) ? value : undefined;
+  }
+
+  private _noteDelegateMarker(managed: ManagedSession, message: string): void {
+    if (managed.orchestration.parentSessionId) return;
+    const parentSessionId = parentSessionIdFromDelegateMarker(message);
+    if (!parentSessionId) return;
+    managed.orchestration = { ...managed.orchestration, parentSessionId };
+    this._orchestrationEvents.emit('agent.status', managed.orchestration, {
+      nativeSessionId: managed.orchestrationBoundNativeId,
+      agentStatus: managed.orchestrationLastStatus ?? 'running',
+    });
   }
 
   private _ensureOrchestrationRunStarted(context: OrchestrationAgentContext): void {
@@ -4031,7 +4094,7 @@ export class SessionManager {
       this.persistedSessions.delete(`autoloop-${runId}-planner`);
       this.persistedSessions.delete(`autoloop-${runId}-coder`);
       this.persistedSessions.delete(`autoloop-${runId}-reviewer`);
-      savePersistedSessions(this.persistedSessions, this.logger);
+      savePersistedSessions(this.persistedSessions, this.logger, this._persistFile);
     }
     // No registry to scrub: the run record IS the registry, and removing it is
     // the delete. The ledger directory under tasks/<runId>/ is deliberately left
@@ -4053,11 +4116,32 @@ export class SessionManager {
     return handle ? { runner: handle.runner, dispatcher: handle.dispatcher } : undefined;
   }
 
+  holdSession(name: string): void {
+    this._sessionHolds.set(name, (this._sessionHolds.get(name) ?? 0) + 1);
+  }
+
+  releaseSessionHold(name: string): void {
+    const next = (this._sessionHolds.get(name) ?? 0) - 1;
+    if (next <= 0) this._sessionHolds.delete(name);
+    else this._sessionHolds.set(name, next);
+  }
+
+  hasLiveSession(name: string): boolean {
+    return this.sessions.has(name);
+  }
+
+  isSessionBusy(name: string): boolean {
+    return this.sessions.get(name)?.session.isBusy ?? false;
+  }
+
   private _cleanupIdleSessions(): void {
     const ttlMs = this.pluginConfig.sessionTtlMinutes * 60_000;
     const now = Date.now();
     let pidsChanged = false;
     for (const [name, managed] of this.sessions) {
+      if ((this._sessionHolds.get(name) ?? 0) > 0) continue;
+      if (managed.sendChain) continue;
+      if (managed.session.isBusy) continue;
       if (now - managed.lastActivity > ttlMs) {
         this.logger.info(`Cleaning up idle in-memory session: ${name}`);
         try {
@@ -4089,6 +4173,6 @@ export class SessionManager {
         pruned = true;
       }
     }
-    if (pruned) savePersistedSessionsAsync(this.persistedSessions);
+    if (pruned) savePersistedSessionsAsync(this.persistedSessions, this.logger, this._persistFile);
   }
 }

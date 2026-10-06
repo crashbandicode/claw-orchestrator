@@ -43,6 +43,12 @@ export interface OrchestrationLifecycleEvent {
   cwd?: string;
   native_session_id?: string;
   agent_status?: OrchestrationAgentStatus;
+  parent_machine_id?: string;
+  parent_session_id?: string;
+  parent_tool_id?: OrchestrationAgentContext['parentToolId'];
+  origin_host?: string;
+  execution_host?: string;
+  remote_session_handle?: string;
 }
 
 export interface OrchestrationEventWriterOptions {
@@ -157,6 +163,12 @@ export class OrchestrationEventWriter {
       cwd: boundedText(context.cwd, 4096),
       ...(values.nativeSessionId ? { native_session_id: boundedIdentity(values.nativeSessionId, 512) } : {}),
       ...(values.agentStatus ? { agent_status: values.agentStatus } : {}),
+      ...(context.parentMachineId ? { parent_machine_id: boundedIdentity(context.parentMachineId, 128) } : {}),
+      ...(context.parentSessionId ? { parent_session_id: boundedIdentity(context.parentSessionId, 512) } : {}),
+      ...(context.parentToolId ? { parent_tool_id: context.parentToolId } : {}),
+      ...(context.originHost ? { origin_host: boundedText(context.originHost, 256) } : {}),
+      ...(context.executionHost ? { execution_host: boundedText(context.executionHost, 256) } : {}),
+      ...(context.remoteSessionHandle ? { remote_session_handle: boundedText(context.remoteSessionHandle, 512) } : {}),
     };
     try {
       this.appendLine(this.outboxFile, `${JSON.stringify(record)}\n`);

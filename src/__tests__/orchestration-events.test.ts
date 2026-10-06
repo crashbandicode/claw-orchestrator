@@ -91,4 +91,41 @@ describe('OrchestrationEventWriter', () => {
     expect(event.native_session_id.length).toBeLessThanOrEqual(512);
     expect(event.run_id).not.toBe(event.agent_key);
   });
+
+  it('emits optional remote lineage fields and omits them when unset', () => {
+    const lines: string[] = [];
+    const writer = new OrchestrationEventWriter({
+      outboxFile: 'events.jsonl',
+      installationId: 'install-1',
+      uuid: () => 'event-remote',
+      appendLine: (_file, line) => lines.push(line),
+    });
+    writer.emit('agent.declared', context, { agentStatus: 'declared' });
+    writer.emit(
+      'agent.declared',
+      {
+        ...context,
+        parentMachineId: '11111111-1111-4111-8111-111111111111',
+        parentSessionId: 'parent-native',
+        parentToolId: 'cursor',
+        originHost: 'yoga',
+        executionHost: 'studio',
+        remoteSessionHandle: 'studio::worker',
+      },
+      { nativeSessionId: 'native-thread-1', agentStatus: 'declared' },
+    );
+    const plain = JSON.parse(lines[0]);
+    const remote = JSON.parse(lines[1]);
+    expect(plain.parent_session_id).toBeUndefined();
+    expect(plain.remote_session_handle).toBeUndefined();
+    expect(remote).toMatchObject({
+      parent_machine_id: '11111111-1111-4111-8111-111111111111',
+      parent_session_id: 'parent-native',
+      parent_tool_id: 'cursor',
+      origin_host: 'yoga',
+      execution_host: 'studio',
+      remote_session_handle: 'studio::worker',
+      native_session_id: 'native-thread-1',
+    });
+  });
 });

@@ -164,6 +164,28 @@ describe('plugin tool registration', () => {
     expect(properties.ignoreUserConfig?.type).toBe('boolean');
   });
 
+  it('declares remote host routing and parent lineage on session_start', () => {
+    const properties = (byName.get('session_start')!.parameters.properties ?? {}) as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(properties.host?.type).toBe('string');
+    expect(properties.operationId?.type).toBe('string');
+    expect(properties.parentMachineId?.type).toBe('string');
+    expect(properties.parentSessionId?.type).toBe('string');
+    expect(properties.parentToolId?.enum).toEqual(['codex', 'claude_code', 'cursor', 'opencode']);
+    expect(properties.originHost?.type).toBe('string');
+    for (const name of [
+      'thread_register',
+      'thread_mailbox_send',
+      'thread_mailbox_read',
+      'thread_mailbox_ack',
+      'thread_mailbox_wait',
+    ]) {
+      expect(byName.has(name), `missing remote tool: ${name}`).toBe(true);
+    }
+  });
+
   it('exposes sandboxMode on session_start for cross-engine read-only sessions', () => {
     const tool = byName.get('session_start');
     expect(tool).toBeDefined();

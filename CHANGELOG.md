@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.7.0-memento.1] - 2026-10-05
+
+### Added
+
+- Launch and manage coding sessions on configured hosts through persistent Unix sockets forwarded over SSH. Execution-host brokers keep agents running when a controller disconnects.
+- Exchange durable messages with remote agents and cooperative mailboxes for manually opened threads, with explicit read acknowledgments.
+- Publish origin and execution identity for Memento's cross-machine delegate links and Remote subagent indicator.
+
+### Fixed
+
+- Preserve active native turns across caller wait timeouts and prevent idle cleanup from terminating busy sessions.
+- Deduplicate remote operations across reconnects and report interrupted broker operations without silently replaying inference.
+
 ## [7.6.0-memento.5] - 2026-10-02
 
 ### Fixed

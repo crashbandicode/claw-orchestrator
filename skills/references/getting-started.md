@@ -133,7 +133,8 @@ For MCP deployments, set `CLAWO_MAX_CONCURRENT_SESSIONS` in the server environme
 - [Multi-Engine](./multi-engine.md) — one interface over Claude Code, Codex, Antigravity, Grok Build, OpenCode and custom CLIs
 - [Council](./council.md) — multi-agent collaboration with consensus voting
 - [Ultraplan & Ultrareview](./ultra.md) — deep planning and fleet code review
-- [Tools Reference](./tools.md) — complete tool API reference (78 tools)
+- [Tools Reference](./tools.md) — complete tool API reference (83 tools)
+- [Remote socket sessions](./remote-sessions.md) — owner-only Unix broker and SSH forwards
 - [CLI Reference](./cli.md) — command-line interface
 - [MCP Server](./mcp.md) — expose the tools to any MCP host
 - [ACP Agent](./acp.md) — run the orchestrator as an Agent Client Protocol agent
