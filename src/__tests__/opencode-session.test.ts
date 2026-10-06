@@ -10,6 +10,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
+import type { SessionConfig } from '../types.js';
 
 // Mock child_process before importing the session
 const mockSpawn = vi.fn();
@@ -183,6 +184,67 @@ describe('PersistentOpencodeSession', () => {
   });
 
   describe('spawn flags', () => {
+    it.each<{ label: string; config: Partial<SessionConfig>; auto: boolean }>([
+      { label: 'auto mode', config: { permissionMode: 'auto' }, auto: true },
+      { label: 'bypass mode', config: { permissionMode: 'bypassPermissions' }, auto: true },
+      {
+        label: 'legacy skip setting',
+        config: { permissionMode: 'acceptEdits', dangerouslySkipPermissions: true },
+        auto: true,
+      },
+      {
+        label: 'explicit legacy skip overrides manual',
+        config: { permissionMode: 'manual', dangerouslySkipPermissions: true },
+        auto: true,
+      },
+      {
+        label: 'plan overrides legacy skip',
+        config: { permissionMode: 'plan', dangerouslySkipPermissions: true },
+        auto: false,
+      },
+      { label: 'explicit auto setting', config: { permissionMode: 'acceptEdits', enableAutoMode: true }, auto: true },
+      { label: 'inherited bypass default', config: {}, auto: true },
+      { label: 'manual mode', config: { permissionMode: 'manual' }, auto: false },
+      { label: 'legacy manual alias', config: { permissionMode: 'default' }, auto: false },
+      { label: 'edit approval only', config: { permissionMode: 'acceptEdits' }, auto: false },
+      { label: 'dontAsk mode', config: { permissionMode: 'dontAsk' }, auto: false },
+      {
+        label: 'plan mode overrides auto setting',
+        config: { permissionMode: 'plan', enableAutoMode: true },
+        auto: false,
+      },
+      {
+        label: 'read-only overrides bypass',
+        config: { permissionMode: 'bypassPermissions', dangerouslySkipPermissions: true, sandboxMode: 'read-only' },
+        auto: false,
+      },
+      {
+        label: 'read-only overrides both auto settings',
+        config: { permissionMode: 'auto', enableAutoMode: true, sandboxMode: 'read-only' },
+        auto: false,
+      },
+    ])('preserves permission intent for $label', async ({ config, auto }) => {
+      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp', ...config });
+      await session.start();
+      const pending = session.send('hello', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await pending;
+
+      const args = mockSpawn.mock.calls[0][1] as string[];
+      expect(args.includes('--auto')).toBe(auto);
+      expect(args).not.toContain('--yolo');
+      expect(args).not.toContain('--dangerously-skip-permissions');
+      if (config.sandboxMode === 'read-only') {
+        expect(args).toContain('clawo-readonly');
+        const { env } = mockSpawn.mock.calls[0][2] as { env: Record<string, string> };
+        expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT).agent['clawo-readonly'].permission).toMatchObject({
+          edit: 'deny',
+          bash: 'deny',
+          task: 'deny',
+        });
+      }
+    });
+
     it('uses run --format json', async () => {
       const session = new PersistentOpencodeSession({
         name: 'test',
@@ -200,8 +262,7 @@ describe('PersistentOpencodeSession', () => {
       expect(spawnArgs[1]).toBe('hello');
       expect(spawnArgs).toContain('--format');
       expect(spawnArgs).toContain('json');
-      // 1.1.40 does not have / does not need --dangerously-skip-permissions.
-      // Adding it would trigger yargs strict mode and print the help screen.
+      // Use the documented --auto flag; it keeps explicit denials intact.
       expect(spawnArgs).not.toContain('--dangerously-skip-permissions');
       // Omitted session effort must not invent a variant (opencode 1.18.32 uses
       // the provider default when --variant is absent).
@@ -213,7 +274,7 @@ describe('PersistentOpencodeSession', () => {
     // 1.18.18: without the flag turn 2 answers "you never asked me to remember
     // anything"; with it, turn 2 recalls turn 1.
     it('passes --session with the harvested id on the second turn', async () => {
-      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp' });
+      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp', permissionMode: 'auto' });
       await session.start();
 
       const p1 = session.send('first', { waitForComplete: true });
@@ -235,6 +296,8 @@ describe('PersistentOpencodeSession', () => {
       expect(args1).not.toContain('--session');
       expect(args2).toContain('--session');
       expect(args2[args2.indexOf('--session') + 1]).toBe('ses_abc123');
+      expect(args1).toContain('--auto');
+      expect(args2).toContain('--auto');
       // --continue means "the last session on this machine" and would collide
       // across concurrent sessions, so it must not be used.
       expect(args2).not.toContain('--continue');

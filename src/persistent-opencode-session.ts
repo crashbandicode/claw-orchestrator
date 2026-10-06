@@ -34,11 +34,10 @@
  * against opencode 1.18.32 (`opencode run --help`: "model variant
  * (provider-specific reasoning effort, e.g., high, max, minimal)").
  *
- * Permissions: on opencode 1.17.15's `run`, a tool that would prompt for a
- * permission is auto-REJECTED in non-interactive mode (it does not hang), so a
- * write-enabled session needs no skip flag. (`--dangerously-skip-permissions`,
- * `--auto`, and `--yolo` do exist as of opencode 1.4.0 if an allow-all run is
- * ever wanted — verified against 1.17.15.)
+ * Permissions: non-interactive `run` rejects permission requests unless
+ * `--auto` is passed. Map explicit auto/bypass approval to that flag on every
+ * turn, including resumes. OpenCode still enforces explicit deny rules.
+ * Read-only and plan requests never enable automatic approval.
  */
 
 import { spawn } from 'node:child_process';
@@ -185,6 +184,16 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
     if (this.opencodeSessionId) args.push('--session', this.opencodeSessionId);
 
     const readOnly = this.options.sandboxMode === 'read-only';
+    if (
+      !readOnly &&
+      this.options.permissionMode !== 'plan' &&
+      (this.options.permissionMode === 'bypassPermissions' ||
+        this.options.permissionMode === 'auto' ||
+        this.options.dangerouslySkipPermissions ||
+        this.options.enableAutoMode)
+    ) {
+      args.push('--auto');
+    }
     if (readOnly) {
       // NOT opencode's built-in `plan` agent: that is a user-overridable preset
       // whose rules start with {"permission":"*","action":"allow"} and deny
