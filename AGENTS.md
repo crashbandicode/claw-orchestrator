@@ -16,7 +16,8 @@ support. Key source files:
 
 | File                                 | Purpose                                                                                                                                                                                                                                      |
 | ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `src/index.ts`                       | Plugin entry — registers all 78 canonical tools                                                                                                                                                                                              |
+| `src/index.ts`                       | Plugin entry — registers all 83 canonical tools                                                                                                                                                                                              |
+| `src/remote/`                        | Owner-only Unix broker, SSH stream forward, operation store, and manual-thread mailbox                                                                                                                                                      |
 | `src/session-manager.ts`             | Core orchestrator — session lifecycle, council, ultraplan/ultrareview                                                                                                                                                                        |
 | `src/base-oneshot-session.ts`        | Abstract base class for one-shot (process-per-send) engines                                                                                                                                                                                  |
 | `src/persistent-session.ts`          | Claude Code CLI wrapper (spawn, JSON protocol, stream parsing)                                                                                                                                                                               |
@@ -113,6 +114,7 @@ When you change functionality, update the corresponding reference file:
 | Tool parameters or behavior    | `skills/references/tools.md`                                   |
 | Engine invocation / flags      | `skills/references/multi-engine.md`                            |
 | Session lifecycle              | `skills/references/sessions.md`                                |
+| Remote socket sessions         | `skills/references/remote-sessions.md`                             |
 | ACP agent behaviour            | `skills/references/acp.md`                                     |
 | Council protocol               | `skills/references/council.md`                                 |
 | Inbox messaging                | `skills/references/inbox.md`                                   |

@@ -37,6 +37,8 @@ Key options:
 | `worktree`           | Run in isolated git worktree                                                                                                                                                                               |
 | `appendSystemPrompt` | Append custom instructions to the system prompt. Claude Code and Grok take it natively; Codex, Antigravity and OpenCode have no such flag and receive it at the top of the first message of a conversation |
 
+Remote execution, qualified `host::localName` handles, and operation rejoin are in [remote-sessions.md](./remote-sessions.md). A missing or disabled remote config leaves this lifecycle unchanged. `resumeSessionId` remains the native engine id.
+
 ### Sending Messages
 
 ```typescript

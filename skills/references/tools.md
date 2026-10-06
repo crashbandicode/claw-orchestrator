@@ -1,6 +1,6 @@
 # Tools Reference
 
-All 78 tools are registered as OpenClaw plugin tools and exposed over MCP by `clawo-mcp` (see [mcp.md](./mcp.md)). The embedded HTTP server covers a subset of them.
+All 83 tools are registered as OpenClaw plugin tools and exposed over MCP by `clawo-mcp` (see [mcp.md](./mcp.md)). The embedded HTTP server covers a subset of them. Remote execution is documented in [remote-sessions.md](./remote-sessions.md).
 
 ## Session Lifecycle (6)
 
@@ -57,6 +57,13 @@ Start a persistent coding session with full CLI flag support.
 | `otelLogRawApiBodies`                | boolean                                                                                       | OpenTelemetry: log raw API request/response bodies (sets `OTEL_LOG_RAW_API_BODIES=1`); debug only                                                                                                                                                                                                                                                                                                                                                                                      |
 | `bedrockServiceTier`                 | `'default'` \| `'flex'` \| `'priority'`                                                       | AWS Bedrock service tier (sets `ANTHROPIC_BEDROCK_SERVICE_TIER`); only effective when routing through Bedrock                                                                                                                                                                                                                                                                                                                                                                          |
 | `effort`                             | `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'` \| `'ultra'` \| `'auto'`            | Reasoning effort level. Engines do not share one ladder: Claude Code takes up to `max`, Codex adds `ultra`, Grok stops at `xhigh`, Antigravity at `high`, and OpenCode forwards the level to its provider unvalidated. A level above an engine's ceiling clamps rather than being dropped. `high` and above trigger the `ultrathink` prefix on Claude user messages.                                                                                                                   |
+| `host`                               | string                                                                                        | Configured execution-host alias. Omit for this machine. Unknown aliases error and are never run locally. See [remote-sessions.md](./remote-sessions.md).                                                                                                                                                                                                                                                                                                                             |
+| `operationId`                        | string                                                                                        | Stable client operation id. The same id and payload rejoin; a changed payload is rejected.                                                                                                                                                                                                                                                                                                                                                                                             |
+| `waitTimeout`                        | number                                                                                        | Controller wait in milliseconds after the broker accepts. Distinct from `timeout`.                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `parentMachineId`                    | string                                                                                        | Origin Memento machine UUID. Configured, not inferred.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `parentSessionId`                    | string                                                                                        | Exact parent native thread id. A first-line `MEMENTO-DELEGATE-FROM` marker can fill this later.                                                                                                                                                                                                                                                                                                                                                                                        |
+| `parentToolId`                       | `'codex'` \| `'claude_code'` \| `'cursor'` \| `'opencode'`                                    | Parent transcript provider.                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `originHost`                         | string                                                                                        | Source host display name from administrator config.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 ### `session_send`
 
@@ -68,8 +75,11 @@ Send a message and get the response.
 | `message` | string  | yes      | Message to send                    |
 | `effort`  | string  |          | Override effort for this message   |
 | `plan`    | boolean |          | Enable plan mode                   |
-| `timeout` | number  |          | Timeout in ms (default 300000)     |
-| `stream`  | boolean |          | Collect streaming chunks in result |
+| `timeout` | number  |          | Native execution timeout in ms (default 300000). Distinct from `waitTimeout`. |
+| `stream`  | boolean |          | Collect streaming chunks in result. Local sessions only; a remote send returns the final result. |
+| `host`    | string  |          | Configured execution-host alias. See [remote-sessions.md](./remote-sessions.md). |
+| `operationId` | string |       | Stable client operation id. |
+| `waitTimeout` | number |       | Controller wait in ms after the broker accepts. |
 
 Returns `{ ok, output, sessionId, error?, permissionDenials? }`. `permissionDenials` lists the tool
 calls the engine refused during the turn — `[{ toolName, toolUseId?, input? }]` — and is present only
@@ -496,7 +506,9 @@ Reject council work and provide feedback. Rewrites `plan.md` with rejection feed
 
 ---
 
-## Inbox (3)
+## Inbox (8)
+
+`session_send_to`, `session_inbox`, and `session_deliver_inbox` accept optional `host`, `operationId`, and `waitTimeout` when remote sockets are enabled. `thread_register`, `thread_mailbox_send`, `thread_mailbox_read`, `thread_mailbox_ack`, and `thread_mailbox_wait` are broker-only. They register, read, ack, and wait on a manual native thread and do not resume it. Parameters are in [remote-sessions.md](./remote-sessions.md).
 
 ### `session_send_to`
 

@@ -131,6 +131,12 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
   private _isReady = false;
   private _isPaused = false;
   private _isBusy = false;
+  /**
+   * True from the moment a waiting turn is started until `turn/completed` or
+   * process exit. A caller timeout detaches only the waiter; this stays set so
+   * a second turn cannot start and idle TTL cannot treat the session as idle.
+   */
+  private _turnLive = false;
   private _startTime: string | null = null;
   private _nextRpcId = 1;
   private pendingRequests = new Map<number, PendingRequest>();
@@ -235,6 +241,8 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
 
       this.proc.on('exit', (code) => {
         this._isReady = false;
+        this._turnLive = false;
+        this._isBusy = false;
         // Reject any pending requests so callers don't hang.
         for (const pending of this.pendingRequests.values()) {
           pending.reject(new Error(`codex app-server exited (code=${code}) before responding`));
@@ -408,16 +416,25 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     this._instructionsPending = false;
     if (instructions) text = `${instructions}\n\n---\n\n${text}`;
 
+    if (this._turnLive) {
+      throw new Error('Codex app-server native turn still in progress');
+    }
+
     if (!options.waitForComplete) {
       this._fireAndForgetTurn(text, options).catch((err) => this.emit(SESSION_EVENT.ERROR, err));
       return { requestId: this._nextRpcId, sent: true };
     }
 
+    this._turnLive = true;
     this._isBusy = true;
     try {
       return await this._runTurn(text, options);
+    } catch (err) {
+      const timedOut = err instanceof Error && err.message === 'Timeout waiting for Codex app-server turn to complete';
+      if (!timedOut) this._turnLive = false;
+      throw err;
     } finally {
-      this._isBusy = false;
+      if (!this._turnLive) this._isBusy = false;
     }
   }
 
@@ -589,6 +606,8 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
         break;
       }
       case 'turn/completed': {
+        this._turnLive = false;
+        this._isBusy = false;
         const p = params as TurnCompletedNotification;
         // This notification can itself report how the turn ended. The engine's
         // TurnStatus is `completed | interrupted | failed | inProgress`, so the counter

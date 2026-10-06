@@ -881,3 +881,27 @@ describe('PersistentCodexAppServerSession — reasoning effort RPC', () => {
     expect(turnStartCalls(proc)[0]?.params?.effort).toBe('xhigh');
   });
 });
+
+describe('codex app-server busy across a caller timeout', () => {
+  beforeEach(() => mockSpawn.mockReset());
+
+  it('stays busy after the waiter times out and does not start a second turn', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    await expect(session.send('first', { timeout: 30, waitForComplete: true })).rejects.toThrow(
+      'Timeout waiting for Codex app-server turn to complete',
+    );
+    expect(session.isBusy).toBe(true);
+    await expect(session.send('second', { timeout: 30, waitForComplete: true })).rejects.toThrow(/still in progress/);
+    expect(turnStartCalls(proc)).toHaveLength(1);
+
+    completeTurn(proc, 'turn-1');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(session.isBusy).toBe(false);
+
+    const third = session.send('third', { timeout: 1_000 });
+    setTimeout(() => completeTurn(proc, 'turn-2'), 5);
+    await third;
+    expect(turnStartCalls(proc)).toHaveLength(2);
+  });
+});

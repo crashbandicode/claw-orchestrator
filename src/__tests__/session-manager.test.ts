@@ -305,6 +305,18 @@ function identityBoundEvents(runId?: string): OrchestrationLifecycleEvent[] {
     .filter((e) => e.event === 'agent.identity_bound' && (!runId || e.run_id === runId));
 }
 
+function readAgentEvents(agentName: string): OrchestrationLifecycleEvent[] {
+  const file = defaultOrchestrationOutboxFile();
+  if (!fs.existsSync(file)) return [];
+  return fs
+    .readFileSync(file, 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line) as OrchestrationLifecycleEvent)
+    .filter((event) => event.agent_name === agentName);
+}
+
 function sessionRunId(manager: unknown, name: string): string {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (manager as any).sessions.get(name).orchestration.runId as string;
@@ -1383,6 +1395,123 @@ describe('SessionManager', () => {
       expect(shortTtlMgr.listSessions().length).toBe(0);
 
       await shortTtlMgr.shutdown();
+    });
+
+    it('does not reap a busy session or a session held by a remote operation', async () => {
+      const shortTtlMgr = createManager({ sessionTtlMinutes: 1 });
+      await shortTtlMgr.startSession({ name: 'busy-ttl', cwd: '/tmp' });
+      lastMock().setBusy(true);
+      vi.advanceTimersByTime(2 * 60_000);
+      expect(shortTtlMgr.listSessions().map((session) => session.name)).toContain('busy-ttl');
+
+      lastMock().setBusy(false);
+      shortTtlMgr.holdSession('busy-ttl');
+      vi.advanceTimersByTime(2 * 60_000);
+      expect(shortTtlMgr.listSessions().map((session) => session.name)).toContain('busy-ttl');
+
+      shortTtlMgr.releaseSessionHold('busy-ttl');
+      vi.advanceTimersByTime(2 * 60_000);
+      expect(shortTtlMgr.listSessions().map((session) => session.name)).not.toContain('busy-ttl');
+      await shortTtlMgr.shutdown();
+    });
+
+    it('reaps a session after its send chain settles and keeps a queued send', async () => {
+      const shortTtlMgr = createManager({ sessionTtlMinutes: 1 });
+      await shortTtlMgr.startSession({ name: 'settled', cwd: '/tmp' });
+      await shortTtlMgr.sendMessage('settled', 'hello');
+      vi.advanceTimersByTime(2 * 60_000);
+      expect(shortTtlMgr.listSessions().map((session) => session.name)).not.toContain('settled');
+
+      await shortTtlMgr.startSession({ name: 'queued', cwd: '/tmp' });
+      let releaseSend: () => void = () => undefined;
+      const gate = new Promise<void>((resolve) => {
+        releaseSend = resolve;
+      });
+      lastMock().sendImplementation = () =>
+        gate.then(() => ({ text: 'later', event: { type: 'result', result: 'done' } }));
+      const pending = shortTtlMgr.sendMessage('queued', 'hold');
+      await Promise.resolve();
+      vi.advanceTimersByTime(2 * 60_000);
+      expect(shortTtlMgr.listSessions().map((session) => session.name)).toContain('queued');
+      releaseSend();
+      await pending;
+      vi.advanceTimersByTime(2 * 60_000);
+      expect(shortTtlMgr.listSessions().map((session) => session.name)).not.toContain('queued');
+      await shortTtlMgr.shutdown();
+    });
+  });
+
+  describe('remote lifecycle fields', () => {
+    it('refuses a new turn while the native session is still busy', async () => {
+      await mgr.startSession({ name: 'busy-send', cwd: '/tmp' });
+      lastMock().setBusy(true);
+      await expect(mgr.sendMessage('busy-send', 'again')).rejects.toThrow(/native turn still in progress/);
+      expect(lastMock().sendCalls).toHaveLength(0);
+    });
+
+    it('copies explicit parent fields into the outbox without wrapping the native id', async () => {
+      const nativeId = '019c6dcb-93ad-7dc1-b531-418d213b8761';
+      await mgr.startSession({
+        name: 'remote-child',
+        cwd: '/tmp',
+        engine: 'codex-app',
+        resumeSessionId: nativeId,
+        parentMachineId: '11111111-1111-4111-8111-111111111111',
+        parentSessionId: 'parent-native',
+        parentToolId: 'cursor',
+        originHost: 'yoga',
+        executionHost: 'studio',
+        remoteSessionHandle: 'studio::remote-child',
+      });
+      const info = mgr.getStatus('remote-child');
+      expect(info.claudeSessionId).toBe(nativeId);
+      expect(info.remoteSessionHandle).toBe('studio::remote-child');
+      expect(info.executionHost).toBe('studio');
+      expect(info.originHost).toBe('yoga');
+      expect(info.parentSessionId).toBe('parent-native');
+      const events = readAgentEvents('remote-child');
+      expect(events.find((event) => event.event === 'agent.declared')).toMatchObject({
+        parent_machine_id: '11111111-1111-4111-8111-111111111111',
+        parent_session_id: 'parent-native',
+        parent_tool_id: 'cursor',
+        origin_host: 'yoga',
+        execution_host: 'studio',
+        remote_session_handle: 'studio::remote-child',
+      });
+      expect(events.find((event) => event.event === 'agent.identity_bound')).toMatchObject({
+        native_session_id: nativeId,
+        remote_session_handle: 'studio::remote-child',
+      });
+    });
+
+    it('fills a missing parent session id from a delegate marker and ignores handoff and tangent markers', async () => {
+      await mgr.startSession({ name: 'marked-child', cwd: '/tmp', engine: 'codex-app' });
+      await mgr.sendMessage('marked-child', 'MEMENTO-HANDOFF-FROM: handoff-id\ncontinue');
+      await mgr.sendMessage('marked-child', 'MEMENTO-TANGENT-FROM: tangent-id\ncontinue');
+      expect(readAgentEvents('marked-child').some((event) => event.parent_session_id)).toBe(false);
+
+      await mgr.sendMessage('marked-child', 'MEMENTO-DELEGATE-FROM: parent-native\nwork');
+      expect(readAgentEvents('marked-child').some((event) => event.parent_session_id === 'parent-native')).toBe(true);
+      expect(mgr.getStatus('marked-child').claudeSessionId).not.toContain('::');
+    });
+
+    it('persists a dedicated state directory instead of the shared registry', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crs-state-'));
+      const writeFile = fs.writeFile as unknown as { mock: { calls: unknown[][] } };
+      const before = writeFile.mock.calls.length;
+      const isolated = createManager({ stateDirectory: dir });
+      await isolated.startSession({ name: 'iso', cwd: '/tmp' });
+      vi.advanceTimersByTime(6_000);
+      const registry = path.join(dir, 'claude-sessions.json');
+      const added = writeFile.mock.calls.slice(before);
+      expect(added.some((call) => String(call[0]) === `${registry}.tmp` && String(call[1]).includes('"iso"'))).toBe(
+        true,
+      );
+      expect(added.some((call) => String(call[0]).includes(`${path.sep}.openclaw${path.sep}`))).toBe(false);
+      const rename = fs.rename as unknown as { mock: { calls: unknown[][] } };
+      expect(rename.mock.calls.some((call) => String(call[1]) === registry)).toBe(true);
+      await isolated.shutdown();
+      fs.rmSync(dir, { recursive: true, force: true });
     });
   });
 

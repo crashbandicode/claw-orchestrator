@@ -96,6 +96,11 @@ const ANNOTATIONS: Record<string, Annotation> = {
   team_send: { openWorldHint: true },
   session_send_to: { openWorldHint: true },
   session_deliver_inbox: { openWorldHint: true },
+  thread_register: {},
+  thread_mailbox_send: {},
+  thread_mailbox_read: { readOnlyHint: true, idempotentHint: true },
+  thread_mailbox_ack: { idempotentHint: true },
+  thread_mailbox_wait: { readOnlyHint: true },
   council_start: { openWorldHint: true },
   council_inject: { openWorldHint: true },
   ultraplan_start: { openWorldHint: true },
@@ -130,8 +135,12 @@ const shim = {
   },
   on: () => {},
   registerHttpRoute: () => {},
-  registerService: () => {},
+  registerService: (def: { stop?: () => void | Promise<void> }) => {
+    serviceStop = def.stop;
+  },
 };
+
+let serviceStop: (() => void | Promise<void>) | undefined;
 
 plugin.register(shim as unknown as Parameters<typeof plugin.register>[0]);
 
@@ -210,3 +219,20 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 log.info(`mcp server ready — exposing ${tools.length} of ${captured.length} tools over stdio`);
+
+let clientClosed = false;
+async function closeClientTransports(): Promise<void> {
+  if (clientClosed) return;
+  clientClosed = true;
+  await serviceStop?.();
+}
+
+process.stdin.on('end', () => {
+  void closeClientTransports();
+});
+process.once('SIGINT', () => {
+  void closeClientTransports().finally(() => process.exit(0));
+});
+process.once('SIGTERM', () => {
+  void closeClientTransports().finally(() => process.exit(0));
+});

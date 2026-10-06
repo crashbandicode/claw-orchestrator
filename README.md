@@ -12,7 +12,7 @@
 [![CI](https://github.com/Enderfga/claw-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/Enderfga/claw-orchestrator/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Coding CLIs are designed for humans at terminals. Claw Orchestrator turns them into headless engines and adds an orchestration layer on top: 78 tools, from single-session calls to multi-agent runs and generated web apps — reachable through the CLI, the OpenClaw gateway, the Model Context Protocol, or directly from TypeScript, and visible through an embedded three-tab dashboard.
+Coding CLIs are designed for humans at terminals. Claw Orchestrator turns them into headless engines and adds an orchestration layer on top: 83 tools, from single-session calls to multi-agent runs and generated web apps — reachable through the CLI, the OpenClaw gateway, the Model Context Protocol, or directly from TypeScript, and visible through an embedded three-tab dashboard.
 
 https://github.com/user-attachments/assets/fbd2b0ea-28d8-4387-9894-c29cf15ba030
 
@@ -39,8 +39,9 @@ https://github.com/user-attachments/assets/fbd2b0ea-28d8-4387-9894-c29cf15ba030
 | **Durable Run Kernel**      | Declarative workflows over `agent` / `fanout` / `council` / `verifier` / `human_gate` / `router` / `subflow` / `autoloop` / `ultraapp_*` nodes. Every state transition is checkpointed, so a run survives a process restart and resumes at the node boundary. Retry, per-node timeout, cancel, steer, and bounded loops come from the kernel.                                                                                             | [`workflow.md`](./skills/references/workflow.md)           |
 | **Verification Plane**      | Acceptance contracts the runtime executes itself — commands, HTTP probes, screenshots, diff policy, file assertions — producing an evidence bundle on disk. A run carrying a contract cannot reach `completed` unless it passes, and one without a contract completes as `unverified` rather than claiming success. The tests a contract runs are held to what the run started with, so a run cannot pass by editing them.                | [`verification.md`](./skills/references/verification.md)   |
 | **Run Ledger & Spend Caps** | Every turn on every engine is appended to a durable JSONL ledger — engine, model, tokens, cost, duration, and the council/fanout/autoloop it belonged to — queryable with `clawo runs` after a restart. Rows carry both the engine's self-report (`ok`) and the runtime's own measurement (`verified`), kept apart. `maxBudgetUsd` is enforced by the runtime, so a cap holds on Codex, Grok, agy and OpenCode too, not just Claude Code. | [`observability.md`](./skills/references/observability.md) |
+| **Remote socket sessions**   | One SessionManager per execution host, reached through an owner-only Unix socket. A peer is an existing SSH config alias plus a stream-local forward. Session handles are `host::localName`; native resume ids stay unwrapped. Operations rejoin by id after a dropped socket and are never blindly replayed. | [`remote-sessions.md`](./skills/references/remote-sessions.md) |
 
-The full 78-tool surface is enumerated in [`tools.md`](./skills/references/tools.md).
+The full 83-tool surface is enumerated in [`tools.md`](./skills/references/tools.md).
 
 ---
 
@@ -81,7 +82,7 @@ Every command is documented in [`cli.md`](./skills/references/cli.md).
 curl -fsSL https://raw.githubusercontent.com/Enderfga/claw-orchestrator/main/install.sh | bash
 ```
 
-Installs via npm, registers the plugin in `~/.openclaw/openclaw.json`, restarts the gateway. All 78 tools become available to every OpenClaw agent.
+Installs via npm, registers the plugin in `~/.openclaw/openclaw.json`, restarts the gateway. All 83 tools become available to every OpenClaw agent.
 
 ### Model Context Protocol Server
 

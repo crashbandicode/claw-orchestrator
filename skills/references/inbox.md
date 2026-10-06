@@ -25,6 +25,8 @@ Session A (planner)          SessionManager           Session B (coder)
 - Sender and target must be existing sessions, otherwise the call fails
 - Returns `{ delivered, queued }`
 
+A remote broker keeps the same delivery statuses and adds a durable mailbox. Managed mail goes through SessionManager's serialized turn path. Manual threads use `thread_register` and the `thread_mailbox_*` tools and are never resumed. See [remote-sessions.md](./remote-sessions.md).
+
 ## Usage
 
 ### Send a Message

@@ -466,7 +466,21 @@ export interface SessionConfig {
    * their short-lived native sessions remain linked after Claw cleans them up.
    */
   orchestration?: OrchestrationAgentContext;
+  /**
+   * Explicit remote-lifecycle fields. The execution host is authoritative for
+   * `executionHost`. Parent identity is supplied by the caller or, for a missing
+   * parent session id only, by a first-line MEMENTO-DELEGATE-FROM marker.
+   */
+  parentMachineId?: string;
+  parentSessionId?: string;
+  parentToolId?: ParentToolId;
+  originHost?: string;
+  executionHost?: string;
+  remoteSessionHandle?: string;
 }
+
+export const PARENT_TOOL_IDS = ['codex', 'claude_code', 'cursor', 'opencode'] as const;
+export type ParentToolId = (typeof PARENT_TOOL_IDS)[number];
 
 export type OrchestrationRunKind = 'session' | 'fanout' | 'council' | 'autoloop' | 'ultraplan' | 'ultrareview';
 export type OrchestrationAgentStatus = 'declared' | 'idle' | 'running' | 'completed' | 'failed' | 'aborted';
@@ -482,6 +496,12 @@ export interface OrchestrationAgentContext {
   model?: string;
   effort?: EffortLevel;
   cwd: string;
+  parentMachineId?: string;
+  parentSessionId?: string;
+  parentToolId?: ParentToolId;
+  originHost?: string;
+  executionHost?: string;
+  remoteSessionHandle?: string;
 }
 
 // ─── Session Stats ───────────────────────────────────────────────────────────
@@ -646,6 +666,14 @@ export interface SessionInfo {
   engine?: EngineType;
   orchestrationRunId?: string;
   orchestrationAgentKey?: string;
+  /** Wrapper name on the execution host. Present when `name` has been qualified. */
+  localName?: string;
+  parentMachineId?: string;
+  parentSessionId?: string;
+  parentToolId?: ParentToolId;
+  originHost?: string;
+  executionHost?: string;
+  remoteSessionHandle?: string;
 }
 
 /** A tool call the engine refused to run during a turn. */
@@ -812,6 +840,10 @@ export interface InboxMessage {
   timestamp: string;
   read: boolean;
   summary?: string;
+  /** Durable receiver-host message id. Omitted by the in-memory local inbox. */
+  id?: string;
+  /** Origin host display name. Omitted when the sender is local. */
+  host?: string;
 }
 
 export interface UltraplanResult {

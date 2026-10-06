@@ -22,6 +22,7 @@ import {
   type AgentPersona,
   type EngineType,
   type CustomEngineConfig,
+  PARENT_TOOL_IDS,
 } from './types.js';
 import type { FanoutConfig } from './fanout.js';
 import { councilWorkflow, fanoutWorkflow, solveWorkflow, type SolveArgs } from './kernel/templates/index.js';
@@ -29,6 +30,26 @@ import { readEvents as readKernelEvents } from './kernel/store.js';
 import { resolveSecretRefs } from './kernel/secrets.js';
 import type { RunState, WorkflowSpec } from './kernel/types.js';
 import { AUTOLOOP_TIMEOUT_SCHEMA, validateAutoloopTimeoutConfig } from './autoloop/types.js';
+import { RemoteEndpoint } from './remote/endpoint.js';
+import type { BrokerMethod } from './remote/protocol.js';
+
+const REMOTE_CALL_PROPERTIES = {
+  host: {
+    type: 'string',
+    description:
+      'Configured execution-host alias from remote-hosts.json. Omit for this machine. An unknown alias is an error and is never run locally.',
+  },
+  operationId: {
+    type: 'string',
+    description:
+      'Stable client operation id. Repeating it rejoins that broker operation. A different payload under the same id is rejected and is not executed twice.',
+  },
+  waitTimeout: {
+    type: 'number',
+    description:
+      'Milliseconds this caller waits after the broker accepts the operation. Distinct from native execution timeout. On expiry the operation keeps running and can be rejoined.',
+  },
+};
 
 // ─── Standalone Export ───────────────────────────────────────────────────────
 
@@ -85,7 +106,7 @@ interface PluginAPI {
     match?: string;
     handler: (...args: unknown[]) => Promise<boolean>;
   }): void;
-  registerService(def: { id: string; start: () => void; stop: () => void }): void;
+  registerService(def: { id: string; start: () => void; stop: () => void | Promise<void> }): void;
 }
 
 function isAgentToolResult(result: unknown): result is AgentToolResult {
@@ -214,16 +235,41 @@ const plugin = {
       return manager;
     }
 
+    const remote = new RemoteEndpoint();
+
+    async function callRouted(
+      method: BrokerMethod,
+      payload: Record<string, unknown>,
+      local: () => Promise<unknown>,
+    ): Promise<unknown> {
+      const host = typeof payload.host === 'string' && payload.host.length > 0 ? payload.host : undefined;
+      if (remote.routeDecision(host) === 'local') return local();
+      const operationId = typeof payload.operationId === 'string' ? payload.operationId : undefined;
+      const waitTimeout = typeof payload.waitTimeout === 'number' ? payload.waitTimeout : undefined;
+      const body: Record<string, unknown> = { ...payload };
+      delete body.host;
+      delete body.operationId;
+      delete body.stream;
+      delete body.executionHost;
+      delete body.remoteSessionHandle;
+      // Mailbox wait is the broker operation. Other tools use waitTimeout only as the controller wait.
+      const clientWait = method === 'thread.wait' ? undefined : waitTimeout;
+      if (method !== 'thread.wait') delete body.waitTimeout;
+      return remote.call(host, method, body, { operationId, waitTimeoutMs: clientWait });
+    }
+
     // ─── Service Lifecycle ────────────────────────────────────────────────
 
     api.registerService({
       id: 'claw-orchestrator',
       start: () => api.logger.info('[claw-orchestrator] Plugin registered (lazy init — will activate on first use)'),
       stop: () => {
-        if (server) server.stop().catch(() => {});
-        if (manager) manager.shutdown().catch(() => {});
+        const closing = remote.close();
+        const stoppingServer = server ? server.stop().catch(() => undefined) : Promise.resolve();
+        const stoppingManager = manager ? manager.shutdown().catch(() => undefined) : Promise.resolve();
         server = null;
         manager = null;
+        return Promise.all([closing, stoppingServer, stoppingManager]).then(() => undefined);
       },
     });
 
@@ -412,13 +458,39 @@ const plugin = {
             description:
               'Resume an existing native engine session. For codex-app, use the full stats.codexThreadId (also returned as stats.sessionId), never a legacy codex-app wrapper ID. A failed or mismatched Codex resume returns an error without starting a new thread.',
           },
+          parentMachineId: {
+            type: 'string',
+            description: 'Origin parent Memento machine UUID. Configured, not inferred from the destination.',
+          },
+          parentSessionId: {
+            type: 'string',
+            description:
+              'Exact parent native thread or session id. A first-line MEMENTO-DELEGATE-FROM marker can fill this later if omitted.',
+          },
+          parentToolId: {
+            type: 'string',
+            enum: [...PARENT_TOOL_IDS],
+            description: 'Parent transcript provider when known.',
+          },
+          originHost: {
+            type: 'string',
+            description: 'Source host display name from administrator config. Not the kernel hostname.',
+          },
+          ...REMOTE_CALL_PROPERTIES,
         },
       },
       execute: async (_id, args) => {
-        const sanitized = { ...args };
-        if (sanitized.cwd) sanitized.cwd = sanitizeCwd(sanitized.cwd as string);
-        const info = await getManager().startSession(sanitized as Parameters<SessionManager['startSession']>[0]);
-        return { ok: true, ...info };
+        return callRouted('session.start', args, async () => {
+          const sanitized = { ...args };
+          delete sanitized.host;
+          delete sanitized.operationId;
+          delete sanitized.waitTimeout;
+          delete sanitized.executionHost;
+          delete sanitized.remoteSessionHandle;
+          if (sanitized.cwd) sanitized.cwd = sanitizeCwd(sanitized.cwd as string);
+          const info = await getManager().startSession(sanitized as Parameters<SessionManager['startSession']>[0]);
+          return { ok: true, ...info };
+        });
       },
     });
 
@@ -442,32 +514,35 @@ const plugin = {
           stream: {
             type: 'boolean',
             description:
-              'Collect text chunks as they arrive and include them in result.chunks[] (default false). Note: OpenClaw plugin SDK does not yet support mid-tool streaming to the caller, so chunks are buffered and returned with the final result.',
+              'Collect text chunks as they arrive and include them in result.chunks[] (default false). Note: OpenClaw plugin SDK does not yet support mid-tool streaming to the caller, so chunks are buffered and returned with the final result. Remote broker sends return the final result only.',
           },
+          ...REMOTE_CALL_PROPERTIES,
         },
         required: ['name', 'message'],
       },
       execute: async (_id, args) => {
-        const wantChunks = args.stream as boolean | undefined;
-        const chunks: string[] = [];
+        return callRouted('session.send', args, async () => {
+          const wantChunks = args.stream as boolean | undefined;
+          const chunks: string[] = [];
 
-        const result = await getManager().sendMessage(args.name as string, args.message as string, {
-          effort: args.effort as EffortLevel | undefined,
-          plan: args.plan as boolean | undefined,
-          timeout: args.timeout as number | undefined,
-          // When stream:true, collect chunks into array for caller.
-          // True mid-tool streaming requires SDK-level support (not yet available).
-          onChunk: wantChunks
-            ? (chunk: string) => {
-                chunks.push(chunk);
-              }
-            : undefined,
+          const result = await getManager().sendMessage(args.name as string, args.message as string, {
+            effort: args.effort as EffortLevel | undefined,
+            plan: args.plan as boolean | undefined,
+            timeout: args.timeout as number | undefined,
+            // When stream:true, collect chunks into array for caller.
+            // True mid-tool streaming requires SDK-level support (not yet available).
+            onChunk: wantChunks
+              ? (chunk: string) => {
+                  chunks.push(chunk);
+                }
+              : undefined,
+          });
+          return {
+            ok: true,
+            ...result,
+            ...(wantChunks ? { chunks } : {}),
+          };
         });
-        return {
-          ok: true,
-          ...result,
-          ...(wantChunks ? { chunks } : {}),
-        };
       },
     });
 
@@ -521,12 +596,17 @@ const plugin = {
       description: 'Stop a persistent coding session',
       parameters: {
         type: 'object',
-        properties: { name: { type: 'string', description: 'Session name' } },
+        properties: {
+          name: { type: 'string', description: 'Session name' },
+          ...REMOTE_CALL_PROPERTIES,
+        },
         required: ['name'],
       },
       execute: async (_id, args) => {
-        await getManager().stopSession(args.name as string);
-        return { ok: true };
+        return callRouted('session.stop', args, async () => {
+          await getManager().stopSession(args.name as string);
+          return { ok: true };
+        });
       },
     });
 
@@ -535,10 +615,12 @@ const plugin = {
     registerTool({
       name: 'session_list',
       description: 'List all active coding sessions',
-      parameters: { type: 'object', properties: {} },
-      execute: async (_id) => {
-        if (!manager) return { ok: true, sessions: [], persisted: [] };
-        return { ok: true, sessions: manager.listSessions(), persisted: manager.listPersistedSessions() };
+      parameters: { type: 'object', properties: { ...REMOTE_CALL_PROPERTIES } },
+      execute: async (_id, args) => {
+        return callRouted('session.list', args, async () => {
+          if (!manager) return { ok: true, sessions: [], persisted: [] };
+          return { ok: true, sessions: manager.listSessions(), persisted: manager.listPersistedSessions() };
+        });
       },
     });
 
@@ -548,18 +630,20 @@ const plugin = {
       name: 'sessions_overview',
       description:
         'Get an aggregate overview of all active coding sessions — readiness, busy/paused state, cost, context usage, and last activity for each. Use this for a dashboard view across all sessions. For single-session detail, use coding_session_status instead.',
-      parameters: { type: 'object', properties: {} },
-      execute: async (_id) => {
-        if (!manager)
-          return {
-            ok: true,
-            version: 'unknown',
-            sessions: 0,
-            sessionNames: [],
-            uptime: process.uptime(),
-            details: [],
-          };
-        return manager.health();
+      parameters: { type: 'object', properties: { ...REMOTE_CALL_PROPERTIES } },
+      execute: async (_id, args) => {
+        return callRouted('session.overview', args, async () => {
+          if (!manager)
+            return {
+              ok: true,
+              version: 'unknown',
+              sessions: 0,
+              sessionNames: [],
+              uptime: process.uptime(),
+              details: [],
+            };
+          return manager.health();
+        });
       },
     });
 
@@ -570,12 +654,17 @@ const plugin = {
       description: 'Get detailed status of a coding session (context %, tokens, cost, uptime)',
       parameters: {
         type: 'object',
-        properties: { name: { type: 'string', description: 'Session name' } },
+        properties: {
+          name: { type: 'string', description: 'Session name' },
+          ...REMOTE_CALL_PROPERTIES,
+        },
         required: ['name'],
       },
       execute: async (_id, args) => {
-        const status = getManager().getStatus(args.name as string);
-        return { ok: true, ...status };
+        return callRouted('session.status', args, async () => {
+          const status = getManager().getStatus(args.name as string);
+          return { ok: true, ...status };
+        });
       },
     });
 
@@ -1829,17 +1918,25 @@ const plugin = {
           to: { type: 'string', description: 'Target session name, or "*" for broadcast' },
           message: { type: 'string', description: 'Message text' },
           summary: { type: 'string', description: 'Short preview (5-10 words)' },
+          messageId: {
+            type: 'string',
+            description: 'Stable receiver-host message id. Repeating it with the same payload does not deliver twice.',
+          },
+          fromHost: { type: 'string', description: 'Origin host display name for the sender.' },
+          ...REMOTE_CALL_PROPERTIES,
         },
         required: ['from', 'to', 'message'],
       },
       execute: async (_id, args) => {
-        const result = await getManager().sessionSendTo(
-          args.from as string,
-          args.to as string,
-          args.message as string,
-          args.summary as string | undefined,
-        );
-        return { ok: true, ...result };
+        return callRouted('inbox.send', args, async () => {
+          const result = await getManager().sessionSendTo(
+            args.from as string,
+            args.to as string,
+            args.message as string,
+            args.summary as string | undefined,
+          );
+          return { ok: true, ...result };
+        });
       },
     });
 
@@ -1853,15 +1950,18 @@ const plugin = {
         properties: {
           name: { type: 'string', description: 'Session name' },
           unreadOnly: { type: 'boolean', description: 'Only unread messages (default true)' },
+          ...REMOTE_CALL_PROPERTIES,
         },
         required: ['name'],
       },
       execute: async (_id, args) => {
-        const messages = getManager().sessionInbox(
-          args.name as string,
-          (args.unreadOnly as boolean | undefined) ?? true,
-        );
-        return { ok: true, count: messages.length, messages };
+        return callRouted('inbox.read', args, async () => {
+          const messages = getManager().sessionInbox(
+            args.name as string,
+            (args.unreadOnly as boolean | undefined) ?? true,
+          );
+          return { ok: true, count: messages.length, messages };
+        });
       },
     });
 
@@ -1873,13 +1973,124 @@ const plugin = {
         'Deliver all queued inbox messages to an idle session. Call this when a session finishes a task to process waiting messages.',
       parameters: {
         type: 'object',
-        properties: { name: { type: 'string', description: 'Session name' } },
+        properties: {
+          name: { type: 'string', description: 'Session name' },
+          ...REMOTE_CALL_PROPERTIES,
+        },
         required: ['name'],
       },
       execute: async (_id, args) => {
-        const count = await getManager().sessionDeliverInbox(args.name as string);
-        return { ok: true, delivered: count };
+        return callRouted('inbox.deliver', args, async () => {
+          const count = await getManager().sessionDeliverInbox(args.name as string);
+          return { ok: true, delivered: count };
+        });
       },
+    });
+
+    registerTool({
+      name: 'thread_register',
+      description:
+        'Register a manually opened native thread on the execution-host broker. Does not resume, spawn, or attach a second process to that thread.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Stable mailbox label. Not a wrapped native UUID.' },
+          nativeSessionId: { type: 'string', description: 'Exact native thread or session id.' },
+          parentToolId: {
+            type: 'string',
+            enum: [...PARENT_TOOL_IDS],
+            description: 'Native provider that owns the thread.',
+          },
+          ...REMOTE_CALL_PROPERTIES,
+        },
+        required: ['name', 'nativeSessionId'],
+      },
+      execute: async (_id, args) =>
+        callRouted('thread.register', args, async () => {
+          throw new Error('Manual thread mailboxes require the remote broker');
+        }),
+    });
+
+    registerTool({
+      name: 'thread_mailbox_send',
+      description:
+        'Queue a durable message for a registered manual thread. Acceptance is not model delivery, and the thread is not resumed.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Registered mailbox label' },
+          from: { type: 'string', description: 'Sender identity' },
+          fromHost: { type: 'string', description: 'Origin host display name' },
+          message: { type: 'string', description: 'Message text' },
+          summary: { type: 'string', description: 'Short preview' },
+          messageId: { type: 'string', description: 'Stable message id. The same id and payload is not queued twice.' },
+          ...REMOTE_CALL_PROPERTIES,
+        },
+        required: ['name', 'from', 'message'],
+      },
+      execute: async (_id, args) =>
+        callRouted('thread.send', args, async () => {
+          throw new Error('Manual thread mailboxes require the remote broker');
+        }),
+    });
+
+    registerTool({
+      name: 'thread_mailbox_read',
+      description:
+        'Read durable mailbox messages for a registered manual thread or managed session. Does not mark them read.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Mailbox label or session name' },
+          unreadOnly: { type: 'boolean', description: 'Only queued messages (default true)' },
+          ...REMOTE_CALL_PROPERTIES,
+        },
+        required: ['name'],
+      },
+      execute: async (_id, args) =>
+        callRouted('thread.read', args, async () => {
+          throw new Error('Manual thread mailboxes require the remote broker');
+        }),
+    });
+
+    registerTool({
+      name: 'thread_mailbox_ack',
+      description:
+        'Acknowledge mailbox messages as read. Acknowledgement is idempotent. TCP delivery is not an acknowledgement.',
+      parameters: {
+        type: 'object',
+        properties: {
+          messageId: { type: 'string', description: 'One message id' },
+          messageIds: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Message ids to acknowledge',
+          },
+          ...REMOTE_CALL_PROPERTIES,
+        },
+      },
+      execute: async (_id, args) =>
+        callRouted('thread.ack', args, async () => {
+          throw new Error('Manual thread mailboxes require the remote broker');
+        }),
+    });
+
+    registerTool({
+      name: 'thread_mailbox_wait',
+      description:
+        'Wait on the broker socket until a registered manual thread has a queued message or the wait expires. Does not poll and does not resume the thread.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Registered mailbox label' },
+          ...REMOTE_CALL_PROPERTIES,
+        },
+        required: ['name'],
+      },
+      execute: async (_id, args) =>
+        callRouted('thread.wait', args, async () => {
+          throw new Error('Manual thread mailboxes require the remote broker');
+        }),
     });
 
     // ─── Tool: ultraplan_start ──────────────────────────────────────

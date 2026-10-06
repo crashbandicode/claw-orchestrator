@@ -50,9 +50,12 @@ export class InboxManager {
 
   wrapCrossSessionMessage(msg: InboxMessage): string {
     const esc = InboxManager.escapeXmlAttr;
-    const attrs = `from="${esc(msg.from)}"${msg.summary ? ` summary="${esc(msg.summary)}"` : ''}`;
+    const attrs = [`from="${esc(msg.from)}"`];
+    if (msg.host) attrs.push(`host="${esc(msg.host)}"`);
+    if (msg.id) attrs.push(`id="${esc(msg.id)}"`);
+    if (msg.summary) attrs.push(`summary="${esc(msg.summary)}"`);
     const body = InboxManager.fenceEnvelopeTags(msg.text);
-    return `<cross-session-message ${attrs}>\n${body}\n</cross-session-message>`;
+    return `<cross-session-message ${attrs.join(' ')}>\n${body}\n</cross-session-message>`;
   }
 
   /**

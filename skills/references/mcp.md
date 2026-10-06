@@ -1,6 +1,6 @@
 # MCP integration
 
-Claw Orchestrator ships a Model Context Protocol (MCP) server (`clawo-mcp`) so any MCP-compatible host can drive its 78 tools.
+Claw Orchestrator ships a Model Context Protocol (MCP) server (`clawo-mcp`) so any MCP-compatible host can drive its 83 tools.
 
 This document covers:
 
@@ -32,7 +32,7 @@ Tools fall into a few groups:
 | Group                   | Examples                                                                                                                                                              |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Session lifecycle       | `session_start`, `session_send`, `session_handoff`, `session_stop`, `session_list`, `session_grep`, `session_compact`, `session_update_tools`, `session_switch_model` |
-| Cross-session messaging | `session_send_to`, `session_inbox`, `session_deliver_inbox`                                                                                                           |
+| Cross-session messaging | `session_send_to`, `session_inbox`, `session_deliver_inbox`, `thread_register`, `thread_mailbox_send`, `thread_mailbox_read`, `thread_mailbox_ack`, `thread_mailbox_wait` |
 | Status / introspection  | `sessions_overview`, `coding_session_status`, `coding_agents_list`                                                                                                    |
 | Multi-agent council     | `council_start`, `council_status`, `council_abort`, `council_inject`, `council_review`, `council_accept`, `council_reject`                                            |
 | Ultraplan / ultrareview | `ultraplan_start`, `ultraplan_status`, `ultrareview_start`, `ultrareview_status`                                                                                      |
@@ -234,7 +234,7 @@ The engines themselves (`claude`, `codex`, `agy`, `grok`, `opencode`) must also 
 
 ## Tool filtering
 
-78 tools is a lot for a small context window. Reduce noise either at the host level (most hosts have an `include` / `exclude` filter — see Hermes example above) or at the server level via `CLAWO_MCP_TOOLS`:
+83 tools is a lot for a small context window. Reduce noise either at the host level (most hosts have an `include` / `exclude` filter — see Hermes example above) or at the server level via `CLAWO_MCP_TOOLS`:
 
 ```bash
 CLAWO_MCP_TOOLS="session_start,session_send,session_stop,council_start,council_status" clawo-mcp
