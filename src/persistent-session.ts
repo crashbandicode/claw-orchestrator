@@ -27,6 +27,7 @@ import {
 } from './types.js';
 import { resolveAlias, getContextWindow, isClaudeModel } from './models.js';
 import { sanitizeSecrets } from './sanitize.js';
+import { createStdinErrorReporter, guardChildStreams, reportSessionError } from './child-process-guard.js';
 
 import {
   CONTEXT_HIGH_THRESHOLD,
@@ -105,6 +106,8 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
   private _engineModel: string | undefined;
   /** Ids of messages this session wrote whose result has not arrived yet. */
   private _unanswered = new Set<string>();
+  /** One session error per stdin fault, whether it arrives by write callback or by 'error' event. */
+  private _stdinFault = createStdinErrorReporter((err) => reportSessionError(this, err, '[claude]'));
   /** Full prompt size of the last turn: input + cached reads + cache writes. */
   private _lastTurnPromptTokens = 0;
 
@@ -420,6 +423,13 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     // Unref so the parent process can exit independently of the child.
     this.proc.unref();
 
+    // A pipe fault with no listener (EPIPE when the CLI closes stdin before a
+    // write lands) is an uncaught exception that ends the whole host.
+    guardChildStreams(this.proc, (stream, err) => {
+      if (stream === 'stdin') this._stdinFault(err);
+      else reportSessionError(this, new Error(`${stream} error: ${err.message}`), '[claude]');
+    });
+
     // Parse stdout line-by-line
     this._rl = readline.createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });
     this._rl.on('line', (line) => {
@@ -438,7 +448,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     // close) makes readline emit an unhandled 'error' that crashes the monitor
     // process itself — exactly what Recovery > Complexity forbids.
     this._rl.on('error', (err: Error) => {
-      this.emit(SESSION_EVENT.ERROR, new Error(`readline error: ${err.message}`));
+      reportSessionError(this, new Error(`readline error: ${err.message}`), '[claude]');
     });
 
     this.proc.stderr?.on('data', (data: Buffer) => {
@@ -461,7 +471,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       }
       this._rl = null;
       this.proc = null;
-      this.emit(SESSION_EVENT.ERROR, err);
+      reportSessionError(this, err, '[claude]');
     });
 
     // Wait for ready
@@ -764,9 +774,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     }
     // Pass an error callback so a broken pipe / closed stdin surfaces instead of
     // silently dropping the write and leaving waitForComplete callers hung.
-    stdin.write(JSON.stringify(payload) + '\n', (err) => {
-      if (err) this.emit(SESSION_EVENT.ERROR, new Error(`Failed to write to stdin: ${err.message}`));
-    });
+    stdin.write(JSON.stringify(payload) + '\n', (err) => this._stdinFault(err));
 
     if (options.callbacks) this._streamCallbacks = options.callbacks;
 

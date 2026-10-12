@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
+import { guardChildStreams } from '../child-process-guard.js';
 import { assertHostAlias, assertSocketPath } from './qualified-name.js';
 
 export interface SshSpawn {
@@ -53,6 +54,7 @@ export class SshUnixForward {
     fs.chmodSync(path.dirname(this.localSocket), 0o700);
     const child = this.spawnFn('ssh', this.args(), { stdio: ['ignore', 'ignore', 'pipe'] });
     this.child = child;
+    guardChildStreams(child);
     return new Promise((resolve, reject) => {
       const fail = (err: Error): void => {
         if (this.settled) return;

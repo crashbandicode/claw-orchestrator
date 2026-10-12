@@ -30,6 +30,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { guardChildStreams } from './child-process-guard.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -276,6 +277,7 @@ export class PersistentAgySession extends BaseOneShotSession {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
+      guardChildStreams(proc);
 
       const timer = setTimeout(() => {
         if (!settled) {

@@ -162,7 +162,7 @@ import { checkBudget, isBudgetExceeded } from './budget.js';
 import { InboxManager, type SessionLookup } from './inbox-manager.js';
 import { sanitizeCwd, validateName } from './validation.js';
 import { sanitizeSecrets } from './sanitize.js';
-import { validateCodexMcpSelection } from './codex-mcp.js';
+import { CodexMcpConfigError, validateCodexMcpSelection } from './codex-mcp.js';
 import { PersistentClaudeSession } from './persistent-session.js';
 import {
   cloneTranscript,
@@ -865,7 +865,10 @@ export class SessionManager {
     try {
       await session.start();
     } catch (err) {
-      this._circuitBreaker.recordFailure(engine);
+      // A rejected codexMcpServers selection, or a Codex config that cannot be
+      // enumerated, says nothing about the engine itself: counting it would let a
+      // few bad requests refuse every valid start on that engine.
+      if (!(err instanceof CodexMcpConfigError)) this._circuitBreaker.recordFailure(engine);
       this._orchestrationEvents.emit('agent.status', orchestration, { agentStatus: 'failed' });
       if (orchestration.runKind === 'session') this._emitOrchestrationRunStatus(orchestration, 'failed');
       throw err;

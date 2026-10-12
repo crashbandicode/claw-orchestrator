@@ -12,6 +12,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { guardChildStreams } from './child-process-guard.js';
 import * as readline from 'node:readline';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -128,6 +129,7 @@ export class PersistentGeminiSession extends BaseOneShotSession {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
+      guardChildStreams(proc);
 
       const timer = setTimeout(() => {
         if (!settled) {

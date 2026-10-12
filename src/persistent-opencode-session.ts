@@ -41,6 +41,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { guardChildStreams } from './child-process-guard.js';
 import * as readline from 'node:readline';
 
 import type { EffortLevel, SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
@@ -234,6 +235,7 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
+      guardChildStreams(proc);
       // opencode reads stdin even when the prompt is on argv. Close it
       // immediately so the subprocess doesn't hang waiting for EOF.
       proc.stdin?.end();

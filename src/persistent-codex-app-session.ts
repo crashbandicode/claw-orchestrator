@@ -29,6 +29,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { resolveWindowsNodeInvocation } from './windows-command.js';
 import { resolveCodexMcpDisableArgs, validateCodexMcpSelection } from './codex-mcp.js';
+import { createStdinErrorReporter, guardChildStreams, type ChildStreamName } from './child-process-guard.js';
 
 import type {
   SessionConfig,
@@ -266,20 +267,24 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
         this.emit(SESSION_EVENT.LOG, `[codex-app-stderr] ${data.toString()}`);
       });
 
+      // An unlistened 'error' on the ChildProcess or on one of its pipes is an
+      // uncaught exception that ends the host: ENOENT/EACCES from spawn, EPIPE
+      // from a write to an app-server that already closed stdin.
+      guardChildStreams(this.proc, (stream, err) => this._onStreamError(stream, err));
+
+      this.proc.on('error', (err) => {
+        // The process could not be spawned, or could not be signalled. A spawn
+        // failure never emits 'exit', so without this the handshake RPC would wait
+        // forever; settle it the way an exit does.
+        this._settleProcessGone(`codex app-server process error: ${err.message}`);
+        this._reportError(err);
+      });
+
       this.proc.on('exit', (code) => {
-        this._isReady = false;
-        this._turnLive = false;
-        this._isBusy = false;
-        // Reject any pending requests so callers don't hang.
-        for (const pending of this.pendingRequests.values()) {
-          pending.reject(new Error(`codex app-server exited (code=${code}) before responding`));
-        }
-        this.pendingRequests.clear();
-        if (this.turnReject) {
-          this.turnReject(new Error(`codex app-server exited mid-turn (code=${code})`));
-          this.turnReject = null;
-          this.turnResolve = null;
-        }
+        this._settleProcessGone(
+          `codex app-server exited (code=${code}) before responding`,
+          `codex app-server exited mid-turn (code=${code})`,
+        );
         this.emit(SESSION_EVENT.CLOSE, code ?? 0);
       });
 
@@ -492,6 +497,10 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
       this.turnResolve = resolve;
       this.turnReject = reject;
     });
+    // The waiter below only attaches after turn/start is acknowledged. A turn
+    // settled before then (the request failed, the timeout fired, the process
+    // went away) would otherwise be an unhandled rejection, which ends the host.
+    turnPromise.catch(() => undefined);
 
     // Wire up text streaming for this turn
     const onText = (chunk: string) => {
@@ -513,7 +522,14 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     }, timeout);
 
     try {
-      await this._request('turn/start', this._turnStartParams(text, options.effort));
+      try {
+        await this._request('turn/start', this._turnStartParams(text, options.effort));
+      } catch (err) {
+        // The turn never started; leave no waiter behind for a later exit to reject.
+        this.turnResolve = null;
+        this.turnReject = null;
+        throw err;
+      }
       const result = await turnPromise;
       return result;
     } finally {
@@ -536,9 +552,51 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
         if (err) {
           this.pendingRequests.delete(id);
           reject(err);
+          // The stream's own 'error' event reports the same fault (see _onStreamError).
+          this._stdinFault(err);
         }
       });
     });
+  }
+
+  /** One report per stdin fault, whether it arrives by write callback or by 'error' event. */
+  private _stdinFault = createStdinErrorReporter((err) => {
+    // A process that never spawned reports ENOENT/EACCES once, through its own
+    // 'error'; the write the handshake then aimed at its dead stdin is not a second fault.
+    if (this.proc?.pid !== undefined) this._reportError(err);
+  });
+
+  /** A fault on one of the app-server's pipes. Reported, never thrown. */
+  private _onStreamError(stream: ChildStreamName, err: Error): void {
+    if (stream === 'stdin') {
+      this._stdinFault(err);
+      return;
+    }
+    if (stream === 'stdout') {
+      // Responses can no longer arrive, so waiting RPCs and the turn would hang.
+      this._settleProcessGone(`codex app-server stdout error: ${err.message}`);
+    }
+    this._reportError(new Error(`codex app-server ${stream} error: ${err.message}`));
+  }
+
+  /**
+   * The app-server is gone or unusable: not ready, and nothing waiting on it may
+   * hang. Shared by process `exit`, process `error` and a stdout fault.
+   */
+  private _settleProcessGone(pendingMessage: string, turnMessage: string = pendingMessage): void {
+    this._isReady = false;
+    this._turnLive = false;
+    this._isBusy = false;
+    // Reject any pending requests so callers don't hang.
+    for (const pending of this.pendingRequests.values()) {
+      pending.reject(new Error(pendingMessage));
+    }
+    this.pendingRequests.clear();
+    if (this.turnReject) {
+      this.turnReject(new Error(turnMessage));
+      this.turnReject = null;
+      this.turnResolve = null;
+    }
   }
 
   private _handleLine(line: string): void {

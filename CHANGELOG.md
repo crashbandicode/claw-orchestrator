@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.7.0-memento.5] - 2026-10-12
+
+### Fixed
+
+- A child process that cannot be spawned (`ENOENT`, `EACCES`) or that closes its stdin before a write lands (`EPIPE`) no longer ends the broker. Node raises both as `error` events on the `ChildProcess` and on its pipes, which the session manager's guard on the session emitter never saw. The `codex app-server` session had no `error` listener on the process, and the `codex-app`, `claude` and `custom` persistent sessions had none on stdin; an unspawnable `codex` or an app-server that died between the writability check and a write was an uncaught exception that took every session on the machine with it. Now the process `error` settles the handshake RPC, pending RPCs and the live turn the way `exit` does and is reported on the session; stream faults are reported once per fault (the write callback and the `error` event are folded together). New shared `src/child-process-guard.ts` puts `error` listeners on stdin, stdout and stderr of every spawned engine child (all persistent and one-shot engines, `codex mcp list`, council git helpers, ssh forward).
+- Other child-process crash paths found in the same audit: the ultraapp docker wrapper never listened for `error` (a missing `docker` was an uncaught exception and the call never settled), the ultraapp host launcher returned before an `ENOENT` `error` event, and the autoloop notifier wrote to a child's stdin with no stream listener.
+- A `codex-app` turn whose `turn/start` request failed left its turn waiter registered; the app-server's later exit rejected that orphan promise, an unhandled rejection that ends the host. The waiter is now cleared when the turn never started and can no longer be an unhandled rejection.
+- Rejected `codexMcpServers` selections (unknown or config-disabled name, a server to disable whose transport type has no safe stub) and a failed `codex mcp list --json` are caller or configuration errors, not engine failures (`CodexMcpConfigError`). They no longer count toward the engine circuit breaker; three of them from any caller used to refuse every valid `codex`/`codex-app` start on that broker for up to five minutes.
+
+### Documented
+
+- `codex mcp list --json` contacts the URL of each streamable-HTTP server it lists (unauthenticated discovery GETs, nothing sent when `bearer_token_env_var` is set), including servers a session is about to exclude. "Excluded" means not started, not never contacted.
+- There is deliberately no process-level `uncaughtException` handler: after the targeted guards above, a remaining uncaught exception is a bug, and swallowing it would leave broker state undefined.
+
 ## [7.7.0-memento.4] - 2026-10-12
 
 ### Fixed

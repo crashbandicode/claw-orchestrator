@@ -15,6 +15,7 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { guardChildStreams } from '../child-process-guard.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -173,6 +174,10 @@ export async function hostRun(args: HostRunArgs): Promise<DockerRunResult> {
     windowsHide: process.platform === 'win32' && headless,
   });
   child.unref();
+  // A command that cannot be spawned (ENOENT) reports through 'error' after this
+  // function has returned; unlistened it ends the host. The missing pid below is
+  // what the caller sees.
+  child.on('error', () => undefined);
   const pid = child.pid;
   if (typeof pid !== 'number') {
     return { ok: false, error: 'spawn returned no pid' };
@@ -315,6 +320,7 @@ function runCmd(cmd: string, args: string[], opts: { cwd: string; env?: Record<s
     });
     let stdout = '';
     let stderr = '';
+    guardChildStreams(child);
     child.stdout?.on('data', (d: Buffer) => (stdout += d.toString()));
     child.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
     child.on('close', (code) => resolve({ ok: code === 0, stdout, stderr }));
