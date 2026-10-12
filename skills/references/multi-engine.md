@@ -283,6 +283,14 @@ Wraps the Cursor Agent CLI with `-p --output-format stream-json`. Write-enabled 
 - Binary: `cursor-agent` (set `CURSOR_BIN` env var to override). The generic `agent` name is
   deliberately not used: xAI's Grok installer symlinks `agent` to its own binary, which rejects
   `--force`/`--trust`/`--workspace` and fails the turn with "unexpected argument"
+- Windows: Cursor's installer provides `cursor-agent.cmd` / `agent.cmd` (and `.ps1`) under
+  `%LOCALAPPDATA%\cursor-agent`, which start Windows PowerShell 5.1 on a script that runs
+  `versions\<ver>\node.exe versions\<ver>\index.js`. Claw never runs Windows PowerShell 5.1 or a shell: it
+  resolves the wrapper itself, on every launch (so a Cursor self-update is picked up), to the newest
+  `versions\<YYYY.MM.DD[-HH-MM-SS]-<hash>>` directory by date (same-day builds: later build time wins) that has both
+  `node.exe` and `index.js`, and sets `CURSOR_INVOKED_AS` / `NODE_COMPILE_CACHE` as the script does. A `node.exe` +
+  `index.js` beside the wrapper wins first. A bare `cursor-agent` is looked up on PATH (`.exe`, then `.cmd`). Other
+  `.cmd`/`.ps1` wrappers are refused unless they are npm shims (`codex`) — no shell is ever used.
 
 ```typescript
 await manager.startSession({

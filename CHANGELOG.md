@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.7.0-memento.6] - 2026-10-12
+
+### Fixed
+
+- Windows Cursor launches no longer depend on Windows PowerShell 5.1 or on an npm shim. Cursor's own installer provides `cursor-agent.cmd` / `agent.cmd` (and `.ps1`), which `resolveWindowsNodeInvocation` refused with `is not a recognized npm Node shim`. The wrapper is now recognised (it names `CURSOR_INVOKED_AS`, or is the stock `(cursor-)agent` launcher) and resolved, on every launch, to `versions\<ver>\node.exe versions\<ver>\index.js` of the newest installed version, with the `CURSOR_INVOKED_AS` / `NODE_COMPILE_CACHE` environment `cursor-agent.ps1` sets, so Cursor self-updates keep working. Version choice follows `cursor-agent.ps1` (version-shaped directory names only, newest `YYYY.MM.DD` first); two deliberate differences: the build time of the `YYYY.MM.DD-HH-MM-SS-<hash>` form breaks a same-day tie, and a newest version without `node.exe`/`index.js` (half-extracted update) falls back to the next complete one instead of failing. Errors name the launcher, the versions directory and the versions checked. npm-shim behaviour and the refusal of unrelated wrappers are unchanged.
+- The Cursor engine uses the same resolver (the duplicated copy in `persistent-cursor-session.ts` is gone), so its session, `--list-models` and ACP model-catalog launches agree. A bare `cursor-agent` on Windows is looked up on PATH (`.exe`, then `.cmd`) because `spawn()` cannot find the installer's `.cmd` by name.
+
 ## [7.7.0-memento.5] - 2026-10-12
 
 ### Fixed
