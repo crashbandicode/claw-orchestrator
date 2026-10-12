@@ -1,6 +1,6 @@
 /**
  * Codex MCP server selection: validation, `codex mcp list --json` parsing, and
- * the `-c mcp_servers.<name>.enabled=false` overrides built from it.
+ * the `-c` disable and transport-stub overrides built from it.
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -35,7 +35,7 @@ function listProc(stdout: string, code = 0, stderr = ''): EventEmitter {
   return proc;
 }
 
-// Shape of `codex mcp list --json` (0.161.0) including the fields that must never leak.
+// Shape of `codex mcp list --json` (0.161.0), including config fields that must never leak.
 const LIST_JSON = JSON.stringify([
   {
     name: 'maas_slack',
@@ -104,12 +104,12 @@ describe('validateCodexMcpSelection', () => {
 });
 
 describe('parseCodexMcpList', () => {
-  it('keeps only name and enabled', () => {
+  it('keeps only name, enabled, and transport.type', () => {
     const parsed = parseCodexMcpList(LIST_JSON);
     expect(parsed).toEqual([
-      { name: 'maas_slack', enabled: true },
-      { name: 'local-tool', enabled: true },
-      { name: 'off', enabled: false },
+      { name: 'maas_slack', enabled: true, transportType: 'streamable_http' },
+      { name: 'local-tool', enabled: true, transportType: 'stdio' },
+      { name: 'off', enabled: false, transportType: 'stdio' },
     ]);
     expect(JSON.stringify(parsed)).not.toMatch(/SECRET|Bearer|maas\.example/);
   });
@@ -132,10 +132,18 @@ describe('buildMcpDisableArgs', () => {
       '-c',
       'mcp_servers.maas_slack.enabled=false',
       '-c',
+      'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+      '-c',
       'mcp_servers.local-tool.enabled=false',
       '-c',
+      'mcp_servers.local-tool.command="false"',
+      '-c',
       'mcp_servers.off.enabled=false',
+      '-c',
+      'mcp_servers.off.command="false"',
     ]);
+    const emitted = buildMcpDisableArgs(servers, []).join(' ');
+    expect(emitted).not.toMatch(/SECRET|Bearer|maas\.example|\/bin\/x|\/bin\/y|API_KEY/);
   });
 
   it('disables exactly the servers that are not selected', () => {
@@ -143,7 +151,11 @@ describe('buildMcpDisableArgs', () => {
       '-c',
       'mcp_servers.maas_slack.enabled=false',
       '-c',
+      'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+      '-c',
       'mcp_servers.off.enabled=false',
+      '-c',
+      'mcp_servers.off.command="false"',
     ]);
   });
 
@@ -151,10 +163,27 @@ describe('buildMcpDisableArgs', () => {
     expect(tomlKey('plain-name_1')).toBe('plain-name_1');
     expect(tomlKey('dotted.name')).toBe('"dotted.name"');
     expect(tomlKey('has"quote')).toBe('"has\\"quote"');
-    expect(buildMcpDisableArgs([{ name: 'a.b', enabled: true }], [])).toEqual([
+    expect(buildMcpDisableArgs([{ name: 'a.b', enabled: true, transportType: 'stdio' }], [])).toEqual([
       '-c',
       'mcp_servers."a.b".enabled=false',
+      '-c',
+      'mcp_servers."a.b".command="false"',
     ]);
+  });
+
+  it('fails closed when an excluded server has an unknown or missing transport type', () => {
+    expect(() => buildMcpDisableArgs([{ name: 'future', enabled: true, transportType: 'socket' }], [])).toThrow(
+      /Cannot disable Codex MCP server future: unsupported or "socket" transport type/,
+    );
+    expect(() => buildMcpDisableArgs([{ name: 'missing', enabled: true }], [])).toThrow(
+      /Cannot disable Codex MCP server missing: unsupported or missing transport type/,
+    );
+  });
+
+  it('does not add overrides for a selected server, even when its type is unknown', () => {
+    expect(buildMcpDisableArgs([{ name: 'selected', enabled: true, transportType: 'future' }], ['selected'])).toEqual(
+      [],
+    );
   });
 
   it('rejects unknown names, listing only server names', () => {
@@ -178,14 +207,23 @@ describe('buildMcpDisableArgs', () => {
 describe('listCodexMcpServers / resolveCodexMcpDisableArgs', () => {
   beforeEach(() => mockSpawn.mockReset());
 
-  it('runs `codex mcp list --json` in the session cwd and parses names', async () => {
+  it('runs `codex mcp list --json` in the session cwd and parses names and types', async () => {
     mockSpawn.mockReturnValueOnce(listProc(LIST_JSON));
     const out = await resolveCodexMcpDisableArgs({ codexBin: 'codex', cwd: '/work', keep: ['maas_slack'] });
     const [cmd, args, opts] = mockSpawn.mock.calls[0] as [string, string[], { cwd: string }];
     expect(cmd).toBeTruthy();
     expect(args.slice(-3)).toEqual(['mcp', 'list', '--json']);
     expect(opts.cwd).toBe('/work');
-    expect(out).toEqual(['-c', 'mcp_servers.local-tool.enabled=false', '-c', 'mcp_servers.off.enabled=false']);
+    expect(out).toEqual([
+      '-c',
+      'mcp_servers.local-tool.enabled=false',
+      '-c',
+      'mcp_servers.local-tool.command="false"',
+      '-c',
+      'mcp_servers.off.enabled=false',
+      '-c',
+      'mcp_servers.off.command="false"',
+    ]);
   });
 
   it('fails the start when codex cannot list its servers, without echoing stderr', async () => {

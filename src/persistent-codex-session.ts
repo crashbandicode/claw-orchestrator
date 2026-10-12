@@ -109,9 +109,9 @@ export class PersistentCodexSession extends BaseOneShotSession {
   private _rolloutRead = false;
 
   /**
-   * `-c mcp_servers.<name>.enabled=false` for every configured server not in
-   * `codexMcpServers`. Set only for a non-empty selection; undefined means
-   * `--ignore-user-config` alone does the job.
+   * `-c` overrides disable every configured server not in `codexMcpServers` and
+   * add an inert transport stub. Set only for a non-empty selection; undefined
+   * means `--ignore-user-config` alone does the job.
    */
   private _mcpDisableArgs?: string[];
 
@@ -282,7 +282,7 @@ export class PersistentCodexSession extends BaseOneShotSession {
     // still resolves from CODEX_HOME, so this does not log the session out.
     if (this.options.ignoreUserConfig) {
       // --ignore-user-config drops the selected MCP servers' definitions along with the
-      // rest, so a selection is built from per-server nabled=false overrides instead
+      // rest, so a selection is built from per-server disable/stub overrides instead
       // (resolved at start and before each turn; see codex-mcp.ts).
       if (this._mcpDisableArgs) args.push(...this._mcpDisableArgs);
       else args.push('--ignore-user-config');

@@ -621,8 +621,8 @@ describe('PersistentCodexSession', () => {
 
 describe('PersistentCodexSession — MCP server selection', () => {
   const MCP_LIST = JSON.stringify([
-    { name: 'maas_slack', enabled: true },
-    { name: 'docs', enabled: true },
+    { name: 'maas_slack', enabled: true, transport: { type: 'streamable_http', url: 'https://x.invalid/mcp' } },
+    { name: 'docs', enabled: true, transport: { type: 'stdio', command: '/bin/docs' } },
   ]);
 
   function listProc(listing: string) {
@@ -682,7 +682,14 @@ describe('PersistentCodexSession — MCP server selection', () => {
     await p;
     const args = execCalls()[0][1] as string[];
     expect(args).not.toContain('--ignore-user-config');
-    expect(args).toEqual(expect.arrayContaining(['-c', 'mcp_servers.maas_slack.enabled=false']));
+    expect(args).toEqual(
+      expect.arrayContaining([
+        '-c',
+        'mcp_servers.maas_slack.enabled=false',
+        '-c',
+        'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+      ]),
+    );
     expect(args.join(' ')).not.toContain('mcp_servers.docs');
     // Re-resolved before the turn, so a server added to the config meanwhile cannot slip in.
     expect(listCalls()).toHaveLength(2);

@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.7.0-memento.4] - 2026-10-12
+
+### Fixed
+
+- Codex MCP filtering now keeps `codex app-server`'s per-override transport validation satisfied. Disabled stdio and streamable HTTP servers receive inert, same-type stubs, using only `transport.type` from `codex mcp list --json`; selected servers receive no overrides.
+- Added a real-Codex integration check for app-server startup and the selected-server allowlist. It skips when Codex is not installed.
+
 ## [7.7.0-memento.3] - 2026-10-12
 
 ### Fixed

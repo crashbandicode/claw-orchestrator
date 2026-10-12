@@ -443,9 +443,11 @@ export interface SessionConfig {
    * exactly the named ones do. A name the config does not define, or that it has
    * disabled, is rejected. A selection cannot use `--ignore-user-config` (that
    * drops the selected definitions too), so the other servers are switched off
-   * one by one with `-c mcp_servers.<name>.enabled=false` and the rest of the
-   * user's config still loads — the caller's explicit model, sandbox and effort
-   * win over it. Server definitions are never read beyond their names.
+   * one by one with `-c` disable overrides and type-matching inert transport
+   * stubs; the rest of the user's config still loads — the caller's explicit
+   * model, sandbox and effort win over it. The resolver uses only server names,
+   * enabled state, and transport type, never configured commands, URLs, headers,
+   * tokens, or env.
    */
   codexMcpServers?: string[];
   /**

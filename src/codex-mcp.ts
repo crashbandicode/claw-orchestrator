@@ -12,15 +12,16 @@
  *     servers included, so it is only used when nothing is selected.
  *   - `codex app-server` has no such flag, and `-c mcp_servers={}` does not clear
  *     anything — `-c` overrides are merged into the config tables, not swapped in.
- *     What does work, measured against 0.161.0 with a throwaway CODEX_HOME, is
- *     `-c mcp_servers.<name>.enabled=false` per server: the disabled server is
- *     never started.
+ *     The app-server validates each `-c` override layer as a transport. A
+ *     disabled-only override is invalid, so each disabled server also needs an
+ *     inert, same-type transport stub: `command="false"` for stdio and a
+ *     loopback port 9 URL for streamable HTTP.
  *
  * With a selection both engines therefore take the second route. It needs the set
- * of configured server names, which `codex mcp list --json` reports. Only names
- * and the `enabled` flag are read from that output. Transports, headers, bearer
- * tokens and env are never kept, logged or put on a command line, and error
- * messages here carry server names only.
+ * of configured server names, which `codex mcp list --json` reports. Only names,
+ * the `enabled` flag, and `transport.type` are kept from that output. Configured
+ * commands, URLs, headers, bearer tokens, and env are never retained, logged, or
+ * put on a command line, and error messages here carry server names only.
  */
 
 import { spawn } from 'node:child_process';
@@ -38,6 +39,8 @@ const LIST_TIMEOUT_MS = 30_000;
 export interface CodexMcpServerEntry {
   name: string;
   enabled: boolean;
+  /** The transport discriminator only; transport configuration is discarded. */
+  transportType?: string;
 }
 
 /**
@@ -93,7 +96,8 @@ export function tomlKey(name: string): string {
 }
 
 /**
- * Parse the output of `codex mcp list --json`, keeping only name and enabled.
+ * Parse the output of `codex mcp list --json`, keeping only name, enabled, and
+ * `transport.type`.
  * Leading non-JSON lines (warnings that some builds print on stdout) are skipped.
  */
 export function parseCodexMcpList(stdout: string): CodexMcpServerEntry[] {
@@ -109,9 +113,18 @@ export function parseCodexMcpList(stdout: string): CodexMcpServerEntry[] {
   const out: CodexMcpServerEntry[] = [];
   for (const item of parsed) {
     if (!item || typeof item !== 'object') continue;
-    const rec = item as { name?: unknown; enabled?: unknown };
+    const rec = item as {
+      name?: unknown;
+      enabled?: unknown;
+      transport?: { type?: unknown };
+    };
     if (typeof rec.name !== 'string' || rec.name.length === 0) continue;
-    out.push({ name: rec.name, enabled: rec.enabled !== false });
+    const transportType = typeof rec.transport?.type === 'string' ? rec.transport.type : undefined;
+    out.push({
+      name: rec.name,
+      enabled: rec.enabled !== false,
+      ...(transportType === undefined ? {} : { transportType }),
+    });
   }
   return out;
 }
@@ -182,6 +195,8 @@ export function listCodexMcpServers(opts: {
 /**
  * The `-c` arguments that leave only `keep` running among the servers `servers`
  * defines. Unknown or already-disabled selections throw, naming the servers.
+ * A disabled server needs a safe transport stub because the app-server validates
+ * each override layer before applying its `enabled=false` value.
  */
 export function buildMcpDisableArgs(servers: CodexMcpServerEntry[], keep: string[]): string[] {
   const known = new Map(servers.map((s) => [s.name, s]));
@@ -203,7 +218,20 @@ export function buildMcpDisableArgs(servers: CodexMcpServerEntry[], keep: string
   const args: string[] = [];
   for (const s of servers) {
     if (keepSet.has(s.name)) continue;
-    args.push('-c', `mcp_servers.${tomlKey(s.name)}.enabled=false`);
+    const serverKey = `mcp_servers.${tomlKey(s.name)}`;
+    let transportStub: string;
+    if (s.transportType === 'stdio') {
+      transportStub = `${serverKey}.command=${JSON.stringify('false')}`;
+    } else if (s.transportType === 'streamable_http') {
+      transportStub = `${serverKey}.url=${JSON.stringify('http://127.0.0.1:9/')}`;
+    } else {
+      const typeDescription = s.transportType === undefined ? 'missing' : JSON.stringify(s.transportType);
+      throw new Error(
+        `Cannot disable Codex MCP server ${s.name}: unsupported or ${typeDescription} transport type; ` +
+          'only stdio and streamable_http can be disabled safely',
+      );
+    }
+    args.push('-c', `${serverKey}.enabled=false`, '-c', transportStub);
   }
   return args;
 }

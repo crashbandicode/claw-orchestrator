@@ -139,7 +139,11 @@ describe('codex-app engine errors against a real manager and process', () => {
         '-c',
         'mcp_servers.maas_slack.enabled=false',
         '-c',
+        'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+        '-c',
         'mcp_servers.docs.enabled=false',
+        '-c',
+        'mcp_servers.docs.command="false"',
       ]);
     });
   });
@@ -154,7 +158,12 @@ describe('codex-app engine errors against a real manager and process', () => {
         codexMcpServers: ['docs'],
         noSessionPersistence: true,
       });
-      expect(launchedArgs()[0].slice(5)).toEqual(['-c', 'mcp_servers.maas_slack.enabled=false']);
+      expect(launchedArgs()[0].slice(5)).toEqual([
+        '-c',
+        'mcp_servers.maas_slack.enabled=false',
+        '-c',
+        'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+      ]);
     });
   });
 

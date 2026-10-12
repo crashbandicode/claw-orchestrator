@@ -244,7 +244,7 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     }
 
     // `codex app-server` has no --ignore-user-config, so "no user MCP servers" is built
-    // from per-server `-c ...enabled=false` overrides. Resolved before spawning: a
+    // from per-server disable/stub `-c` overrides. Resolved before spawning: a
     // failure here (unknown selection, codex cannot list its servers) must stop the
     // start rather than let the servers the caller excluded load.
     const mcpArgs = await this._mcpConfigArgs();
@@ -293,8 +293,8 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
 
   /**
    * `-c` overrides that leave only the selected MCP servers (none by default) when
-   * `ignoreUserConfig` is set; nothing otherwise. See codex-mcp.ts for why this is
-   * per-server `enabled=false` rather than a flag or an empty table.
+   * `ignoreUserConfig` is set; nothing otherwise. See codex-mcp.ts for why disabled
+   * servers also need a type-matching transport stub.
    */
   private async _mcpConfigArgs(): Promise<string[]> {
     const selection = validateCodexMcpSelection(this.options, 'codex-app');

@@ -1071,7 +1071,11 @@ describe('PersistentCodexAppServerSession — ignoreUserConfig and MCP selection
       '-c',
       'mcp_servers.maas_slack.enabled=false',
       '-c',
+      'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+      '-c',
       'mcp_servers.docs.enabled=false',
+      '-c',
+      'mcp_servers.docs.command="false"',
     ]);
     expect(session.codexThreadId).toBe('t1');
   });
@@ -1089,7 +1093,12 @@ describe('PersistentCodexAppServerSession — ignoreUserConfig and MCP selection
     });
     await session.start();
     const args = appServerArgs();
-    expect(args.slice(5)).toEqual(['-c', 'mcp_servers.maas_slack.enabled=false']);
+    expect(args.slice(5)).toEqual([
+      '-c',
+      'mcp_servers.maas_slack.enabled=false',
+      '-c',
+      'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+    ]);
     expect(args.join(' ')).not.toContain('mcp_servers.docs');
   });
 
