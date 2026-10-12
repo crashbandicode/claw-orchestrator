@@ -5,6 +5,26 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.7.0-memento.4] - 2026-10-12
+
+### Fixed
+
+- Codex MCP filtering now keeps `codex app-server`'s per-override transport validation satisfied. Disabled stdio and streamable HTTP servers receive inert, same-type stubs, using only `transport.type` from `codex mcp list --json`; selected servers receive no overrides.
+- Added a real-Codex integration check for app-server startup and the selected-server allowlist. It skips when Codex is not installed.
+
+## [7.7.0-memento.3] - 2026-10-12
+
+### Fixed
+
+- A `codex app-server` `error` notification no longer ends the broker. The session manager now attaches an `error` listener to every session it creates or resumes, on every engine, before `start()`; the Codex app-server session also logs instead of emitting when nothing listens, and the autoloop runner's background `error` events are logged. Previously an off-network Codex (unreachable MCP servers) restarted the broker and killed every session on the machine.
+- The `error` notification's text is now read from `error.message` (v2 `ErrorNotification`); it was read from a top-level `message` that does not exist, so every error surfaced as the bare `codex app-server error`. `willRetry: true` errors are logged only.
+- `ignoreUserConfig` now works for the `codex-app` engine: every configured MCP server is started disabled (`-c mcp_servers.<name>.enabled=false`, names from `codex mcp list --json`).
+
+### Added
+
+- `codexMcpServers` (CLI `--codex-mcp-servers`) on `session_start`, for the `codex` and `codex-app` engines with `ignoreUserConfig`: keep exactly the named MCP servers from the user's Codex config. Unknown or config-disabled names, other engines, and use without `ignoreUserConfig` are rejected with a clear error; only server names are ever read from the config. CLI `--ignore-user-config` added.
+- Session `health` (`state` ok/degraded/failed, `errorCount`, `lastError`, `lastErrorAt`) in `coding_session_status`, `session_list` and `sessions_overview` once an engine has reported an error. A still-ready engine is `degraded` and keeps serving; a no-longer-ready one is `failed`.
+
 ## [7.7.0-memento.2] - 2026-10-06
 
 ### Fixed

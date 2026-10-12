@@ -618,3 +618,120 @@ describe('PersistentCodexSession', () => {
     });
   });
 });
+
+describe('PersistentCodexSession — MCP server selection', () => {
+  const MCP_LIST = JSON.stringify([
+    { name: 'maas_slack', enabled: true, transport: { type: 'streamable_http', url: 'https://x.invalid/mcp' } },
+    { name: 'docs', enabled: true, transport: { type: 'stdio', command: '/bin/docs' } },
+  ]);
+
+  function listProc(listing: string) {
+    const p = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter };
+    p.stdout = new EventEmitter();
+    p.stderr = new EventEmitter();
+    queueMicrotask(() => {
+      p.stdout.emit('data', Buffer.from(listing));
+      p.emit('close', 0);
+    });
+    return p;
+  }
+
+  const execCalls = () => mockSpawn.mock.calls.filter((c) => (c[1] as string[])[0] === 'exec');
+  const listCalls = () => mockSpawn.mock.calls.filter((c) => (c[1] as string[])[0] === 'mcp');
+
+  beforeEach(() => {
+    process.env.CODEX_HOME = codexHome;
+    mockSpawn.mockReset();
+  });
+
+  it('uses --ignore-user-config alone, and never lists servers, when nothing is selected', async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockReturnValue(proc);
+    const session = new PersistentCodexSession({
+      name: 'test',
+      cwd: '/tmp',
+      permissionMode: 'bypassPermissions',
+      ignoreUserConfig: true,
+    });
+    await session.start();
+    const p = session.send('hi', { waitForComplete: true });
+    setTimeout(() => runTurn(proc, 'thread-mcp-none'), 10);
+    await p;
+    const args = execCalls()[0][1] as string[];
+    expect(args).toContain('--ignore-user-config');
+    expect(args.join(' ')).not.toContain('mcp_servers');
+    expect(listCalls()).toHaveLength(0);
+    session.stop();
+  });
+
+  it('keeps only the selected servers by disabling the others instead of --ignore-user-config', async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockImplementation((_cmd: string, args: string[]) => (args[0] === 'mcp' ? listProc(MCP_LIST) : proc));
+    const session = new PersistentCodexSession({
+      name: 'test',
+      cwd: '/tmp',
+      permissionMode: 'bypassPermissions',
+      ignoreUserConfig: true,
+      codexMcpServers: ['docs'],
+    });
+    await session.start();
+    expect(listCalls()).toHaveLength(1);
+
+    const p = session.send('hi', { waitForComplete: true });
+    setTimeout(() => runTurn(proc, 'thread-mcp-docs'), 10);
+    await p;
+    const args = execCalls()[0][1] as string[];
+    expect(args).not.toContain('--ignore-user-config');
+    expect(args).toEqual(
+      expect.arrayContaining([
+        '-c',
+        'mcp_servers.maas_slack.enabled=false',
+        '-c',
+        'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+      ]),
+    );
+    expect(args.join(' ')).not.toContain('mcp_servers.docs');
+    // Re-resolved before the turn, so a server added to the config meanwhile cannot slip in.
+    expect(listCalls()).toHaveLength(2);
+    session.stop();
+  });
+
+  it('applies the same overrides on a resumed turn', async () => {
+    const proc = createMockProcess();
+    mockSpawn.mockImplementation((_cmd: string, args: string[]) => (args[0] === 'mcp' ? listProc(MCP_LIST) : proc));
+    const session = new PersistentCodexSession({
+      name: 'test',
+      cwd: '/tmp',
+      permissionMode: 'bypassPermissions',
+      ignoreUserConfig: true,
+      codexMcpServers: [],
+    });
+    await session.start();
+    const p1 = session.send('one', { waitForComplete: true });
+    setTimeout(() => runTurn(proc, 'thread-mcp-resume'), 10);
+    await p1;
+
+    const proc2 = createMockProcess();
+    mockSpawn.mockImplementation((_cmd: string, args: string[]) => (args[0] === 'mcp' ? listProc(MCP_LIST) : proc2));
+    const p2 = session.send('two', { waitForComplete: true });
+    setTimeout(() => runTurn(proc2, 'thread-mcp-resume'), 10);
+    await p2;
+    // An empty selection is "no servers": the whole file is ignored natively.
+    const second = execCalls()[1][1] as string[];
+    expect(second.slice(0, 3)).toEqual(['exec', 'resume', 'thread-mcp-resume']);
+    expect(second).toContain('--ignore-user-config');
+    session.stop();
+  });
+
+  it('refuses to start on an unknown server name', async () => {
+    mockSpawn.mockImplementation(() => listProc(MCP_LIST));
+    const session = new PersistentCodexSession({
+      name: 'test',
+      cwd: '/tmp',
+      permissionMode: 'bypassPermissions',
+      ignoreUserConfig: true,
+      codexMcpServers: ['missing'],
+    });
+    await expect(session.start()).rejects.toThrow(/Unknown MCP server in codexMcpServers: missing/);
+  });
+});

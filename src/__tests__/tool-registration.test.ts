@@ -164,6 +164,16 @@ describe('plugin tool registration', () => {
     expect(properties.ignoreUserConfig?.type).toBe('boolean');
   });
 
+  it('declares codexMcpServers as a bounded array of server names on session_start', () => {
+    const properties = (byName.get('session_start')!.parameters.properties ?? {}) as Record<
+      string,
+      Record<string, unknown>
+    >;
+    expect(properties.codexMcpServers?.type).toBe('array');
+    expect(properties.codexMcpServers?.maxItems).toBe(64);
+    expect(properties.codexMcpServers?.items).toMatchObject({ type: 'string' });
+  });
+
   it('declares remote host routing and parent lineage on session_start', () => {
     const properties = (byName.get('session_start')!.parameters.properties ?? {}) as Record<
       string,

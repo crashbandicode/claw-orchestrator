@@ -370,7 +370,14 @@ const plugin = {
           ignoreUserConfig: {
             type: 'boolean',
             description:
-              "Codex engine only. Run without loading $CODEX_HOME/config.toml (`codex exec --ignore-user-config`), so the session is decided by what the caller passed rather than by the machine's own Codex config. Auth still resolves from CODEX_HOME.",
+              "Codex engines only (codex, codex-app). Start without the user's Codex MCP servers, so the session is decided by what the caller passed rather than by the machine's own Codex config. engine codex also skips $CODEX_HOME/config.toml altogether (`codex exec --ignore-user-config`); codex-app, which has no such flag, disables each configured server with `-c` and a same-type inert transport stub derived from `transport.type`, while still reading the rest of the file. Auth still resolves from CODEX_HOME. Keep specific servers with codexMcpServers.",
+          },
+          codexMcpServers: {
+            type: 'array',
+            maxItems: 64,
+            items: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,64}$' },
+            description:
+              "Codex engines only, and only with ignoreUserConfig: true. Names of MCP servers to keep from the user's Codex config; every other configured server is switched off. Omitted or empty = no MCP servers. A name the config does not define, or has disabled, fails the start with the available names. With a selection the engine codex no longer uses --ignore-user-config (it would drop the selected definitions), so the rest of config.toml loads too; explicit model, sandbox and effort still win. The resolver uses only server names, enabled state, and transport.type; configured commands, URLs, headers, tokens and env are never retained, logged or passed to a command line.",
           },
           restricted: {
             type: 'boolean',

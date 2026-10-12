@@ -23,6 +23,7 @@ import type { SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from 
 import { SESSION_EVENT } from './constants.js';
 import { BaseOneShotSession } from './base-oneshot-session.js';
 import { resolveWindowsNodeInvocation } from './windows-command.js';
+import { resolveCodexMcpDisableArgs, validateCodexMcpSelection } from './codex-mcp.js';
 
 // ─── Codex JSON event shapes (subset we consume) ────────────────────────────
 //
@@ -106,6 +107,32 @@ export class PersistentCodexSession extends BaseOneShotSession {
 
   /** Guards the rollout lookup so it runs at most once per session. */
   private _rolloutRead = false;
+
+  /**
+   * `-c` overrides disable every configured server not in `codexMcpServers` and
+   * add an inert transport stub. Set only for a non-empty selection; undefined
+   * means `--ignore-user-config` alone does the job.
+   */
+  private _mcpDisableArgs?: string[];
+
+  override async start(): Promise<this> {
+    await this._refreshMcpDisableArgs();
+    return super.start();
+  }
+
+  /** Resolve the selection against the servers the config defines right now. */
+  private async _refreshMcpDisableArgs(): Promise<void> {
+    const selection = validateCodexMcpSelection(this.options, 'codex');
+    if (this.options.ignoreUserConfig !== true || !selection || selection.length === 0) {
+      this._mcpDisableArgs = undefined;
+      return;
+    }
+    this._mcpDisableArgs = await resolveCodexMcpDisableArgs({
+      codexBin: this.engineBin,
+      cwd: this.options.cwd,
+      keep: selection,
+    });
+  }
 
   constructor(config: SessionConfig, codexBin?: string) {
     super(config, codexBin || process.env.CODEX_BIN || 'codex', {
@@ -253,7 +280,13 @@ export class PersistentCodexSession extends BaseOneShotSession {
     // not the orchestrator's: a `model = …` line in it silently decides which
     // model an orchestrated run uses and which one we then price it as. Auth
     // still resolves from CODEX_HOME, so this does not log the session out.
-    if (this.options.ignoreUserConfig) args.push('--ignore-user-config');
+    if (this.options.ignoreUserConfig) {
+      // --ignore-user-config drops the selected MCP servers' definitions along with the
+      // rest, so a selection is built from per-server disable/stub overrides instead
+      // (resolved at start and before each turn; see codex-mcp.ts).
+      if (this._mcpDisableArgs) args.push(...this._mcpDisableArgs);
+      else args.push('--ignore-user-config');
+    }
     // Extra writable roots. Rejected by `exec resume` (like --sandbox/-C), and
     // the resumed thread keeps the roots the first turn opened.
     if (!isResume && this.options.addDir?.length) {
@@ -313,6 +346,14 @@ export class PersistentCodexSession extends BaseOneShotSession {
   }
 
   protected _run(message: string, options: SessionSendOptions): Promise<TurnResult> {
+    // Only a selection needs this: it is the one case that lists the configured
+    // servers, and a server added to the config mid-session must not slip in.
+    // Everything else spawns synchronously, exactly as before.
+    if (!this._mcpDisableArgs) return this._runTurn(message, options);
+    return this._refreshMcpDisableArgs().then(() => this._runTurn(message, options));
+  }
+
+  private _runTurn(message: string, options: SessionSendOptions): Promise<TurnResult> {
     // Read before spawning: on a resumed thread the baseline has to be the
     // cumulative total as of the *previous* turn, and this turn is about to
     // append its own to the same file.

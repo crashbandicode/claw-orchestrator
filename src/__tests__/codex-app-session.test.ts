@@ -905,3 +905,241 @@ describe('codex app-server busy across a caller timeout', () => {
     expect(turnStartCalls(proc)).toHaveLength(2);
   });
 });
+
+// ─── error notifications and MCP configuration ─────────────────────────────
+
+function pushNotification(proc: ReturnType<typeof createMockProc>, method: string, params: unknown): void {
+  proc.stdout.push(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
+}
+
+const tick = (ms = 10) => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe('PersistentCodexAppServerSession — error notifications', () => {
+  beforeEach(() => {
+    mockSpawn.mockReset();
+  });
+
+  it('reads the message from the v2 ErrorNotification and reports it as an Error', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    const errors: Error[] = [];
+    session.on('error', (e: Error) => errors.push(e));
+
+    pushNotification(proc, 'error', {
+      error: { message: 'Transport channel closed, http/request failed' },
+      threadId: 't1',
+      turnId: 'turn1',
+      willRetry: false,
+    });
+    await tick();
+
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toBe('Transport channel closed, http/request failed');
+    expect((errors[0] as Error & { turnId?: string }).turnId).toBe('turn1');
+    // Reporting is not a stop: the app-server and the session carry on.
+    expect(session.isReady).toBe(true);
+  });
+
+  it('still honours the flat message shape older servers sent', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    const errors: Error[] = [];
+    session.on('error', (e: Error) => errors.push(e));
+    pushNotification(proc, 'error', { message: 'flat shape' });
+    await tick();
+    expect(errors.map((e) => e.message)).toEqual(['flat shape']);
+  });
+
+  it('does not throw when an error notification carries no message and nothing listens', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    const logs: string[] = [];
+    session.on('log', (m: string) => logs.push(m));
+
+    // Before the fix this was `emit('error')` with no listener: an uncaught exception.
+    expect(() => pushNotification(proc, 'error', {})).not.toThrow();
+    await tick();
+
+    expect(session.isReady).toBe(true);
+    expect(logs.some((l) => l.includes('codex app-server error (no message)'))).toBe(true);
+  });
+
+  it('records an error notification without a message when something listens', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    const errors: Error[] = [];
+    session.on('error', (e: Error) => errors.push(e));
+    pushNotification(proc, 'error', {});
+    await tick();
+    expect(errors.map((e) => e.message)).toEqual(['codex app-server error (no message)']);
+  });
+
+  it('logs a will-retry error instead of reporting a failure', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    const errors: Error[] = [];
+    const logs: string[] = [];
+    session.on('error', (e: Error) => errors.push(e));
+    session.on('log', (m: string) => logs.push(m));
+    pushNotification(proc, 'error', { error: { message: 'stream dropped' }, willRetry: true });
+    await tick();
+    expect(errors).toHaveLength(0);
+    expect(logs.some((l) => l.includes('will retry: stream dropped'))).toBe(true);
+  });
+
+  it('keeps an in-flight turn running through an error and settles it on turn/completed', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    session.on('error', () => undefined);
+
+    const p = session.send('work', { waitForComplete: true, timeout: 2_000 });
+    setTimeout(() => {
+      pushNotification(proc, 'error', { error: { message: 'mcp unreachable' }, willRetry: false, turnId: 'turn-A' });
+    }, 5);
+    setTimeout(() => completeTurn(proc, 'turn-A'), 25);
+
+    const result = (await p) as { text: string };
+    expect(result.text).toBe('ok');
+    expect(session.isBusy).toBe(false);
+    expect(session.getStats().turnsSucceeded).toBe(1);
+  });
+
+  it('rejects an in-flight turn through the existing path when the server then fails the turn', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    session.on('error', () => undefined);
+
+    const p = session.send('work', { waitForComplete: true, timeout: 2_000 });
+    setTimeout(() => pushNotification(proc, 'error', { error: { message: 'fatal' }, willRetry: false }), 5);
+    setTimeout(
+      () => pushNotification(proc, 'turn/completed', { threadId: 't1', turn: { id: 'turn-B', status: 'failed' } }),
+      25,
+    );
+    await expect(p).rejects.toThrow(/turn failed/i);
+    expect(session.isBusy).toBe(false);
+  });
+});
+
+describe('PersistentCodexAppServerSession — ignoreUserConfig and MCP selection', () => {
+  // Braces: a beforeEach that returns the mock would have vitest call it as cleanup, with no arguments.
+  beforeEach(() => {
+    mockSpawn.mockReset();
+  });
+
+  const MCP_LIST = JSON.stringify([
+    { name: 'maas_slack', enabled: true, transport: { type: 'streamable_http', url: 'https://x.invalid/mcp' } },
+    { name: 'docs', enabled: true, transport: { type: 'stdio', command: '/bin/docs' } },
+  ]);
+
+  /** Route `codex mcp list --json` and `codex app-server` to their own mock processes. */
+  function routeSpawn(appProc: ReturnType<typeof createMockProc>, listing = MCP_LIST) {
+    mockSpawn.mockImplementation((_cmd: string, args: string[]) => {
+      if (args[0] === 'mcp') {
+        const p = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter };
+        p.stdout = new EventEmitter();
+        p.stderr = new EventEmitter();
+        queueMicrotask(() => {
+          p.stdout.emit('data', Buffer.from(listing));
+          p.emit('close', 0);
+        });
+        return p;
+      }
+      return appProc;
+    });
+  }
+
+  const appServerArgs = () =>
+    (mockSpawn.mock.calls.find((c) => (c[1] as string[])[0] === 'app-server')?.[1] ?? []) as string[];
+
+  it('starts the app-server with every MCP server disabled and nothing else changed', async () => {
+    const proc = createMockProc(defaultResponder());
+    routeSpawn(proc);
+    const session = new PersistentCodexAppServerSession({
+      name: 't',
+      cwd: '/tmp',
+      permissionMode: 'bypassPermissions',
+      engine: 'codex-app',
+      ignoreUserConfig: true,
+    });
+    await session.start();
+    expect(appServerArgs()).toEqual([
+      'app-server',
+      '--listen',
+      'stdio://',
+      '--enable',
+      'goals',
+      '-c',
+      'mcp_servers.maas_slack.enabled=false',
+      '-c',
+      'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+      '-c',
+      'mcp_servers.docs.enabled=false',
+      '-c',
+      'mcp_servers.docs.command="false"',
+    ]);
+    expect(session.codexThreadId).toBe('t1');
+  });
+
+  it('keeps exactly the selected servers', async () => {
+    const proc = createMockProc(defaultResponder());
+    routeSpawn(proc);
+    const session = new PersistentCodexAppServerSession({
+      name: 't',
+      cwd: '/tmp',
+      permissionMode: 'bypassPermissions',
+      engine: 'codex-app',
+      ignoreUserConfig: true,
+      codexMcpServers: ['docs'],
+    });
+    await session.start();
+    const args = appServerArgs();
+    expect(args.slice(5)).toEqual([
+      '-c',
+      'mcp_servers.maas_slack.enabled=false',
+      '-c',
+      'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
+    ]);
+    expect(args.join(' ')).not.toContain('mcp_servers.docs');
+  });
+
+  it('adds no MCP arguments without ignoreUserConfig, and never lists the servers', async () => {
+    const proc = createMockProc(defaultResponder());
+    routeSpawn(proc);
+    const session = new PersistentCodexAppServerSession({
+      name: 't',
+      cwd: '/tmp',
+      permissionMode: 'bypassPermissions',
+      engine: 'codex-app',
+    });
+    await session.start();
+    expect(appServerArgs()).toEqual(['app-server', '--listen', 'stdio://', '--enable', 'goals']);
+    expect(mockSpawn.mock.calls.some((c) => (c[1] as string[])[0] === 'mcp')).toBe(false);
+  });
+
+  it('refuses to start, without spawning the app-server, on an unknown server name', async () => {
+    const proc = createMockProc(defaultResponder());
+    routeSpawn(proc);
+    const session = new PersistentCodexAppServerSession({
+      name: 't',
+      cwd: '/tmp',
+      permissionMode: 'bypassPermissions',
+      engine: 'codex-app',
+      ignoreUserConfig: true,
+      codexMcpServers: ['nope'],
+    });
+    await expect(session.start()).rejects.toThrow(/Unknown MCP server in codexMcpServers: nope.*maas_slack, docs/);
+    expect(appServerArgs()).toEqual([]);
+  });
+
+  it('refuses a selection without ignoreUserConfig', async () => {
+    const session = new PersistentCodexAppServerSession({
+      name: 't',
+      cwd: '/tmp',
+      permissionMode: 'bypassPermissions',
+      engine: 'codex-app',
+      codexMcpServers: ['docs'],
+    });
+    await expect(session.start()).rejects.toThrow(/requires ignoreUserConfig/);
+    expect(mockSpawn).not.toHaveBeenCalled();
+  });
+});
