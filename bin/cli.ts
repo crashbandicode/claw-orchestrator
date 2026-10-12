@@ -306,6 +306,14 @@ program
   .option('--base-url <url>', 'Custom API endpoint (for proxy)')
   .option('--add-dir <dirs>', 'Comma-separated additional working directories')
   .option(
+    '--ignore-user-config',
+    "Codex engines: start without the user's Codex MCP servers (engine codex also skips config.toml); keep some with --codex-mcp-servers",
+  )
+  .option(
+    '--codex-mcp-servers <names>',
+    'Codex engines, with --ignore-user-config: comma-separated MCP server names to keep from the Codex config',
+  )
+  .option(
     '--custom-engine <preset>',
     'With -e custom: the id of a bundled engine preset (see `clawo engines`). Inline configs are not accepted here — that is what presets are for',
   )
@@ -343,6 +351,12 @@ program
         .map((s: string) => s.trim())
         .filter(Boolean);
     if (opts.enableAutoMode) body.enableAutoMode = true;
+    if (opts.ignoreUserConfig) body.ignoreUserConfig = true;
+    if (opts.codexMcpServers)
+      body.codexMcpServers = opts.codexMcpServers
+        .split(',')
+        .map((s: string) => s.trim())
+        .filter(Boolean);
     if (opts.maxTurns) {
       const v = parseInt(opts.maxTurns);
       if (isNaN(v) || v <= 0) {

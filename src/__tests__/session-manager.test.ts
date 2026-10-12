@@ -2879,4 +2879,177 @@ describe('SessionManager', () => {
       expect(identityBoundEvents(runId)).toHaveLength(before);
     });
   });
+
+  describe('engine error guard', () => {
+    // EventEmitter throws an `error` event nobody listens for, which ends the host
+    // process. MockSession extends EventEmitter exactly as the real sessions do, so
+    // without the manager's listener these emits would throw out of the test.
+
+    it('survives an error event with no message and records it on the session', async () => {
+      await mgr.startSession({ name: 'guarded', cwd: '/tmp', engine: 'codex-app' });
+      const mock = lastMock();
+
+      expect(() => mock.emit(SESSION_EVENT.ERROR, new Error(''))).not.toThrow();
+      expect(() => mock.emit(SESSION_EVENT.ERROR, undefined)).not.toThrow();
+
+      const status = mgr.getStatus('guarded');
+      expect(status.health).toMatchObject({ state: 'degraded', errorCount: 2 });
+      expect(status.health?.lastError).toBe('engine reported an error without a message');
+      expect(status.health?.lastErrorAt).toBeTruthy();
+      expect(mgr.listSessions().find((s) => s.name === 'guarded')?.health?.errorCount).toBe(2);
+    });
+
+    it('reports no health for a session that has had no errors', async () => {
+      const info = await mgr.startSession({ name: 'quiet', cwd: '/tmp' });
+      expect(info.health).toBeUndefined();
+      expect(mgr.getStatus('quiet').health).toBeUndefined();
+      expect(mgr.health().details[0].health).toBeUndefined();
+    });
+
+    it('keeps other sessions working while one reports errors', async () => {
+      await mgr.startSession({ name: 'noisy', cwd: '/tmp', engine: 'codex-app' });
+      const noisy = lastMock();
+      await mgr.startSession({ name: 'steady', cwd: '/tmp', engine: 'codex-app' });
+
+      noisy.emit(SESSION_EVENT.ERROR, new Error('Transport channel closed'));
+
+      const reply = await mgr.sendMessage('steady', 'still there?');
+      expect(reply.output).toContain('still there?');
+      expect(mgr.getStatus('steady').health).toBeUndefined();
+      expect(mgr.getStatus('noisy').health?.lastError).toBe('Transport channel closed');
+    });
+
+    it('settles an in-flight turn normally, and a clean turn clears degraded', async () => {
+      await mgr.startSession({ name: 'inflight', cwd: '/tmp', engine: 'codex-app' });
+      const mock = lastMock();
+      mock.sendImplementation = async () => {
+        mock.emit(SESSION_EVENT.ERROR, new Error('mcp server unreachable'));
+        return { text: 'done anyway', event: { type: 'result', result: 'done' } };
+      };
+
+      const result = await mgr.sendMessage('inflight', 'work');
+      expect(result.output).toBe('done anyway');
+      expect(result.error).toBeUndefined();
+      // The error was recorded during the turn; the turn then completed cleanly.
+      expect(mgr.getStatus('inflight').health).toMatchObject({ state: 'ok', errorCount: 1 });
+    });
+
+    it('lets a failing in-flight turn reject through the existing path', async () => {
+      await mgr.startSession({ name: 'inflight-fail', cwd: '/tmp', engine: 'codex-app' });
+      const mock = lastMock();
+      mock.sendImplementation = async () => {
+        mock.emit(SESSION_EVENT.ERROR, new Error('fatal'));
+        throw new Error('Codex app-server turn failed');
+      };
+      await expect(mgr.sendMessage('inflight-fail', 'work')).rejects.toThrow(/turn failed/);
+      expect(mgr.getStatus('inflight-fail').health).toMatchObject({ state: 'degraded', errorCount: 1 });
+      // The session is still usable afterwards.
+      mock.sendImplementation = undefined;
+      await expect(mgr.sendMessage('inflight-fail', 'again')).resolves.toBeTruthy();
+      expect(mgr.getStatus('inflight-fail').health?.state).toBe('ok');
+    });
+
+    it('marks a session failed when its engine is no longer ready, and keeps it failed', async () => {
+      await mgr.startSession({ name: 'dead', cwd: '/tmp', engine: 'codex-app' });
+      const mock = lastMock();
+      mock.setReady(false);
+      mock.emit(SESSION_EVENT.ERROR, new Error('app-server exited'));
+      expect(mgr.getStatus('dead').health).toMatchObject({ state: 'failed', errorCount: 1 });
+      // A later recovery of the flag does not hide that the engine died.
+      mock.setReady(true);
+      mock.emit(SESSION_EVENT.ERROR, new Error('again'));
+      expect(mgr.getStatus('dead').health?.state).toBe('failed');
+      expect(mgr.health().details.find((d) => d.name === 'dead')?.health?.state).toBe('failed');
+    });
+
+    it('reports a degraded session as failed once its engine has gone away', async () => {
+      await mgr.startSession({ name: 'went-away', cwd: '/tmp', engine: 'codex-app' });
+      const mock = lastMock();
+      mock.emit(SESSION_EVENT.ERROR, new Error('mcp unreachable'));
+      expect(mgr.getStatus('went-away').health?.state).toBe('degraded');
+      mock.setReady(false);
+      expect(mgr.getStatus('went-away').health?.state).toBe('failed');
+    });
+
+    it('catches an error reported during start(), before the session is registered', async () => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (): ISession => {
+        const mock = new MockSession();
+        mock.start = async function (this: MockSession) {
+          // What a codex-app handshake does when the server reports an MCP failure.
+          this.emit(SESSION_EVENT.ERROR, new Error('startup notification'));
+          this.sessionId = 'started';
+          return this;
+        };
+        mockSessions.push(mock);
+        return mock;
+      };
+      await expect(mgr.startSession({ name: 'handshake', cwd: '/tmp', engine: 'codex-app' })).resolves.toBeTruthy();
+      // The session was ready by the time start() resolved, so the error was survivable.
+      expect(mgr.getStatus('handshake').health).toMatchObject({
+        state: 'degraded',
+        errorCount: 1,
+        lastError: 'startup notification',
+      });
+    });
+
+    it('redacts secrets and caps the recorded message', async () => {
+      await mgr.startSession({ name: 'redact', cwd: '/tmp', engine: 'codex-app' });
+      lastMock().emit(SESSION_EVENT.ERROR, new Error(`auth failed: Bearer abc.def-123 ${'x'.repeat(2000)}`));
+      const msg = mgr.getStatus('redact').health?.lastError ?? '';
+      expect(msg).toContain('Bearer ***');
+      expect(msg).not.toContain('abc.def-123');
+      expect(msg.length).toBeLessThanOrEqual(500);
+    });
+
+    it('guards every engine, not only codex-app', async () => {
+      await mgr.shutdown();
+      mgr = createManager({ maxConcurrentSessions: 20 });
+      for (const engine of ['claude', 'codex', 'opencode', 'cursor', 'grok', 'agy', 'gemini'] as const) {
+        await mgr.startSession({ name: `g-${engine}`, cwd: '/tmp', engine });
+        expect(() => lastMock().emit(SESSION_EVENT.ERROR, new Error(`${engine} boom`))).not.toThrow();
+        expect(mgr.getStatus(`g-${engine}`).health?.errorCount).toBe(1);
+      }
+    });
+
+    it('guards a session started by switchModel', async () => {
+      await mgr.startSession({ name: 'switched', cwd: '/tmp', engine: 'cursor' });
+      lastMock().cursorChatId = NATIVE_CURSOR_ID;
+      await mgr.switchModel('switched', 'composer-2.5');
+      expect(() => lastMock().emit(SESSION_EVENT.ERROR, new Error('after switch'))).not.toThrow();
+      expect(mgr.getStatus('switched').health?.lastError).toBe('after switch');
+    });
+  });
+
+  describe('codexMcpServers validation', () => {
+    it('refuses a selection on an engine that would ignore it', async () => {
+      await expect(
+        mgr.startSession({
+          name: 'sel-claude',
+          cwd: '/tmp',
+          engine: 'claude',
+          ignoreUserConfig: true,
+          codexMcpServers: ['a'],
+        }),
+      ).rejects.toThrow(/only supported by the 'codex' and 'codex-app' engines/);
+      expect(mgr.hasSession('sel-claude')).toBe(false);
+    });
+
+    it('refuses a selection without ignoreUserConfig', async () => {
+      await expect(
+        mgr.startSession({ name: 'sel-noignore', cwd: '/tmp', engine: 'codex-app', codexMcpServers: ['a'] }),
+      ).rejects.toThrow(/requires ignoreUserConfig/);
+    });
+
+    it('passes a valid selection through to the engine config', async () => {
+      await mgr.startSession({
+        name: 'sel-ok',
+        cwd: '/tmp',
+        engine: 'codex-app',
+        ignoreUserConfig: true,
+        codexMcpServers: ['docs'],
+      });
+      expect(createdConfigs.at(-1)).toMatchObject({ ignoreUserConfig: true, codexMcpServers: ['docs'] });
+    });
+  });
 });

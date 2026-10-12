@@ -107,6 +107,8 @@ clawo session-start [name] [options]
 | `--origin-host <name>`          | Source host display name                                                                    |
 | `--base-url <url>`              | Custom API endpoint (for proxy)                                                             |
 | `--add-dir <dirs>`              | Comma-separated additional working directories                                              |
+| `--ignore-user-config`          | Codex engines: start without the user's Codex MCP servers                                   |
+| `--codex-mcp-servers <names>`   | Codex engines, with `--ignore-user-config`: comma-separated MCP server names to keep         |
 | `--custom-engine <preset>`      | With `-e custom`: the id of a bundled engine preset (see [`clawo engines`](#clawo-engines)) |
 
 The remaining `session_start` options (hook events, permission-prompt tool, debug output, `fromPr`, MCP channels, prompt-cache settings and others) are tool parameters only and have no CLI flag. See [Tools Reference](./tools.md#session_start).

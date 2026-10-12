@@ -437,6 +437,18 @@ export interface SessionConfig {
    */
   ignoreUserConfig?: boolean;
   /**
+   * Codex engines (`codex`, `codex-app`) only, and only with `ignoreUserConfig`.
+   * Names of MCP servers to keep from the user's Codex config. With
+   * `ignoreUserConfig` and no selection no MCP server starts; with a selection
+   * exactly the named ones do. A name the config does not define, or that it has
+   * disabled, is rejected. A selection cannot use `--ignore-user-config` (that
+   * drops the selected definitions too), so the other servers are switched off
+   * one by one with `-c mcp_servers.<name>.enabled=false` and the rest of the
+   * user's config still loads — the caller's explicit model, sandbox and effort
+   * win over it. Server definitions are never read beyond their names.
+   */
+  codexMcpServers?: string[];
+  /**
    * Claude Code only. Restricted mode (`--restricted`): the CLI removes the
    * built-in tools that run commands or code — Bash, PowerShell, the REPL — plus
    * WebFetch unless `tools` names them, and ignores user, project and local
@@ -649,6 +661,27 @@ export interface StreamEvent {
 
 // ─── Results ─────────────────────────────────────────────────────────────────
 
+/**
+ * How a managed session stands after engine-reported errors.
+ *
+ * - `degraded`: the engine reported an error but its process is still ready.
+ *   Codex raises these for conditions it survives (an unreachable MCP server, a
+ *   retried stream). The session keeps serving turns, and the next turn that
+ *   completes cleanly returns it to `ok`.
+ * - `failed`: the engine process is gone or not ready. It stays failed until the
+ *   session is stopped and started again; sends are refused by the engine.
+ */
+export type SessionHealthState = 'ok' | 'degraded' | 'failed';
+
+/** Engine errors recorded against a managed session. Message text is secret-redacted and length-capped. */
+export interface SessionHealth {
+  state: SessionHealthState;
+  /** Errors reported since the session started, including ones that did not change its state. */
+  errorCount: number;
+  lastError?: string;
+  lastErrorAt?: string;
+}
+
 export interface SessionInfo {
   name: string;
   claudeSessionId?: string;
@@ -663,6 +696,8 @@ export interface SessionInfo {
   budgetUsd?: number;
   /** True once `costUsd` reached `budgetUsd` — further turns are refused. */
   budgetExhausted?: boolean;
+  /** Present once the engine has reported an error; absent means none so far. */
+  health?: SessionHealth;
   engine?: EngineType;
   orchestrationRunId?: string;
   orchestrationAgentKey?: string;

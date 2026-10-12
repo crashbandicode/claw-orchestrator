@@ -28,6 +28,7 @@ import * as readline from 'node:readline';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { resolveWindowsNodeInvocation } from './windows-command.js';
+import { resolveCodexMcpDisableArgs, validateCodexMcpSelection } from './codex-mcp.js';
 
 import type {
   SessionConfig,
@@ -102,6 +103,26 @@ interface AgentMessageDeltaNotification {
 interface TurnCompletedNotification {
   threadId: string;
   turn: { id: string; status: string };
+}
+
+/** v2 `ErrorNotification` (plus the flat `message` older servers sent). */
+interface ErrorNotification {
+  error?: { message?: string; additionalDetails?: string | null };
+  message?: string;
+  threadId?: string;
+  turnId?: string;
+  willRetry?: boolean;
+}
+
+/** An `error` notification from the app-server, as an `Error` the session manager can record. */
+export class CodexAppServerError extends Error {
+  constructor(
+    message: string,
+    readonly turnId?: string,
+  ) {
+    super(message);
+    this.name = 'CodexAppServerError';
+  }
 }
 
 /** Historical Claw public key `codex-app-<8>-<timestamp>`. Not a Codex thread id. */
@@ -222,8 +243,14 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
       );
     }
 
+    // `codex app-server` has no --ignore-user-config, so "no user MCP servers" is built
+    // from per-server `-c ...enabled=false` overrides. Resolved before spawning: a
+    // failure here (unknown selection, codex cannot list its servers) must stop the
+    // start rather than let the servers the caller excluded load.
+    const mcpArgs = await this._mcpConfigArgs();
+
     try {
-      const args = ['app-server', '--listen', 'stdio://', '--enable', 'goals'];
+      const args = ['app-server', '--listen', 'stdio://', '--enable', 'goals', ...mcpArgs];
       const invocation = resolveWindowsNodeInvocation(this.codexBin);
       this.proc = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
         cwd: this.options.cwd,
@@ -262,6 +289,21 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
       await this._abortStartup();
       throw err;
     }
+  }
+
+  /**
+   * `-c` overrides that leave only the selected MCP servers (none by default) when
+   * `ignoreUserConfig` is set; nothing otherwise. See codex-mcp.ts for why this is
+   * per-server `enabled=false` rather than a flag or an empty table.
+   */
+  private async _mcpConfigArgs(): Promise<string[]> {
+    const selection = validateCodexMcpSelection(this.options, 'codex-app');
+    if (this.options.ignoreUserConfig !== true) return [];
+    return resolveCodexMcpDisableArgs({
+      codexBin: this.codexBin,
+      cwd: this.options.cwd,
+      keep: selection ?? [],
+    });
   }
 
   /**
@@ -421,7 +463,7 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     }
 
     if (!options.waitForComplete) {
-      this._fireAndForgetTurn(text, options).catch((err) => this.emit(SESSION_EVENT.ERROR, err));
+      this._fireAndForgetTurn(text, options).catch((err) => this._reportError(err as Error));
       return { requestId: this._nextRpcId, sent: true };
     }
 
@@ -650,8 +692,25 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
         break;
       }
       case 'error': {
-        const p = params as { message?: string };
-        this.emit(SESSION_EVENT.ERROR, new Error(p.message ?? 'codex app-server error'));
+        // v2 `ErrorNotification` is `{ error: TurnError, threadId, turnId, willRetry }`
+        // (generate-json-schema, 0.161.0); the text is at `error.message`. Reading a
+        // top-level `message` found nothing, so every error surfaced as the bare
+        // 'codex app-server error' with no cause. A top-level `message` is still
+        // honoured for servers that send the older flat shape.
+        const p = params as ErrorNotification;
+        const text = p.error?.message ?? p.message;
+        const message = typeof text === 'string' && text.length > 0 ? text : 'codex app-server error (no message)';
+        if (p.willRetry === true) {
+          // Codex is retrying (a dropped stream, a reconnect) and the turn goes on.
+          // It is progress information, not a failure to report.
+          this.emit(SESSION_EVENT.LOG, `[codex-app-error] will retry: ${message}`);
+          break;
+        }
+        // Reported, never thrown: the notification does not end the turn or the
+        // server. A turn that really failed is settled by the `turn/completed`
+        // that follows it, and a dead server by the process `exit` handler, so
+        // settling the waiter here would also free a turn Codex is still running.
+        this._reportError(new CodexAppServerError(message, p.turnId));
         break;
       }
       default:
@@ -854,6 +913,20 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     const value = this._rpcEffort(explicitTurn ? turnEffort : this.options.effort) ?? this._sessionDefaultEffort;
     if (value) params.effort = value;
     return params;
+  }
+
+  /**
+   * Emit `error` only when something listens. An unlistened `error` event is thrown
+   * by EventEmitter from inside the stdout callback, which ends the host process;
+   * the session manager always listens, but a session used on its own may not, and
+   * one app-server's notification must never be able to kill its host.
+   */
+  private _reportError(err: Error): void {
+    if (this.listenerCount(SESSION_EVENT.ERROR) > 0) {
+      this.emit(SESSION_EVENT.ERROR, err);
+    } else {
+      this.emit(SESSION_EVENT.LOG, `[codex-app-error] ${err.message}`);
+    }
   }
 
   private _addHistory(entry: { time: string; type: string; event: unknown }): void {

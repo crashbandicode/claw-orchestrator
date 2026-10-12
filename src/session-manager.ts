@@ -161,6 +161,8 @@ import {
 import { checkBudget, isBudgetExceeded } from './budget.js';
 import { InboxManager, type SessionLookup } from './inbox-manager.js';
 import { sanitizeCwd, validateName } from './validation.js';
+import { sanitizeSecrets } from './sanitize.js';
+import { validateCodexMcpSelection } from './codex-mcp.js';
 import { PersistentClaudeSession } from './persistent-session.js';
 import {
   cloneTranscript,
@@ -183,6 +185,7 @@ import { resolveCustomEngine } from './engine-presets.js';
 import {
   type SessionConfig,
   type SessionInfo,
+  type SessionHealth,
   type SendOptions,
   type PermissionDenial,
   type SendResult,
@@ -288,7 +291,23 @@ interface ManagedSession {
    * so a first turn that fails does not strand the conversation it was carrying.
    */
   pendingHandoff?: string;
+  /**
+   * Engine errors recorded by the guard `_guardSessionEvents()` installs on every
+   * session. Shared with that guard's closures, which are attached before the
+   * session starts (an engine can report an error during its own handshake), so
+   * this object exists before the `ManagedSession` does.
+   */
+  health: SessionHealthRecord;
 }
+
+/**
+ * Mutable form of `SessionHealth` kept per managed session. `starting` is true until
+ * `start()` resolves: an engine that is not ready yet is not a failed one.
+ */
+type SessionHealthRecord = SessionHealth & { starting?: boolean };
+
+/** Cap on a recorded error message, so a verbose engine error cannot bloat session listings. */
+const MAX_RECORDED_ERROR_CHARS = 500;
 
 /**
  * Structural type for the `codex-app` engine session, exposing the app-server
@@ -820,6 +839,9 @@ export class SessionManager {
       // Circuit breaker and proxy setup are part of starting the declared
       // child. Every rejection must therefore close its lifecycle record.
       this._circuitBreaker.check(engine);
+      // A selection on an engine that would ignore it, or without ignoreUserConfig,
+      // is refused here rather than silently starting servers the caller excluded.
+      validateCodexMcpSelection(fullConfig, engine);
       if (engine === 'claude' && fullConfig.resolvedModel && !fullConfig.baseUrl) {
         if (!isClaudeModel(fullConfig.resolvedModel!)) {
           const proxyPort = await this._ensureProxyServer();
@@ -836,6 +858,9 @@ export class SessionManager {
     }
 
     session.on(SESSION_EVENT.LOG, (...args: unknown[]) => this.logger.info(`[Session:${name}]`, ...args));
+    // Before start(): an engine may report an error during its own handshake.
+    const health: SessionHealthRecord = { state: 'ok', errorCount: 0, starting: true };
+    this._guardSessionEvents(name, session, health);
 
     try {
       await session.start();
@@ -848,6 +873,7 @@ export class SessionManager {
 
     // Engine started successfully — reset circuit breaker
     this._circuitBreaker.reset(engine);
+    health.starting = false;
 
     // Track child process PID for orphan cleanup
     if (session.pid) {
@@ -865,6 +891,7 @@ export class SessionManager {
       skipPersistence: skipPersist,
       orchestration,
       orchestrationLastStatus: 'idle',
+      health,
     };
 
     release();
@@ -1005,6 +1032,7 @@ export class SessionManager {
             turnError = String((evt.result as string) || result.text || 'turn failed');
           }
           this._setOrchestrationAgentStatus(managed, turnError ? 'failed' : 'idle');
+          if (!turnError && managed.health.state === 'degraded') managed.health.state = 'ok';
           // Surfaced here because this is the one place every caller funnels
           // through. The result event was dropped at this line, and it is the
           // only record of a blocked call: the turn itself still reports success.
@@ -1899,11 +1927,13 @@ export class SessionManager {
       costUsd: number;
       contextPercent: number;
       lastActivity: string | null;
+      health?: SessionHealth;
     }>;
     circuitBreakers: Record<string, { failures: number; backoffUntil: string | null }>;
   } {
     const details = Array.from(this.sessions.entries()).map(([name, managed]) => {
       const stats = managed.session.getStats();
+      const health = this._healthOf(managed);
       return {
         name,
         ready: stats.isReady,
@@ -1914,6 +1944,7 @@ export class SessionManager {
         costUsd: stats.costUsd,
         contextPercent: stats.contextPercent,
         lastActivity: stats.lastActivity,
+        ...(health ? { health } : {}),
       };
     });
 
@@ -2697,6 +2728,7 @@ export class SessionManager {
     const resumeSessionId = this._managedResumeId(managed);
     if (resumeSessionId) managed.claudeSessionId = resumeSessionId;
     const costUsd = this._spentUsd(managed);
+    const health = this._healthOf(managed);
     const info: SessionInfo = {
       name,
       claudeSessionId: resumeSessionId,
@@ -2706,6 +2738,7 @@ export class SessionManager {
       paused: false,
       stats,
       costUsd: Math.round(costUsd * 10000) / 10000,
+      ...(health ? { health } : {}),
       engine: managed.config.engine,
       orchestrationRunId: managed.orchestration.runId,
       orchestrationAgentKey: managed.orchestration.agentKey,
@@ -2782,6 +2815,76 @@ export class SessionManager {
 
   private _emitOrchestrationRunStatus(context: OrchestrationAgentContext, status: OrchestrationRunStatus): void {
     this._orchestrationEvents.emit('run.status', context, { runStatus: status });
+  }
+
+  /**
+   * Give a session an `error` listener for its whole life.
+   *
+   * `EventEmitter` throws an `error` event that nobody listens for, and the throw
+   * happens inside whichever stdout or readline callback raised it, so it is an
+   * uncaught exception that ends the process. The broker hosts every session on
+   * the machine, so one engine reporting one error used to take all of them down
+   * (observed: a codex app-server `error` notification restarted the broker six
+   * times in one morning). Every session this manager creates or resumes goes
+   * through here, whatever its engine, so no session can do that again.
+   *
+   * What an error means is left to the session that raised it: its own pending
+   * send is settled by the session (claude and custom reject through their own
+   * `error` listeners, codex-app on `turn/completed` or process exit). This guard
+   * only keeps the process alive and records the event where status can show it.
+   * It must never throw itself.
+   */
+  private _guardSessionEvents(name: string, session: ISession, health: SessionHealthRecord): void {
+    session.on(SESSION_EVENT.ERROR, (...args: unknown[]) => {
+      try {
+        this._recordSessionError(name, session, health, args[0]);
+      } catch (guardErr) {
+        // A failure to record is not worth the process; say so and carry on.
+        try {
+          this.logger.error(`[Session:${name}] error guard failed: ${(guardErr as Error)?.message}`);
+        } catch {
+          /* logging must not throw out of an event handler either */
+        }
+      }
+    });
+  }
+
+  /**
+   * Record an engine error on the session's health.
+   *
+   * The session is marked `failed` when its engine is no longer ready, and
+   * `degraded` when it is: Codex reports conditions it survives (an MCP server
+   * that cannot be reached) through the same channel as fatal ones, and a session
+   * that is still serving must not be killed on a notification's say-so. The next
+   * clean turn returns a `degraded` session to `ok`; `failed` stays until the
+   * session is restarted.
+   */
+  private _recordSessionError(name: string, session: ISession, health: SessionHealthRecord, err: unknown): void {
+    const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+    const message = sanitizeSecrets(raw || 'engine reported an error without a message').slice(
+      0,
+      MAX_RECORDED_ERROR_CHARS,
+    );
+    health.errorCount++;
+    health.lastError = message;
+    health.lastErrorAt = new Date().toISOString();
+    health.state = health.state === 'failed' || (!health.starting && !session.isReady) ? 'failed' : 'degraded';
+    this.logger.warn?.(`[Session:${name}] engine error (${health.state}, #${health.errorCount}): ${message}`);
+  }
+
+  /** Health as reported in session info; absent until an error has been recorded. */
+  private _healthOf(managed: ManagedSession): SessionHealth | undefined {
+    const h: SessionHealth = {
+      state: managed.health.state,
+      errorCount: managed.health.errorCount,
+      ...(managed.health.lastError !== undefined ? { lastError: managed.health.lastError } : {}),
+      ...(managed.health.lastErrorAt !== undefined ? { lastErrorAt: managed.health.lastErrorAt } : {}),
+    };
+    if (h.errorCount === 0) return undefined;
+    // A session whose engine has since gone away is failed even if the error that
+    // preceded it was recorded as survivable.
+    const state = h.state === 'degraded' && !managed.session.isReady ? 'failed' : h.state;
+    return { ...h, state };
   }
 
   private _wireNativeIdentity(managed: ManagedSession): void {
@@ -3594,6 +3697,12 @@ export class SessionManager {
       autoloopHardTimeoutMs: opts.autoloopHardTimeoutMs,
     });
     runnerRef = runner;
+    // The runner emits `error` for background failures (hard-deadline expiry, a
+    // drain that threw, an overflowing parked buffer). Nothing else listens, and an
+    // unlistened `error` event ends the process that hosts every other session.
+    runner.on('error', (err: unknown) => {
+      this.logger.error(`[autoloop/${runId}] runner error: ${err instanceof Error ? err.message : String(err)}`);
+    });
     try {
       await runner.start();
       // A reconstructed migration becomes externally visible only after its
