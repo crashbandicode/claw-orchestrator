@@ -27,6 +27,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { guardChildStreams } from './child-process-guard.js';
 
 import type { SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
 import { sanitizeSecrets } from './sanitize.js';
@@ -186,6 +187,7 @@ export class PersistentGrokSession extends BaseOneShotSession {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
+      guardChildStreams(proc);
       proc.stdin?.end();
 
       const timer = setTimeout(() => {

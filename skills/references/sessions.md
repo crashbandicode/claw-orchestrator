@@ -276,6 +276,7 @@ See [`src/proxy/`](https://github.com/Enderfga/claw-orchestrator/tree/main/src/p
 SessionManager tracks consecutive failures per engine type. After 3 consecutive start failures for an engine, a circuit breaker opens with exponential backoff (1s × 2^(n-1), capped at 5 minutes). During backoff, new session creation for that engine is rejected with a descriptive error.
 
 - Resets on successful session start
+- Caller and configuration errors do not count: a rejected `codexMcpServers` selection (unknown or disabled name, unsupported transport type) or a failed `codex mcp list --json` is not an engine failure, so bad requests cannot lock out valid starts
 - State visible in `health()` response under `circuitBreakers`
 - Constants: `CIRCUIT_BREAKER_THRESHOLD` (3), `CIRCUIT_BREAKER_BACKOFF_BASE_MS` (1s), `CIRCUIT_BREAKER_MAX_BACKOFF_MS` (5 min)
 

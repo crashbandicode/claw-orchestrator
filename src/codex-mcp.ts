@@ -26,6 +26,7 @@
 
 import { spawn } from 'node:child_process';
 import { resolveWindowsNodeInvocation } from './windows-command.js';
+import { guardChildStreams } from './child-process-guard.js';
 import type { EngineType, SessionConfig } from './types.js';
 
 /** Upper bound on a selection, so a runaway argument cannot grow the arg list unboundedly. */
@@ -35,6 +36,23 @@ export const MAX_CODEX_MCP_SELECTION = 64;
 const MCP_SERVER_NAME = /^[A-Za-z0-9_-]{1,64}$/;
 
 const LIST_TIMEOUT_MS = 30_000;
+
+/**
+ * A `codexMcpServers` selection that cannot be honoured, or a Codex config that
+ * cannot be enumerated: an unknown or config-disabled name, a server to disable
+ * whose transport type has no safe stub, a failed `codex mcp list`.
+ *
+ * It is a caller or configuration fault, not an engine fault. The session
+ * manager must not count it toward the engine's circuit breaker: three of them
+ * from one caller would otherwise refuse every valid start on that engine for up
+ * to five minutes.
+ */
+export class CodexMcpConfigError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'CodexMcpConfigError';
+  }
+}
 
 export interface CodexMcpServerEntry {
   name: string;
@@ -65,25 +83,25 @@ export function validateCodexMcpSelection(
   const raw = config.codexMcpServers;
   if (raw === undefined) return undefined;
   if (!Array.isArray(raw)) {
-    throw new Error('codexMcpServers must be an array of MCP server names');
+    throw new CodexMcpConfigError('codexMcpServers must be an array of MCP server names');
   }
   if (engine !== 'codex' && engine !== 'codex-app') {
-    throw new Error("codexMcpServers is only supported by the 'codex' and 'codex-app' engines");
+    throw new CodexMcpConfigError("codexMcpServers is only supported by the 'codex' and 'codex-app' engines");
   }
   if (raw.length > MAX_CODEX_MCP_SELECTION) {
-    throw new Error(`codexMcpServers accepts at most ${MAX_CODEX_MCP_SELECTION} names`);
+    throw new CodexMcpConfigError(`codexMcpServers accepts at most ${MAX_CODEX_MCP_SELECTION} names`);
   }
   const names: string[] = [];
   for (const entry of raw) {
     if (typeof entry !== 'string' || !MCP_SERVER_NAME.test(entry)) {
-      throw new Error(
+      throw new CodexMcpConfigError(
         'codexMcpServers entries must be MCP server names of 1-64 letters, digits, underscores or hyphens',
       );
     }
     if (!names.includes(entry)) names.push(entry);
   }
   if (config.ignoreUserConfig !== true) {
-    throw new Error(
+    throw new CodexMcpConfigError(
       'codexMcpServers selects servers to keep while ignoreUserConfig is on; it requires ignoreUserConfig: true',
     );
   }
@@ -102,14 +120,14 @@ export function tomlKey(name: string): string {
  */
 export function parseCodexMcpList(stdout: string): CodexMcpServerEntry[] {
   const start = stdout.indexOf('[');
-  if (start < 0) throw new Error('codex mcp list --json returned no JSON array');
+  if (start < 0) throw new CodexMcpConfigError('codex mcp list --json returned no JSON array');
   let parsed: unknown;
   try {
     parsed = JSON.parse(stdout.slice(start));
   } catch {
-    throw new Error('codex mcp list --json returned output that is not valid JSON');
+    throw new CodexMcpConfigError('codex mcp list --json returned output that is not valid JSON');
   }
-  if (!Array.isArray(parsed)) throw new Error('codex mcp list --json did not return an array');
+  if (!Array.isArray(parsed)) throw new CodexMcpConfigError('codex mcp list --json did not return an array');
   const out: CodexMcpServerEntry[] = [];
   for (const item of parsed) {
     if (!item || typeof item !== 'object') continue;
@@ -146,6 +164,7 @@ export function listCodexMcpServers(opts: {
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: process.platform === 'win32',
     });
+    guardChildStreams(proc);
     const settle = (fn: () => void): void => {
       if (settled) return;
       settled = true;
@@ -159,7 +178,7 @@ export function listCodexMcpServers(opts: {
         } catch {
           // Already gone.
         }
-        reject(new Error('Timed out enumerating Codex MCP servers (codex mcp list --json)'));
+        reject(new CodexMcpConfigError('Timed out enumerating Codex MCP servers (codex mcp list --json)'));
       });
     }, opts.timeoutMs ?? LIST_TIMEOUT_MS);
     proc.stdout?.on('data', (d: Buffer) => {
@@ -170,13 +189,13 @@ export function listCodexMcpServers(opts: {
       stderr += d.toString();
     });
     proc.on('error', (err) => {
-      settle(() => reject(new Error(`Cannot run codex to enumerate MCP servers: ${err.message}`)));
+      settle(() => reject(new CodexMcpConfigError(`Cannot run codex to enumerate MCP servers: ${err.message}`)));
     });
     proc.on('close', (code) => {
       settle(() => {
         if (code !== 0) {
           reject(
-            new Error(
+            new CodexMcpConfigError(
               `codex mcp list --json exited with code ${code}${stderr.trim() ? ' (see the Codex log for details)' : ''}`,
             ),
           );
@@ -203,14 +222,14 @@ export function buildMcpDisableArgs(servers: CodexMcpServerEntry[], keep: string
   const unknown = keep.filter((n) => !known.has(n));
   if (unknown.length > 0) {
     const available = servers.map((s) => s.name);
-    throw new Error(
+    throw new CodexMcpConfigError(
       `Unknown MCP server${unknown.length > 1 ? 's' : ''} in codexMcpServers: ${unknown.join(', ')}. ` +
         `Servers in the Codex config: ${available.length > 0 ? available.join(', ') : '(none)'}`,
     );
   }
   const off = keep.filter((n) => known.get(n)!.enabled === false);
   if (off.length > 0) {
-    throw new Error(
+    throw new CodexMcpConfigError(
       `MCP server${off.length > 1 ? 's' : ''} selected in codexMcpServers ${off.length > 1 ? 'are' : 'is'} disabled in the Codex config: ${off.join(', ')}`,
     );
   }
@@ -226,7 +245,7 @@ export function buildMcpDisableArgs(servers: CodexMcpServerEntry[], keep: string
       transportStub = `${serverKey}.url=${JSON.stringify('http://127.0.0.1:9/')}`;
     } else {
       const typeDescription = s.transportType === undefined ? 'missing' : JSON.stringify(s.transportType);
-      throw new Error(
+      throw new CodexMcpConfigError(
         `Cannot disable Codex MCP server ${s.name}: unsupported or ${typeDescription} transport type; ` +
           'only stdio and streamable_http can be disabled safely',
       );

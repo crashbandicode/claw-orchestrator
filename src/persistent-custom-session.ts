@@ -36,6 +36,7 @@ import {
 } from './types.js';
 import { resolveAlias, estimateTokens, hasPricingOverride } from './models.js';
 import { buildSanitizer } from './sanitize.js';
+import { createStdinErrorReporter, guardChildStreams, reportSessionError } from './child-process-guard.js';
 import { resolveCustomEngine } from './engine-presets.js';
 
 import {
@@ -87,6 +88,8 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
   private _rl: readline.Interface | null = null;
   private _streamCallbacks: StreamCallbacks | null = null;
   private _contextHighFired = false;
+  /** One session error per stdin fault, whether it arrives by write callback or by 'error' event. */
+  private _stdinFault = createStdinErrorReporter((err) => reportSessionError(this, err, `[${this.engineConfig.name}]`));
 
   // One-shot mode state
   private currentProc: ChildProcess | null = null;
@@ -239,6 +242,14 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     });
     this.proc.unref();
 
+    // A pipe fault with no listener (EPIPE when the engine closes stdin before a
+    // write lands) is an uncaught exception that ends the whole host.
+    const label = `[${this.engineConfig.name}]`;
+    guardChildStreams(this.proc, (stream, err) => {
+      if (stream === 'stdin') this._stdinFault(err);
+      else reportSessionError(this, new Error(`${stream} error: ${err.message}`), label);
+    });
+
     // Parse stdout line-by-line
     this._rl = readline.createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });
     this._rl.on('line', (line) => {
@@ -253,7 +264,7 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
       }
     });
     this._rl.on('error', (err: Error) => {
-      this.emit(SESSION_EVENT.ERROR, new Error(`readline error: ${err.message}`));
+      reportSessionError(this, new Error(`readline error: ${err.message}`), label);
     });
 
     this.proc.stderr?.on('data', (data: Buffer) => {
@@ -274,7 +285,7 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
       }
       this._rl = null;
       this.proc = null;
-      this.emit(SESSION_EVENT.ERROR, err);
+      reportSessionError(this, err, label);
     });
 
     // Wait for ready
@@ -397,9 +408,7 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     if (!stdin || stdin.writable === false) {
       throw new Error('Session stdin is not writable (process may have exited). Call start() first.');
     }
-    stdin.write(JSON.stringify(payload) + '\n', (err) => {
-      if (err) this.emit(SESSION_EVENT.ERROR, new Error(`Failed to write to stdin: ${err.message}`));
-    });
+    stdin.write(JSON.stringify(payload) + '\n', (err) => this._stdinFault(err));
 
     if (options.callbacks) this._streamCallbacks = options.callbacks;
 
@@ -501,6 +510,7 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
+      guardChildStreams(proc);
 
       const timer = setTimeout(() => {
         if (!settled) {

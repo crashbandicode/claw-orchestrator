@@ -4,6 +4,7 @@
  */
 
 import { spawn as realSpawn, type ChildProcess } from 'node:child_process';
+import { guardChildStreams } from '../child-process-guard.js';
 
 type SpawnFn = (cmd: string, args: string[]) => ChildProcess;
 
@@ -19,10 +20,16 @@ async function run(args: string[], spawnFn: SpawnFn): Promise<RunResult> {
     const child = spawnFn('docker', args);
     let stdout = '';
     let stderr = '';
+    guardChildStreams(child);
     child.stdout?.on('data', (d: Buffer) => (stdout += d.toString()));
     child.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
     child.on('close', (code: number | null) => {
       resolve({ ok: code === 0, stdout, stderr, code: code ?? -1 });
+    });
+    // No docker binary (ENOENT) or no permission to run it: an unlistened
+    // 'error' would end the host and this promise would never settle.
+    child.on('error', (e: Error) => {
+      resolve({ ok: false, stdout, stderr: stderr + e.message, code: -1 });
     });
   });
 }

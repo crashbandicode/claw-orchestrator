@@ -122,6 +122,43 @@ describe('PersistentCursorSession', () => {
       }
     });
 
+    it('launches the newest installed Cursor version through the agent.cmd alias, resolved at call time', () => {
+      const root = mkdtempSync(join(tmpdir(), 'claw-cursor-alias-'));
+      try {
+        const install = (name: string) => {
+          const runtime = join(root, 'versions', name);
+          mkdirSync(runtime, { recursive: true });
+          writeFileSync(join(runtime, 'node.exe'), 'test');
+          writeFileSync(join(runtime, 'index.js'), 'test');
+          return runtime;
+        };
+        const older = install('2026.10.01-e373342');
+        const launcher = join(root, 'agent.cmd');
+        writeFileSync(launcher, '@echo off\r\nset "CURSOR_INVOKED_AS=%~nx0"\r\n');
+
+        expect(resolveCursorInvocation(launcher, 'win32').command).toBe(join(older, 'node.exe'));
+        const newer = install('2026.10.20-1234abc');
+        const invocation = resolveCursorInvocation(launcher, 'win32');
+        expect(invocation.command).toBe(join(newer, 'node.exe'));
+        expect(invocation.prefixArgs).toEqual([join(newer, 'index.js')]);
+        expect(invocation.env.CURSOR_INVOKED_AS).toBe('agent.cmd');
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('fails a Cursor launcher with no runtime instead of spawning the wrapper', () => {
+      const root = mkdtempSync(join(tmpdir(), 'claw-cursor-empty-'));
+      try {
+        mkdirSync(join(root, 'versions', '2026.10.01-e373342'), { recursive: true });
+        const launcher = join(root, 'cursor-agent.cmd');
+        writeFileSync(launcher, '@echo off');
+        expect(() => resolveCursorInvocation(launcher, 'win32')).toThrow(/no usable node\.exe\/index\.js runtime/);
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    });
+
     it('uses -p --force --trust --output-format stream-json', async () => {
       const session = new PersistentCursorSession({
         name: 'test',

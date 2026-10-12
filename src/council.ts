@@ -14,6 +14,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
+import { guardChildStreams } from './child-process-guard.js';
 import { changedFilesSince } from './verify/baseline.js';
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
@@ -121,6 +122,7 @@ function spawnAsync(
     });
     let stdout = '';
     let stderr = '';
+    guardChildStreams(child);
     child.stdout.on('data', (d: Buffer) => {
       stdout += d.toString();
     });

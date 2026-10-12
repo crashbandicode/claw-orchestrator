@@ -12,6 +12,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { guardChildStreams } from './child-process-guard.js';
 import * as readline from 'node:readline';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -28,6 +29,7 @@ import {
   resolveCursorParameterizedModelEffort,
 } from './cursor-model-effort.js';
 import { loadCursorParameterizedCatalog } from './cursor-parameterized-catalog.js';
+import { cursorLauncherEnv, resolveCursorRuntime, resolveWindowsBareCommand } from './windows-command.js';
 
 /**
  * Enforced read-only for Cursor Agent.
@@ -56,64 +58,22 @@ export interface CursorInvocation {
   env: Record<string, string>;
 }
 
-function cursorVersionKey(name: string): number {
-  const match = /^(\d{4})\.(\d{1,2})\.(\d{1,2})(?:-(\d{2})-(\d{2})-(\d{2}))?-/.exec(name);
-  if (!match) return 0;
-  return Date.UTC(
-    Number(match[1]),
-    Number(match[2]) - 1,
-    Number(match[3]),
-    Number(match[4] || 0),
-    Number(match[5] || 0),
-    Number(match[6] || 0),
-  );
-}
-
 /**
  * Cursor's Windows installer exposes `.cmd` / `.ps1` launchers, but
  * `child_process.spawn()` cannot execute those wrappers directly without a
- * shell (`spawn EINVAL`). Avoid shell/cmd indirection by resolving the wrapper
- * to the installed version's bundled node.exe + index.js pair.
+ * shell (`spawn EINVAL`), and the wrapper itself runs Windows PowerShell 5.1,
+ * which Claw does not use. The wrapper is resolved to the newest installed
+ * version's bundled node.exe + index.js pair instead (see windows-command.ts),
+ * at launch time so a Cursor self-update is picked up. A bare `cursor-agent`
+ * is first looked up on PATH, where only the `.cmd` exists.
  */
 export function resolveCursorInvocation(engineBin: string, platform = process.platform): CursorInvocation {
-  if (platform !== 'win32' || !/\.(?:cmd|ps1)$/i.test(engineBin)) {
-    return { command: engineBin, prefixArgs: [], env: {} };
+  const bin = resolveWindowsBareCommand(engineBin, platform);
+  if (platform !== 'win32' || !/\.(?:cmd|ps1)$/i.test(bin)) {
+    return { command: bin, prefixArgs: [], env: {} };
   }
-
-  const launcherDir = path.dirname(engineBin);
-  const directNode = path.join(launcherDir, 'node.exe');
-  const directEntry = path.join(launcherDir, 'index.js');
-  let runtime: { node: string; entry: string } | undefined;
-
-  if (fs.existsSync(directNode) && fs.existsSync(directEntry)) {
-    runtime = { node: directNode, entry: directEntry };
-  } else {
-    const versionsDir = path.join(launcherDir, 'versions');
-    const candidates = fs.existsSync(versionsDir)
-      ? fs
-          .readdirSync(versionsDir, { withFileTypes: true })
-          .filter((entry) => entry.isDirectory() && cursorVersionKey(entry.name) > 0)
-          .sort((a, b) => cursorVersionKey(b.name) - cursorVersionKey(a.name) || b.name.localeCompare(a.name))
-      : [];
-    for (const candidate of candidates) {
-      const node = path.join(versionsDir, candidate.name, 'node.exe');
-      const entry = path.join(versionsDir, candidate.name, 'index.js');
-      if (fs.existsSync(node) && fs.existsSync(entry)) {
-        runtime = { node, entry };
-        break;
-      }
-    }
-  }
-
-  if (!runtime) {
-    throw new Error(`Cursor launcher ${engineBin} has no usable node.exe/index.js runtime`);
-  }
-
-  const env: Record<string, string> = { CURSOR_INVOKED_AS: path.basename(engineBin) };
-  if (!process.env.NODE_COMPILE_CACHE && process.env.LOCALAPPDATA) {
-    env.NODE_COMPILE_CACHE = path.join(process.env.LOCALAPPDATA, 'cursor-compile-cache');
-  }
-  return { command: runtime.node, prefixArgs: [runtime.entry], env };
+  const runtime = resolveCursorRuntime(bin);
+  return { command: runtime.node, prefixArgs: [runtime.entry], env: cursorLauncherEnv(bin) };
 }
 
 // ─── PersistentCursorSession ────────────────────────────────────────────────
@@ -277,6 +237,7 @@ export class PersistentCursorSession extends BaseOneShotSession {
         windowsHide: process.platform === 'win32',
       });
       this.currentProc = proc;
+      guardChildStreams(proc);
 
       const timer = setTimeout(() => {
         if (!settled) {

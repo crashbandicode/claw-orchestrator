@@ -107,7 +107,8 @@ Wraps `codex app-server --listen stdio:// --enable goals` as a long-running JSON
 - v2 RPC tools (Codex 0.137): `codex_interrupt` (`turn/interrupt`), `codex_steer` (`turn/steer`), `codex_fork` (`thread/fork`), `codex_rollback` (`thread/rollback`), `codex_models` (`model/list`), `codex_thread_list` (`thread/list`). A `turn/completed` with `status: 'failed'` rejects the turn and increments `toolErrors`.
 - Thread resume: starting with `resumeSessionId` loads the existing thread via `thread/resume` instead of `thread/start`.
 - `error` notifications (v2 `ErrorNotification`: `error.message`, `willRetry`, `turnId`) are reported to the session manager as errors carrying that message and recorded in session `health`; they never settle or kill the turn or the app-server (`turn/completed` / process exit do). `willRetry: true` is only logged. With no listener the session logs instead of emitting, so an `error` event cannot become an uncaught exception.
-- `ignoreUserConfig` / `codexMcpServers`: `codex app-server` has no `--ignore-user-config`, and `-c mcp_servers={}` does not clear anything (config tables merge), so the app-server is spawned with `-c mcp_servers.<name>.enabled=false` and a same-type inert transport stub for every server that is not selected. Codex 0.161.0 validates each override layer as a transport, so the stub is required. Only names, enabled state, and `transport.type` are used; configured commands, URLs, headers and env are not retained or emitted. If the listing fails, a selected name is unknown, or an excluded server uses an unsupported transport type, the start fails before the app-server spawns.
+- `ignoreUserConfig` / `codexMcpServers`: `codex app-server` has no `--ignore-user-config`, and `-c mcp_servers={}` does not clear anything (config tables merge), so the app-server is spawned with `-c mcp_servers.<name>.enabled=false` and a same-type inert transport stub for every server that is not selected. Codex 0.161.0 validates each override layer as a transport, so the stub is required. Only names, enabled state, and `transport.type` are used; configured commands, URLs, headers and env are not retained or emitted. If the listing fails, a selected name is unknown, or an excluded server uses an unsupported transport type, the start fails before the app-server spawns. These failures are caller or configuration errors (`CodexMcpConfigError`) and do not count toward the engine's circuit breaker.
+  - `codex mcp list --json` is Codex's own enumeration and it contacts the URL of every streamable-HTTP server it lists, including ones this session is about to exclude: unauthenticated GETs to the server's `/mcp` and its `.well-known/oauth-*` / `openid-configuration` discovery paths (nothing is sent when `bearer_token_env_var` is configured), bounded by Claw's 30 s listing timeout. No credentials are sent. "Excluded" therefore means "not started by the session", not "never contacted"; Codex offers no listing mode that skips this.
 
 > **Feature flag.** `goals` is an experimental Codex feature. The session always passes `--enable goals`; some goal commands may still fail or be ignored by the server.
 
@@ -282,6 +283,14 @@ Wraps the Cursor Agent CLI with `-p --output-format stream-json`. Write-enabled 
 - Binary: `cursor-agent` (set `CURSOR_BIN` env var to override). The generic `agent` name is
   deliberately not used: xAI's Grok installer symlinks `agent` to its own binary, which rejects
   `--force`/`--trust`/`--workspace` and fails the turn with "unexpected argument"
+- Windows: Cursor's installer provides `cursor-agent.cmd` / `agent.cmd` (and `.ps1`) under
+  `%LOCALAPPDATA%\cursor-agent`, which start Windows PowerShell 5.1 on a script that runs
+  `versions\<ver>\node.exe versions\<ver>\index.js`. Claw never runs Windows PowerShell 5.1 or a shell: it
+  resolves the wrapper itself, on every launch (so a Cursor self-update is picked up), to the newest
+  `versions\<YYYY.MM.DD[-HH-MM-SS]-<hash>>` directory by date (same-day builds: later build time wins) that has both
+  `node.exe` and `index.js`, and sets `CURSOR_INVOKED_AS` / `NODE_COMPILE_CACHE` as the script does. A `node.exe` +
+  `index.js` beside the wrapper wins first. A bare `cursor-agent` is looked up on PATH (`.exe`, then `.cmd`). Other
+  `.cmd`/`.ps1` wrappers are refused unless they are npm shims (`codex`) — no shell is ever used.
 
 ```typescript
 await manager.startSession({

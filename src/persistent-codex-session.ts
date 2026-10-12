@@ -15,6 +15,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { guardChildStreams } from './child-process-guard.js';
 import { writeFileSync, unlinkSync, readFileSync, readdirSync } from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
@@ -377,6 +378,7 @@ export class PersistentCodexSession extends BaseOneShotSession {
         windowsHide: process.platform === 'win32',
       });
       this.currentProc = proc;
+      guardChildStreams(proc);
 
       const timer = setTimeout(() => {
         if (!settled) {
