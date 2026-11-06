@@ -12,7 +12,7 @@
 [![CI](https://github.com/Enderfga/claw-orchestrator/actions/workflows/ci.yml/badge.svg)](https://github.com/Enderfga/claw-orchestrator/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Coding CLIs are designed for humans at terminals. Claw Orchestrator turns them into headless engines and adds an orchestration layer on top: 83 tools, from single-session calls to multi-agent runs and generated web apps — reachable through the CLI, the OpenClaw gateway, the Model Context Protocol, or directly from TypeScript, and visible through an embedded three-tab dashboard.
+Coding CLIs are designed for humans at terminals. Claw Orchestrator turns them into headless engines and adds an orchestration layer on top: 85 tools, from single-session calls to multi-agent runs and generated web apps — reachable through the CLI, the OpenClaw gateway, the Model Context Protocol, or directly from TypeScript, and visible through an embedded three-tab dashboard.
 
 https://github.com/user-attachments/assets/fbd2b0ea-28d8-4387-9894-c29cf15ba030
 
@@ -41,7 +41,7 @@ https://github.com/user-attachments/assets/fbd2b0ea-28d8-4387-9894-c29cf15ba030
 | **Run Ledger & Spend Caps** | Every turn on every engine is appended to a durable JSONL ledger — engine, model, tokens, cost, duration, and the council/fanout/autoloop it belonged to — queryable with `clawo runs` after a restart. Rows carry both the engine's self-report (`ok`) and the runtime's own measurement (`verified`), kept apart. `maxBudgetUsd` is enforced by the runtime, so a cap holds on Codex, Grok, agy and OpenCode too, not just Claude Code. | [`observability.md`](./skills/references/observability.md) |
 | **Remote socket sessions**   | One SessionManager per execution host, reached through an owner-only Unix socket. A peer is an existing SSH config alias plus a stream-local forward. Session handles are `host::localName`; native resume ids stay unwrapped. Operations rejoin by id after a dropped socket and are never blindly replayed. | [`remote-sessions.md`](./skills/references/remote-sessions.md) |
 
-The full 83-tool surface is enumerated in [`tools.md`](./skills/references/tools.md).
+The full 85-tool surface is enumerated in [`tools.md`](./skills/references/tools.md).
 
 ---
 
@@ -82,7 +82,7 @@ Every command is documented in [`cli.md`](./skills/references/cli.md).
 curl -fsSL https://raw.githubusercontent.com/Enderfga/claw-orchestrator/main/install.sh | bash
 ```
 
-Installs via npm, registers the plugin in `~/.openclaw/openclaw.json`, restarts the gateway. All 83 tools become available to every OpenClaw agent.
+Installs via npm, registers the plugin in `~/.openclaw/openclaw.json`, restarts the gateway. All 85 tools become available to every OpenClaw agent.
 
 ### Model Context Protocol Server
 
@@ -116,7 +116,7 @@ block, and the cancellation and permission limitations are in
 | Engine      | CLI        | Tested Version |
 | ----------- | ---------- | -------------- |
 | Claude Code | `claude`   | 2.1.284        |
-| Codex       | `codex`    | 0.159.0        |
+| Codex       | `codex`    | 0.165.0        |
 | Antigravity | `agy`      | 1.2.13         |
 | Grok Build  | `grok`     | 1.0.44         |
 | OpenCode    | `opencode` | 1.18.33        |

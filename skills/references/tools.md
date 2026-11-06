@@ -1,6 +1,6 @@
 # Tools Reference
 
-All 83 tools are registered as OpenClaw plugin tools and exposed over MCP by `clawo-mcp` (see [mcp.md](./mcp.md)). The embedded HTTP server covers a subset of them. Remote execution is documented in [remote-sessions.md](./remote-sessions.md).
+All 85 tools are registered as OpenClaw plugin tools and exposed over MCP by `clawo-mcp` (see [mcp.md](./mcp.md)). The embedded HTTP server covers a subset of them. Remote execution is documented in [remote-sessions.md](./remote-sessions.md).
 
 ## Session Lifecycle (6)
 
@@ -12,7 +12,7 @@ Start a persistent coding session with full CLI flag support.
 | ------------------------------------ | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `name`                               | string                                                                                        | Session name (auto-generated if omitted)                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `cwd`                                | string                                                                                        | Working directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `engine`                             | `'claude'` \| `'codex'` \| `'codex-app'` \| `'agy'` \| `'grok'` \| `'opencode'` \| `'custom'` | Engine to use (default: `claude`). `agy` wraps Google Antigravity CLI. `grok` wraps xAI Grok Build and reports its own per-turn cost. `opencode` wraps sst/opencode (pass model as `provider/model`). Use `custom` with `customEngine` for any CLI. (`'gemini'` and `'cursor'` are still accepted for existing callers but are legacy — not version-tracked; use `agy` for Google and `grok` in place of Cursor.)                                                                      |
+| `engine`                             | `'claude'` \| `'codex'` \| `'codex-app'` \| `'agy'` \| `'grok'` \| `'opencode'` \| `'custom'` | Engine to use (default: `claude`). `agy` wraps Google Antigravity CLI. `grok` wraps xAI Grok Build and reports its own per-turn cost. `opencode` wraps sst/opencode (pass model as `provider/model`). Use `custom` with `customEngine` for any CLI. (`'gemini'` and `'cursor'` are still accepted. `'cursor'` is not version-tracked; use `cursor_goal_set` for a durable goal on that engine. Use `agy` for Google and `grok` when a Cursor session is not required.)                                                                      |
 | `model`                              | string                                                                                        | Model alias or full name                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `permissionMode`                     | string                                                                                        | `acceptEdits`, `bypassPermissions`, `plan`, `auto`, `manual`, `dontAsk` (`default` = legacy alias for `manual`)                                                                                                                                                                                                                                                                                                                                                                        |
 | `sandboxMode`                        | `'read-only'` \| `'workspace-write'` \| `'danger-full-access'`                                | Sandbox policy. Codex supports all values. `read-only` is enforced on every other built-in engine too: Claude → plan mode; Antigravity → its plan mode; OpenCode → a generated `clawo-readonly` agent denying `edit`/`bash`. **`grok` refuses a read-only session** rather than approximate one — its enforcement has not been adversarially verified. A `custom` engine must map it via `permissionModes`, or the session refuses to start. Persisted across session resume.          |
@@ -266,9 +266,27 @@ Returns `{ ok, agents }`.
 
 ---
 
-## Codex (13)
+## Cursor (1)
 
-Tools targeting OpenAI's `codex` CLI. The `codex_resume` and `codex_review` tools are one-shot wrappers and work without a managed session. The `codex_goal_*` tools require a session started with `engine: "codex-app"` (see [multi-engine.md](./multi-engine.md)) — the legacy `engine: "codex"` (which uses `codex exec`) has no slash-command surface.
+`cursor_goal_set` requires a session started with `engine: "cursor"`. Cursor's TUI command submits the user message `/goal <objective>`; headless `cursor-agent -p` sends that same text. The process then keeps working while the goal is active, because Claw does not pass `--single-turn`. There is no Cursor slash command for clear, pause, or status.
+
+### `cursor_goal_set`
+
+Set a durable objective. Sends `/goal <objective>`. **Requires `engine: "cursor"`.**
+
+| Parameter   | Type   | Required | Description                                                                                          |
+| ----------- | ------ | -------- | ---------------------------------------------------------------------------------------------------- |
+| `name`      | string | yes      | Session name.                                                                                        |
+| `objective` | string | yes      | What Cursor should pursue. A blank objective is rejected.                                            |
+| `timeout`   | number |          | Timeout in ms for the whole pursuit, not one model turn (default 300000). Raise it for a long goal. |
+
+Returns the regular `session_send` turn result. The assistant text is the only goal surface Cursor emits on this path. The session's existing permission mode still applies, including a read-only deny config.
+
+---
+
+## Codex (14)
+
+Tools targeting OpenAI's `codex` CLI. The `codex_resume` and `codex_review` tools are one-shot wrappers and work without a managed session. The `codex_goal_*` and `codex_side` tools require a session started with `engine: "codex-app"` (see [multi-engine.md](./multi-engine.md)) — the legacy `engine: "codex"` (which uses `codex exec`) has no goal or side surface.
 
 ### `codex_resume`
 
@@ -306,7 +324,7 @@ Returns `{ ok, stdout, stderr }`.
 
 ### `codex_goal_set`
 
-Set a long-horizon objective. Sends `/goal <objective>` via the app-server. **Requires `engine: "codex-app"`.**
+Set a long-horizon objective with `thread/goal/set` (`status: "active"`, `origin: "user"`). **Requires `engine: "codex-app"`.** The call returns when Codex stores the goal. It does not wait while Codex pursues it.
 
 | Parameter   | Type   | Required |
 | ----------- | ------ | -------- |
@@ -314,21 +332,21 @@ Set a long-horizon objective. Sends `/goal <objective>` via the app-server. **Re
 | `objective` | string | yes      |
 | `timeout`   | number |          |
 
-Returns `{ ok, text, goal }` where `goal` is `{ objective, status: "active"|"paused"|"budgetLimited"|"complete", tokensUsed, timeUsedSeconds, tokenBudget?, ... }` or `null`.
+Returns `{ ok, text, goal }` where `goal` is `{ objective, status: "active"|"paused"|"blocked"|"usageLimited"|"budgetLimited"|"complete", tokensUsed, timeUsedSeconds, tokenBudget?, ... }` or `null`.
 
 ### `codex_goal_get`
 
-Read the cached goal state. Pure read — does not send a turn.
+Read the goal with `thread/goal/get`. Does not start a turn.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
 | `name`    | string | yes      |
 
-Returns `{ ok, goal }` (`null` if no goal active).
+Returns `{ ok, goal }` (`null` if no goal is set).
 
 ### `codex_goal_pause` / `codex_goal_resume` / `codex_goal_clear`
 
-Send `/goal pause`, `/goal resume`, or `/goal clear` respectively. Requires `engine: "codex-app"`.
+`thread/goal/set` with `status: "paused"` or `status: "active"`, or `thread/goal/clear`. Every call sends `origin: "user"`. Requires `engine: "codex-app"`.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
@@ -337,7 +355,19 @@ Send `/goal pause`, `/goal resume`, or `/goal clear` respectively. Requires `eng
 
 Returns `{ ok, text, goal }`.
 
-> **Stability note:** Codex's `goals` feature is experimental upstream. The wrapper only formats the `/goal` slash text, so upstream changes affect that text, not the protocol.
+### `codex_side`
+
+Ask one question on an ephemeral fork of the current thread (`thread/fork` with Codex's side-conversation instructions, then a hidden boundary item, then one turn). The parent thread id does not change, and the side answer does not complete a parent turn that is already running. Codex refuses this until the parent conversation has had a turn. Requires `engine: "codex-app"`.
+
+| Parameter | Type   | Required | Description                                      |
+| --------- | ------ | -------- | ------------------------------------------------ |
+| `name`    | string | yes      | Session name.                                    |
+| `prompt`  | string | yes      | The question to ask on the fork.                 |
+| `timeout` | number |          | Timeout in ms for the side answer (default 120000). |
+
+Returns `{ ok, text, sideThreadId, parentThreadId }`.
+
+> **Stability note:** Codex's `goals` feature is experimental upstream. Claw calls the `thread/goal/*` RPCs from Codex 0.165 and passes `--enable goals`. An older app-server that only understood `/goal` as user text will reject these calls.
 
 ### Codex app-server RPCs
 

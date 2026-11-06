@@ -171,6 +171,9 @@ export class PersistentCursorSession extends BaseOneShotSession {
   private async _spawnTurn(message: string, options: SessionSendOptions): Promise<TurnResult> {
     // agent -p <prompt> [--force | --mode plan] --trust --output-format stream-json
     const readOnly = this.options.sandboxMode === 'read-only';
+    // `--single-turn` is intentionally absent. Cursor continues an active goal
+    // inside this process only when that flag is off. `cursor_goal_set` sends
+    // the same `/goal <objective>` text the TUI submits and relies on this.
     const args: string[] = ['-p', message];
     // `--mode plan` steers the model toward read-only behavior; the binding
     // guarantee comes from the deny config injected via the process cwd below.

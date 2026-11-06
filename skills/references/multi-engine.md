@@ -103,7 +103,8 @@ Wraps `codex app-server --listen stdio:// --enable goals` as a long-running JSON
 - Cumulative token tracking from `thread/tokenUsage/updated` notifications. The same notification's `last` breakdown and `modelContextWindow` drive `contextPercent`, so it reports live occupancy against the window the server enforces rather than a running total over the model's published window
 - `appendSystemPrompt` is placed at the top of the first message of a new thread (app-server has no system-prompt flag); a resumed thread already carries it
 - Goal lifecycle observation via `thread/goal/updated` and `thread/goal/cleared` notifications
-- Goal control via the `codex_goal_*` tools (which internally send the `/goal` slash command as user text — see [tools.md](./tools.md#codex-13))
+- Goal control via the `codex_goal_*` tools, which call `thread/goal/set`, `thread/goal/get`, and `thread/goal/clear` with `origin: "user"` (see [tools.md](./tools.md#codex-14)). Pause and resume are status updates. The RPC returns when the goal is stored; the app-server pursues an active goal on its own.
+- `codex_side` forks an ephemeral thread, injects Codex's side-conversation boundary, asks one question there, and unsubscribes. The parent thread id does not change.
 - v2 RPC tools (Codex 0.137): `codex_interrupt` (`turn/interrupt`), `codex_steer` (`turn/steer`), `codex_fork` (`thread/fork`), `codex_rollback` (`thread/rollback`), `codex_models` (`model/list`), `codex_thread_list` (`thread/list`). A `turn/completed` with `status: 'failed'` rejects the turn and increments `toolErrors`.
 - Thread resume: starting with `resumeSessionId` loads the existing thread via `thread/resume` instead of `thread/start`.
 - `error` notifications (v2 `ErrorNotification`: `error.message`, `willRetry`, `turnId`) are reported to the session manager as errors carrying that message and recorded in session `health`; they never settle or kill the turn or the app-server (`turn/completed` / process exit do). `willRetry: true` is only logged. With no listener the session logs instead of emitting, so an `error` event cannot become an uncaught exception.
@@ -258,15 +259,14 @@ await manager.startSession({
 
 ### Cursor Agent (`engine: 'cursor'`) — legacy
 
-> **Legacy: `engine: 'cursor'`.** Superseded in this lineup by Grok Build (`engine: 'grok'`).
-> The `cursor` engine still exists and still works — existing callers are not broken — but it is
-> no longer a documented option, is not version-tracked, and gets no new work.
+> **Legacy lineup, still the Cursor route.** Grok Build (`engine: 'grok'`) is the default when a
+> Cursor session is not required. `engine: 'cursor'` stays available, including durable goals via
+> `cursor_goal_set`. It is not version-tracked.
 >
-> Cursor itself is still maintained. It left the tracked set because it does not report which
-> model ran (its `system` init event says `"model": "Auto"`), so costs cannot be attributed to a
-> model, and because xAI's Grok installer also claims the bare `agent` binary name.
+> Cursor's `system` init event says `"model": "Auto"`, so costs cannot be attributed to a model.
+> xAI's Grok installer also claims the bare `agent` binary name, which this engine does not use.
 
-Wraps the Cursor Agent CLI with `-p --output-format stream-json`. Write-enabled sessions use `--force`. Each `send()` spawns a new process.
+Wraps the Cursor Agent CLI with `-p --output-format stream-json`. Write-enabled sessions use `--force`. Each `send()` spawns a new process. `cursor_goal_set` sends the user message `/goal <objective>` (the same text the TUI submits). `--single-turn` is not passed, so that process keeps working while the goal is active. The timeout covers the whole pursuit.
 
 - Conversation continuity: the chat id from the first turn's `system` event is captured and passed back as `--resume <chatId>` on later sends, so the model sees prior turns. `--continue` is deliberately not used: it resumes "the latest chat", which collides between concurrent sessions.
 - One-shot execution per message (no persistent subprocess)
