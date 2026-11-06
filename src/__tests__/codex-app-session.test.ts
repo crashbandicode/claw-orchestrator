@@ -1143,3 +1143,147 @@ describe('PersistentCodexAppServerSession — ignoreUserConfig and MCP selection
     expect(mockSpawn).not.toHaveBeenCalled();
   });
 });
+
+const storedGoal = {
+  threadId: 't1',
+  objective: 'park',
+  status: 'active',
+  createdAt: 1,
+  updatedAt: 1,
+  timeUsedSeconds: 0,
+  tokensUsed: 0,
+};
+
+describe('PersistentCodexAppServerSession — goal RPCs and side fork', () => {
+  beforeEach(() => mockSpawn.mockReset());
+
+  it('sets, pauses, reads, and clears a goal without starting a turn', async () => {
+    const proc = createMockProc(
+      defaultResponder((m) => {
+        if (m.method === 'thread/goal/set' && m.params?.status === 'paused') {
+          return { goal: { ...storedGoal, status: 'paused' } };
+        }
+        if (m.method === 'thread/goal/set') return { goal: storedGoal };
+        if (m.method === 'thread/goal/get') return { goal: { ...storedGoal, status: 'paused' } };
+        if (m.method === 'thread/goal/clear') return { cleared: true };
+        return undefined;
+      }),
+    );
+    const session = await startSession(proc);
+
+    const set = await session.sendGoalCommand('  park  ');
+    expect(set.goal).toMatchObject({ objective: 'park', status: 'active' });
+    expect(proc.written.find((m) => m.method === 'thread/goal/set')?.params).toEqual({
+      threadId: 't1',
+      objective: 'park',
+      status: 'active',
+      origin: 'user',
+    });
+
+    const paused = await session.sendGoalCommand('pause');
+    expect(paused.goal).toMatchObject({ status: 'paused' });
+    expect(proc.written.filter((m) => m.method === 'thread/goal/set')[1]?.params).toEqual({
+      threadId: 't1',
+      status: 'paused',
+      origin: 'user',
+    });
+
+    await expect(session.refreshGoal()).resolves.toMatchObject({ status: 'paused', objective: 'park' });
+    const cleared = await session.sendGoalCommand('clear');
+    expect(cleared.goal).toBeNull();
+    expect(session.goal).toBeNull();
+    expect(proc.written.find((m) => m.method === 'thread/goal/clear')?.params).toEqual({
+      threadId: 't1',
+      origin: 'user',
+    });
+    expect(turnStartCalls(proc)).toHaveLength(0);
+  });
+
+  it('ignores a goal notification for a different thread', async () => {
+    const proc = createMockProc(defaultResponder());
+    const session = await startSession(proc);
+    pushNotification(proc, 'thread/goal/updated', {
+      threadId: 'other',
+      goal: { ...storedGoal, threadId: 'other', objective: 'elsewhere' },
+    });
+    await tick();
+    expect(session.goal).toBeNull();
+  });
+
+  it('asks on an ephemeral fork and leaves the parent thread and its turn alone', async () => {
+    const proc = createMockProc(
+      defaultResponder((m) => (m.method === 'thread/fork' ? { thread: { id: 'side1' } } : undefined)),
+    );
+    const session = await startSession(proc);
+    const streamed: string[] = [];
+    session.on('text', (chunk: string) => streamed.push(chunk));
+
+    const parent = session.send('parent', { waitForComplete: true, timeout: 3_000 });
+    await tick();
+    pushNotification(proc, 'turn/started', { threadId: 't1', turn: { id: 'parent-turn' } });
+    pushNotification(proc, 'item/agentMessage/delta', { threadId: 't1', delta: 'PARENT' });
+    await tick();
+
+    const sidePromise = session.side('Say SIDE', 1_000);
+    await tick();
+    const fork = proc.written.find((m) => m.method === 'thread/fork');
+    expect(fork?.params).toMatchObject({
+      threadId: 't1',
+      ephemeral: true,
+      excludeTurns: true,
+      cwd: '/tmp',
+      sandbox: 'workspace-write',
+    });
+    expect(fork?.params?.developerInstructions).toContain('You are in a side conversation');
+    const injected = proc.written.find((m) => m.method === 'thread/inject_items');
+    const items = injected?.params?.items as Array<{ content?: Array<{ text?: string }> }>;
+    expect(items?.[0]?.content?.[0]?.text).toContain('Side conversation boundary.');
+    const sideTurn = proc.written.filter((m) => m.method === 'turn/start').at(-1);
+    expect(sideTurn?.params?.threadId).toBe('side1');
+
+    pushNotification(proc, 'turn/started', { threadId: 'side1', turn: { id: 'side-turn' } });
+    pushNotification(proc, 'item/agentMessage/delta', { threadId: 'side1', delta: 'SIDE' });
+    pushNotification(proc, 'turn/completed', {
+      threadId: 'side1',
+      turn: { id: 'side-turn', status: 'completed' },
+    });
+    const side = await sidePromise;
+
+    expect(side).toEqual({ text: 'SIDE', sideThreadId: 'side1', parentThreadId: 't1' });
+    expect(session.codexThreadId).toBe('t1');
+    expect(session.isBusy).toBe(true);
+    expect(streamed.join('')).toBe('PARENT');
+    expect(proc.written.some((m) => m.method === 'thread/unsubscribe' && m.params?.threadId === 'side1')).toBe(true);
+
+    completeTurn(proc, 'parent-turn');
+    await expect(parent).resolves.toMatchObject({ text: 'PARENT' });
+    expect(session.isBusy).toBe(false);
+  });
+
+  it('retries the side fork without excludeTurns when history cannot be omitted', async () => {
+    let forks = 0;
+    const proc = createMockProc(
+      defaultResponder((m) => {
+        if (m.method !== 'thread/fork') return undefined;
+        forks += 1;
+        if (forks === 1) return { __rpcError: 'history pagination is unsupported for includeTurns' };
+        return { thread: { id: 'side2' } };
+      }),
+    );
+    const session = await startSession(proc);
+    const pending = session.side('again', 1_000);
+    await tick();
+    pushNotification(proc, 'item/completed', {
+      threadId: 'side2',
+      item: { type: 'agentMessage', text: 'OK' },
+    });
+    pushNotification(proc, 'turn/completed', {
+      threadId: 'side2',
+      turn: { id: 'side-turn', status: 'completed' },
+    });
+    await expect(pending).resolves.toMatchObject({ text: 'OK', sideThreadId: 'side2' });
+    const forkCalls = proc.written.filter((m) => m.method === 'thread/fork');
+    expect(forkCalls).toHaveLength(2);
+    expect(forkCalls[1]?.params?.excludeTurns).toBe(false);
+  });
+});

@@ -648,6 +648,21 @@ describe('SessionManager', () => {
 
   // ─── sendMessage ────────────────────────────────────────────────────
 
+  describe('cursorGoalSet', () => {
+    it('sends /goal on a cursor session and rejects any other engine', async () => {
+      await mgr.startSession({ name: 'cursor-goal', cwd: '/tmp', engine: 'cursor' });
+      await mgr.cursorGoalSet('cursor-goal', '  ship the fix  ', 1234);
+      expect(lastMock().sendCalls.at(-1)).toMatchObject({
+        message: '/goal ship the fix',
+        options: { waitForComplete: true, timeout: 1234 },
+      });
+
+      await mgr.startSession({ name: 'claude-goal', cwd: '/tmp', engine: 'claude' });
+      await expect(mgr.cursorGoalSet('claude-goal', 'ship the fix')).rejects.toThrow(/engine: "cursor"/);
+      await expect(mgr.cursorGoalSet('cursor-goal', '   ')).rejects.toThrow(/objective/);
+    });
+  });
+
   describe('sendMessage', () => {
     it('sends message and returns output', async () => {
       await mgr.startSession({ name: 'msg-test', cwd: '/tmp' });

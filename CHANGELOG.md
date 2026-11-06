@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.7.0-memento.7] - 2026-11-05
+
+### Added
+
+- `cursor_goal_set` sets a durable goal on a `cursor` session. It sends the user message `/goal <objective>`, the same text Cursor's TUI submits, and does not pass `--single-turn`, so that `cursor-agent -p` process keeps working while the goal is active. The timeout covers the whole pursuit. Other engines are rejected. Cursor has no slash command for clear, pause, or status.
+- Codex `codex-app` goals use `thread/goal/set`, `thread/goal/get`, and `thread/goal/clear` (Codex 0.165), with `origin: "user"`. Pause and resume are status updates. These RPCs do not wait for the model to pursue the objective.
+- `codex_side` asks one question on an ephemeral `thread/fork` of a `codex-app` thread, injects the same side-conversation boundary Codex's TUI uses, and unsubscribes the fork. The parent thread id stays, and the side answer does not complete a parent turn.
+
 ## [7.7.0-memento.6] - 2026-10-12
 
 ### Fixed

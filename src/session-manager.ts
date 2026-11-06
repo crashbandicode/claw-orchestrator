@@ -2018,14 +2018,12 @@ export class SessionManager {
   // ─── Codex /goal helpers (codex-app engine only) ─────────────────────
 
   /**
-   * Send a `/goal <args>` slash command to a `codex-app` session. Used by
-   * the `codex_goal_*` tools. The server-side parser interprets the slash
-   * command and emits goal-related notifications which the session class
-   * caches.
+   * Drive `thread/goal/set|get|clear` on a `codex-app` session. `slashArgs`
+   * keeps the old command words: empty reads, `pause` / `resume` / `clear`
+   * change status, and any other text sets an active objective.
    *
    * Errors clearly when called against a non-`codex-app` session — those
-   * sessions cannot interpret `/goal` (the `codex exec` path has no slash
-   * command surface).
+   * sessions have no goal RPC (the `codex exec` path has no goal surface).
    */
   async codexGoalCommand(
     name: string,
@@ -2049,14 +2047,19 @@ export class SessionManager {
   }
 
   /**
-   * Read the cached goal state from a `codex-app` session without sending
-   * any command. Returns null if no goal is set or the session has not yet
-   * received a `thread/goal/updated` notification.
+   * Read the goal from the app-server (`thread/goal/get`). Does not start a
+   * model turn. Returns null when the thread has no goal.
    */
-  codexGoalGet(name: string): { ok: true; goal: unknown } {
+  async codexGoalGet(name: string): Promise<{ ok: true; goal: unknown }> {
     const managed = this.sessions.get(name);
     if (!managed) throw new Error(`Session not found: ${name}`);
-    const session = managed.session as ISession & { goal?: unknown };
+    const session = managed.session as ISession & {
+      goal?: unknown;
+      refreshGoal?: () => Promise<unknown>;
+    };
+    if (typeof session.refreshGoal === 'function') {
+      return { ok: true, goal: await session.refreshGoal() };
+    }
     if (!('goal' in session)) {
       const engine = managed.config.engine || 'claude';
       throw new Error(
@@ -2065,6 +2068,35 @@ export class SessionManager {
       );
     }
     return { ok: true, goal: session.goal ?? null };
+  }
+
+  /**
+   * Ask one question on an ephemeral fork (`thread/fork` + boundary item).
+   * The parent thread id stays, and a parent turn already in flight is not
+   * completed by the side answer.
+   */
+  async codexSide(
+    name: string,
+    prompt: string,
+    timeoutMs?: number,
+  ): Promise<{ ok: true; text: string; sideThreadId: string; parentThreadId: string }> {
+    const managed = this.sessions.get(name);
+    if (!managed) throw new Error(`Session not found: ${name}`);
+    const session = managed.session as ISession & {
+      side?: (
+        prompt: string,
+        timeoutMs?: number,
+      ) => Promise<{ text: string; sideThreadId: string; parentThreadId: string }>;
+    };
+    if (typeof session.side !== 'function') {
+      const engine = managed.config.engine || 'claude';
+      throw new Error(
+        `Session "${name}" uses engine "${engine}" which does not support /side. ` +
+          `Start a session with engine: "codex-app".`,
+      );
+    }
+    const result = await session.side(prompt, timeoutMs);
+    return { ok: true, ...result };
   }
 
   // ─── Codex app-server v2 RPCs (codex-app engine only, Codex 0.137) ────────
@@ -2162,6 +2194,35 @@ export class SessionManager {
   async claudeGoalStatus(name: string, timeoutMs?: number): Promise<unknown> {
     this._assertClaudeSession(name);
     return await this.sendMessage(name, '/goal', { timeout: timeoutMs });
+  }
+
+  // ─── Cursor /goal (cursor-agent headless, cursor engine only) ────────
+  //
+  // Cursor's TUI `/goal` command submits the user message `/goal <objective>`.
+  // There is no separate goal RPC and no `/goal clear` or bare status command.
+  // In headless `-p` mode the same text is the prompt. Continuation stays
+  // inside that process: the CLI keeps working while a goal is active unless
+  // `--single-turn` is set, which this engine never passes. The timeout
+  // therefore covers the whole pursuit, not one model turn.
+
+  private _assertCursorSession(name: string): void {
+    const managed = this.sessions.get(name);
+    if (!managed) throw new Error(`Session not found: ${name}`);
+    const engine = managed.config.engine || 'claude';
+    if (engine !== 'cursor') {
+      throw new Error(
+        `Session "${name}" uses engine "${engine}" which does not support Cursor /goal. ` +
+          `Start a session with engine: "cursor" to use cursor_goal_set.`,
+      );
+    }
+  }
+
+  /** Send `/goal <objective>` to a cursor session. The process continues until the goal ends. */
+  async cursorGoalSet(name: string, objective: string, timeoutMs?: number): Promise<unknown> {
+    const trimmed = typeof objective === 'string' ? objective.trim() : '';
+    if (!trimmed) throw new Error('Cursor /goal requires an objective');
+    this._assertCursorSession(name);
+    return await this.sendMessage(name, `/goal ${trimmed}`, { timeout: timeoutMs });
   }
 
   // ─── Plugin Details (CLI 2.1.139) ─────────────────────────────────────

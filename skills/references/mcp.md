@@ -1,6 +1,6 @@
 # MCP integration
 
-Claw Orchestrator ships a Model Context Protocol (MCP) server (`clawo-mcp`) so any MCP-compatible host can drive its 83 tools.
+Claw Orchestrator ships a Model Context Protocol (MCP) server (`clawo-mcp`) so any MCP-compatible host can drive its 85 tools.
 
 This document covers:
 
@@ -37,9 +37,10 @@ Tools fall into a few groups:
 | Multi-agent council     | `council_start`, `council_status`, `council_abort`, `council_inject`, `council_review`, `council_accept`, `council_reject`                                            |
 | Ultraplan / ultrareview | `ultraplan_start`, `ultraplan_status`, `ultrareview_start`, `ultrareview_status`                                                                                      |
 | Autoloop                | `autoloop_start`, `autoloop_chat`, `autoloop_status`, `autoloop_list`, `autoloop_reset_agent`, `autoloop_stop`                                                        |
-| Codex specifics         | `codex_resume`, `codex_review`, `codex_goal_set`, `codex_goal_get`, `codex_goal_pause`, `codex_goal_resume`, `codex_goal_clear`                                       |
+| Codex specifics         | `codex_resume`, `codex_review`, `codex_goal_set`, `codex_goal_get`, `codex_goal_pause`, `codex_goal_resume`, `codex_goal_clear`, `codex_side`                         |
 | Codex app-server        | `codex_interrupt`, `codex_steer`, `codex_fork`, `codex_rollback`, `codex_models`, `codex_thread_list`                                                                 |
 | Claude specifics        | `claude_goal_set`, `claude_goal_status`, `claude_goal_clear`, `claude_agents_list`, `plugin_details`                                                                  |
+| Cursor specifics        | `cursor_goal_set`                                                                                                                                                     |
 | Fan-out                 | `fanout_start`, `fanout_status`, `fanout_abort`                                                                                                                       |
 | Workflow & verification | `workflow_start`, `workflow_status`, `workflow_list`, `workflow_resume`, `workflow_cancel`, `workflow_steer`, `workflow_approve`, `verify_run`                        |
 | Ultraapp                | `ultraapp_*` (14 tools) — see [`ultraapp.md`](./ultraapp.md)                                                                                                          |
@@ -234,7 +235,7 @@ The engines themselves (`claude`, `codex`, `agy`, `grok`, `opencode`) must also 
 
 ## Tool filtering
 
-83 tools is a lot for a small context window. Reduce noise either at the host level (most hosts have an `include` / `exclude` filter — see Hermes example above) or at the server level via `CLAWO_MCP_TOOLS`:
+85 tools is a lot for a small context window. Reduce noise either at the host level (most hosts have an `include` / `exclude` filter — see Hermes example above) or at the server level via `CLAWO_MCP_TOOLS`:
 
 ```bash
 CLAWO_MCP_TOOLS="session_start,session_send,session_stop,council_start,council_status" clawo-mcp

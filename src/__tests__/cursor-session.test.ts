@@ -182,6 +182,25 @@ describe('PersistentCursorSession', () => {
       expect(spawnArgs).toContain('sonnet-4');
     });
 
+    // Cursor continues a goal inside this process only when --single-turn is
+    // absent. cursor_goal_set sends the same text the TUI submits.
+    it('passes /goal through as the prompt and does not force a single turn', async () => {
+      const session = new PersistentCursorSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+      });
+      await session.start();
+
+      const sendPromise = session.send('/goal ship the fix', { waitForComplete: true });
+      setTimeout(() => closeProc(mockProc, 0), 10);
+      await sendPromise;
+
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs[spawnArgs.indexOf('-p') + 1]).toBe('/goal ship the fix');
+      expect(spawnArgs).not.toContain('--single-turn');
+    });
+
     // Regression guard: `agent -p` opens a NEW chat unless --resume names one, so
     // omitting it made every turn amnesiac. Verified against 2026.08.11: without
     // the flag turn 2 has no memory of turn 1; with it, turn 2 recalls it.

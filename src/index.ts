@@ -312,7 +312,7 @@ const plugin = {
             type: 'string',
             enum: ENGINE_TYPES,
             description:
-              'Engine to use (default: claude). codex = `codex exec` per send (no /goal). codex-app = long-running `codex app-server` with /goal support. agy = Google Antigravity CLI (Gemini CLI successor; plain-text output, tokens estimated, conversation resume handled automatically). opencode = sst/opencode CLI (provider-agnostic; pass model as `provider/model`). Use "custom" with customEngine config for any CLI.',
+              'Engine to use (default: claude). codex = `codex exec` per send (no /goal). codex-app = long-running `codex app-server` with thread/goal RPCs and codex_side. cursor = `cursor-agent`; `cursor_goal_set` sends `/goal` and that process keeps working while the goal is active. agy = Google Antigravity CLI (Gemini CLI successor; plain-text output, tokens estimated, conversation resume handled automatically). opencode = sst/opencode CLI (provider-agnostic; pass model as `provider/model`). Use "custom" with customEngine config for any CLI.',
           },
           model: { type: 'string', description: 'Model to use (opus, sonnet, haiku, gpt-5.5, agy-pro, etc.)' },
           permissionMode: {
@@ -957,6 +957,41 @@ const plugin = {
       },
     });
 
+    // ─── Tool: cursor_goal_set ──────────────────────────────────────────
+    //
+    // Cursor's slash command is `submitMessage("/goal <objective>")`. Headless
+    // `-p` sends that same user message, and the process continues the goal
+    // until it is complete or cleared as long as `--single-turn` is absent.
+    // This wrapper only formats that text and refuses any other engine.
+
+    registerTool({
+      name: 'cursor_goal_set',
+      description:
+        'Set a durable goal on a cursor session. Sends `/goal <objective>` to cursor-agent. The process keeps working while the goal is active, so timeout covers the whole pursuit. Requires engine: "cursor".',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Session name (must be a cursor session).' },
+          objective: {
+            type: 'string',
+            description: 'The objective. Cursor pursues it across idle continuations until it is complete or cleared.',
+          },
+          timeout: {
+            type: 'number',
+            description: 'Timeout in ms for the whole pursuit (default 300000). Raise it for a long goal.',
+          },
+        },
+        required: ['name', 'objective'],
+      },
+      execute: async (_id, args) => {
+        return await getManager().cursorGoalSet(
+          args.name as string,
+          args.objective as string,
+          args.timeout as number | undefined,
+        );
+      },
+    });
+
     // ─── Tool: codex_resume (Codex 0.119+) ──────────────────────────────
 
     registerTool({
@@ -1029,27 +1064,31 @@ const plugin = {
       },
     });
 
-    // ─── Tools: codex_goal_* (Codex 0.128 /goal slash commands) ────────
+    // ─── Tools: codex_goal_* and codex_side (Codex 0.165 app-server) ────
     //
-    // Goal mutation in Codex's v2 protocol is **server-side**: clients drive
-    // it by sending the `/goal <args>` slash text via `turn/start`. These
-    // tools are convenience wrappers around that pattern, scoped to sessions
-    // started with engine: "codex-app". Calls against any other engine
-    // surface a clear error rather than silently no-op'ing.
+    // Goals are thread/goal/set, thread/goal/get, and thread/goal/clear.
+    // Pause and resume are status updates. These calls do not wait for the
+    // model to pursue the objective; the long-lived app-server does that.
+    // codex_side is an ephemeral thread/fork that does not replace the parent
+    // thread. Every one of these tools requires engine: "codex-app".
 
     registerTool({
       name: 'codex_goal_set',
       description:
-        'Set a long-horizon objective on a codex-app session. Sends `/goal <objective>` via the app-server slash command. Requires engine: "codex-app".',
+        'Set a long-horizon objective on a codex-app session via thread/goal/set (status active, origin user). Does not wait for Codex to pursue it. Requires engine: "codex-app".',
       parameters: {
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Session name (must be a codex-app session).' },
           objective: {
             type: 'string',
-            description: 'The objective text. Codex will pursue this across turns until achieved, paused, or cleared.',
+            description:
+              'The objective text. Codex pursues this inside the app-server until it is paused, cleared, or complete.',
           },
-          timeout: { type: 'number', description: 'Timeout in ms for the resulting turn (default 120000).' },
+          timeout: {
+            type: 'number',
+            description: 'Unused. Goal RPCs return when the server stores the goal, not when pursuit finishes.',
+          },
         },
         required: ['name', 'objective'],
       },
@@ -1065,7 +1104,7 @@ const plugin = {
     registerTool({
       name: 'codex_goal_get',
       description:
-        'Read the cached goal state on a codex-app session (objective, status, tokensUsed, timeUsedSeconds, tokenBudget). Returns null if no goal is active. Pure read — does not send any turn.',
+        'Read the goal on a codex-app session via thread/goal/get (objective, status, tokensUsed, timeUsedSeconds, tokenBudget). Returns null if no goal is set. Does not start a turn.',
       parameters: {
         type: 'object',
         properties: { name: { type: 'string', description: 'Session name (must be a codex-app session).' } },
@@ -1078,7 +1117,7 @@ const plugin = {
 
     registerTool({
       name: 'codex_goal_pause',
-      description: 'Pause goal pursuit on a codex-app session. Sends `/goal pause`.',
+      description: 'Pause goal pursuit on a codex-app session via thread/goal/set status paused, origin user.',
       parameters: {
         type: 'object',
         properties: {
@@ -1094,7 +1133,7 @@ const plugin = {
 
     registerTool({
       name: 'codex_goal_resume',
-      description: 'Resume a paused goal on a codex-app session. Sends `/goal resume`.',
+      description: 'Resume a paused goal on a codex-app session via thread/goal/set status active, origin user.',
       parameters: {
         type: 'object',
         properties: {
@@ -1110,7 +1149,7 @@ const plugin = {
 
     registerTool({
       name: 'codex_goal_clear',
-      description: 'Clear the active goal on a codex-app session. Sends `/goal clear`.',
+      description: 'Clear the goal on a codex-app session via thread/goal/clear, origin user.',
       parameters: {
         type: 'object',
         properties: {
@@ -1121,6 +1160,28 @@ const plugin = {
       },
       execute: async (_id, args) => {
         return await getManager().codexGoalCommand(args.name as string, 'clear', args.timeout as number | undefined);
+      },
+    });
+
+    registerTool({
+      name: 'codex_side',
+      description:
+        'Ask one question on an ephemeral fork of a codex-app thread (Codex /side). Does not replace the parent thread or steal a parent turn. The parent conversation must already have a turn. Requires engine: "codex-app".',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Session name (must be a codex-app session).' },
+          prompt: { type: 'string', description: 'The side question. It runs on the fork, not the parent thread.' },
+          timeout: { type: 'number', description: 'Timeout in ms for the side answer (default 120000).' },
+        },
+        required: ['name', 'prompt'],
+      },
+      execute: async (_id, args) => {
+        return await getManager().codexSide(
+          args.name as string,
+          args.prompt as string,
+          args.timeout as number | undefined,
+        );
       },
     });
 
