@@ -45,6 +45,8 @@ class CostingSession extends EventEmitter implements ISession {
   /** Engine-side turns per send — claude counts one per tool-result batch. */
   turnsPerSend = 1;
   model = 'mock-model';
+  refusalFallbacks = 0;
+  lastRefusalFallback: { from: string; to: string; category?: string } | undefined;
 
   get isReady() {
     return true;
@@ -96,6 +98,9 @@ class CostingSession extends EventEmitter implements ISession {
       contextPercent: 1,
       retries: 0,
       tokensEstimated: this.tokensEstimated,
+      ...(this.refusalFallbacks
+        ? { refusalFallbacks: this.refusalFallbacks, lastRefusalFallback: this.lastRefusalFallback }
+        : {}),
       sessionId: this.sessionId,
       uptime: 1,
     };
@@ -185,6 +190,23 @@ describe('run ledger integration', () => {
     await mgr.shutdown();
   });
 
+  it("returns each send's own tokens, including a send queued behind another", async () => {
+    // The engine's stats are running totals. A caller that reads them around its own sendMessage()
+    // charges a queued send for the turn it waited behind; the manager measures inside the chain.
+    const mgr = makeManager();
+    await mgr.startSession({ name: 'usage-a', engine: 'codex', cwd: tmpDir });
+
+    const results = await Promise.all([mgr.sendMessage('usage-a', 'first'), mgr.sendMessage('usage-a', 'second')]);
+    const third = await mgr.sendMessage('usage-a', 'third');
+
+    expect([...results, third].map((r) => r.usage)).toEqual([
+      { tokensIn: 100, tokensOut: 40, costUsd: 0.5 },
+      { tokensIn: 100, tokensOut: 40, costUsd: 0.5 },
+      { tokensIn: 100, tokensOut: 40, costUsd: 0.5 },
+    ]);
+    await mgr.shutdown();
+  });
+
   it('records a failed turn with ok:false and the error text', async () => {
     const mgr = makeManager();
     await mgr.startSession({ name: 'ledger-fail', engine: 'codex', cwd: tmpDir });
@@ -239,6 +261,75 @@ describe('run ledger integration', () => {
     await mgr.shutdown();
   });
 
+  // An alias names a model only through the CLI: `opus[1m]` meant Opus 5 until
+  // CLI 2.1.280 and Opus 5.5 after. The row records what the engine reports.
+  it('records the model the engine reports when the session was started with an alias', async () => {
+    const mgr = makeManager();
+    await mgr.startSession({ name: 'ledger-alias', engine: 'claude', model: 'opus[1m]', cwd: tmpDir });
+    engines[0].model = 'claude-opus-5-5[1m]';
+    await mgr.sendMessage('ledger-alias', 'hi');
+    expect(readRunLedger({ session: 'ledger-alias' })[0].model).toBe('claude-opus-5-5[1m]');
+    await mgr.startSession({ name: 'ledger-explicit', engine: 'claude', model: 'claude-sonnet-4-6', cwd: tmpDir });
+    engines[1].model = 'claude-opus-5-5';
+    await mgr.sendMessage('ledger-explicit', 'hi');
+    expect(readRunLedger({ session: 'ledger-explicit' })[0].model).toBe('claude-sonnet-4-6');
+    await mgr.shutdown();
+  });
+
+  it('marks the turn the model refused and the engine re-ran on another model', async () => {
+    const mgr = makeManager();
+    await mgr.startSession({ name: 'ledger-refusal', engine: 'claude', cwd: tmpDir });
+    await mgr.sendMessage('ledger-refusal', 'ordinary');
+    // The fallback frame arrives during the turn, as it does from the CLI.
+    const engine = engines[0];
+    const send = engine.send.bind(engine);
+    engine.send = async (...args: Parameters<typeof engine.send>) => {
+      engine.refusalFallbacks = 1;
+      engine.lastRefusalFallback = { from: 'claude-opus-5-5', to: 'claude-opus-4-8', category: 'cyber' };
+      engine.send = send;
+      return send(...args);
+    };
+    await mgr.sendMessage('ledger-refusal', 'refused, then re-run');
+    await mgr.sendMessage('ledger-refusal', 'ordinary again');
+    const rows = readRunLedger({ session: 'ledger-refusal' });
+    expect(rows.map((r) => r.refusalFallback)).toEqual([
+      undefined,
+      { from: 'claude-opus-5-5', to: 'claude-opus-4-8', category: 'cyber' },
+      undefined,
+    ]);
+    await mgr.shutdown();
+  });
+
+  // An inbox delivery is a turn like any other: recorded on its own row, so the
+  // turn after it does not start from a snapshot that already holds its cost.
+  it('records an inbox turn on its own row', async () => {
+    const mgr = makeManager();
+    await mgr.startSession({ name: 'inbox-from', engine: 'codex', cwd: tmpDir });
+    await mgr.startSession({ name: 'inbox-to', engine: 'codex', cwd: tmpDir });
+    expect(await mgr.sessionSendTo('inbox-from', 'inbox-to', 'review this')).toEqual({
+      delivered: true,
+      queued: false,
+    });
+    await mgr.sendMessage('inbox-to', 'next');
+
+    const rows = readRunLedger({ session: 'inbox-to' });
+    expect(rows.map((r) => r.costUsd)).toEqual([0.5, 0.5]);
+    expect(rows.map((r) => r.turn)).toEqual([1, 2]);
+    await mgr.shutdown();
+  });
+
+  it('keeps an inbox turn in the conversation a handoff carries', async () => {
+    const mgr = makeManager();
+    await mgr.startSession({ name: 'inbox-ho-from', engine: 'codex', cwd: tmpDir });
+    await mgr.startSession({ name: 'inbox-ho-to', engine: 'codex', cwd: tmpDir });
+    await mgr.sessionSendTo('inbox-ho-from', 'inbox-ho-to', 'PLANTED: the release codename is heron');
+    await mgr.sendMessage('inbox-ho-to', 'next');
+
+    const out = await mgr.handoffSession('inbox-ho-to', { engine: 'opencode', message: 'go on' });
+    expect(out.result?.output).toContain('PLANTED: the release codename is heron');
+    await mgr.shutdown();
+  });
+
   it('getRunLedger returns rows plus a summary', async () => {
     const mgr = makeManager();
     await mgr.startSession({ name: 'ledger-sum', engine: 'codex', cwd: tmpDir });
@@ -271,6 +362,20 @@ describe('budget cap', () => {
     await mgr.startSession({ name: 'uncapped', engine: 'codex', cwd: tmpDir });
     for (let i = 0; i < 4; i++) await mgr.sendMessage('uncapped', `turn ${i}`);
     expect(engines[0].turns).toBe(4);
+    await mgr.shutdown();
+  });
+
+  it('refuses an inbox turn once the cap is reached and keeps the message queued', async () => {
+    const mgr = makeManager();
+    await mgr.startSession({ name: 'inbox-cap-from', engine: 'codex', cwd: tmpDir });
+    await mgr.startSession({ name: 'inbox-cap-to', engine: 'codex', cwd: tmpDir, maxBudgetUsd: 0.4 });
+    await mgr.sendMessage('inbox-cap-to', 'one');
+
+    const r = await mgr.sessionSendTo('inbox-cap-from', 'inbox-cap-to', 'more work');
+    expect(r).toEqual({ delivered: false, queued: true });
+    await expect(mgr.sessionDeliverInbox('inbox-cap-to')).rejects.toBeInstanceOf(BudgetExceededError);
+    expect(mgr.sessionInbox('inbox-cap-to')).toHaveLength(1);
+    expect(engines[1].turns).toBe(1);
     await mgr.shutdown();
   });
 

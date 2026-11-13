@@ -6,7 +6,6 @@ import * as path from 'node:path';
 import { SessionManager } from '../session-manager.js';
 import { EmbeddedServer } from '../embedded-server.js';
 import type { CouncilSession } from '../types.js';
-import { sanitizeCwd } from '../validation.js';
 import { useIsolatedHome } from './helpers/isolate-home.js';
 
 // Tests construct real EmbeddedServer instances, which write to
@@ -236,7 +235,7 @@ describe('POST /autoloop/new', () => {
     expect(r.status).toBe(200);
     expect(manager.autoloopStart).toHaveBeenLastCalledWith({
       runId: 'multi-engine-http',
-      workspace: sanitizeCwd('/tmp'),
+      workspace: fs.realpathSync('/tmp'),
       plannerEngine: 'codex',
       plannerModel: 'gpt-planner',
       plannerEffort: 'high',
@@ -299,10 +298,10 @@ describe('POST /autoloop/new', () => {
     }
   });
 
-  // A custom engine names an executable to spawn. This HTTP surface is routinely
-  // reverse-tunnelled to a public hostname and its token is a monitoring
-  // credential, so accepting one from the request body would turn any dashboard
-  // session into remote code execution. Built-in engines stay selectable.
+  // A custom engine names an executable to spawn, plus argv and a credential-
+  // bearing env. Such configs never travel in request bodies or run specs; over
+  // HTTP they are chosen by preset id or reference (see the comment above
+  // findCustomEngineKey). Built-in engines stay selectable.
   it('refuses a custom engine supplied over HTTP instead of spawning its binary', async () => {
     vi.mocked(manager.autoloopStart).mockClear();
     for (const key of ['planner_custom_engine', 'coder_custom_engine', 'reviewer_custom_engine']) {
@@ -330,6 +329,18 @@ describe('POST /autoloop/new', () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
       body: JSON.stringify({ workspace: '/tmp', planner_engine: 'not-real' }),
+    });
+    expect(r.status).toBe(400);
+  });
+
+  it('returns 400 when an autoloop role asks for engine acp', async () => {
+    vi.mocked(manager.autoloopStart).mockRejectedValueOnce(
+      new Error("Coder engine 'acp' is not supported by Autoloop"),
+    );
+    const r = await fetch(`http://127.0.0.1:${port}/autoloop/new`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify({ workspace: '/tmp', coder_engine: 'acp' }),
     });
     expect(r.status).toBe(400);
   });
@@ -395,18 +406,20 @@ describe('POST /autoloop/:id/chat', () => {
     await manager.shutdown();
   });
 
-  it('returns 202 immediately (fire-and-forget) and dispatches autoloopChat in the background', async () => {
-    // Pretend the run is alive in memory so the handler clears its 404 gate.
-    vi.spyOn(manager, 'getAutoloop').mockReturnValue({
-      runner: {} as never,
-      dispatcher: {} as never,
-    });
-    // autoloopChat may take a long time — simulate by never resolving within
+  it('returns 202 immediately (fire-and-forget) after accepting and sends in the background', async () => {
+    // Delivery may take a long time — simulate by never resolving within
     // the test window. The handler must NOT await it.
-    const slow = new Promise<{ reply: string }>(() => {
+    const slow = new Promise<void>(() => {
       /* never resolves */
     });
-    const spy = vi.spyOn(manager, 'autoloopChat').mockReturnValue(slow);
+    const send = vi.fn().mockReturnValue(slow);
+    // Pretend the run is alive in memory so the handler clears its 404 gate.
+    vi.spyOn(manager, 'getAutoloop').mockReturnValue({
+      runner: { send } as never,
+      dispatcher: {} as never,
+    });
+    const env = { msg_id: 'm_accepted', type: 'chat' } as never;
+    const spy = vi.spyOn(manager, 'acceptAutoloopChat').mockReturnValue(env);
 
     const r = await fetch(`http://127.0.0.1:${port}/autoloop/run-xyz/chat`, {
       method: 'POST',
@@ -415,9 +428,9 @@ describe('POST /autoloop/:id/chat', () => {
     });
     expect(r.status).toBe(202);
     const j = (await r.json()) as { ok: boolean; queued: boolean };
-    expect(j.ok).toBe(true);
-    expect(j.queued).toBe(true);
+    expect(j).toEqual({ ok: true, queued: true });
     expect(spy).toHaveBeenCalledWith('run-xyz', 'hello');
+    expect(send).toHaveBeenCalledWith(env);
   });
 
   it('returns 400 when text is missing or empty', async () => {

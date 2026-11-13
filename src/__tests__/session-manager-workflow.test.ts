@@ -11,6 +11,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
 
 const FAKE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-wf-home-'));
 process.env.HOME = FAKE_HOME;
@@ -69,6 +70,30 @@ function stubAgents(m: SessionManager, result: { ok: boolean; output?: string } 
 }
 
 describe('workflow lifecycle', () => {
+  // Their directories, slug and version are trusted as UltraApp wrote them.
+  it("refuses UltraApp's internal node kinds in a caller's spec, inline subflows included", async () => {
+    const deploy = {
+      id: 'd',
+      kind: 'ultraapp_deploy',
+      appRunId: 'ua-x',
+      runDir: tmp,
+      slug: 'demo',
+      version: '../../..',
+      codebasePath: tmp,
+    };
+    await expect(manager.workflowStart({ name: 'x', cwd: tmp, nodes: [deploy] } as never)).rejects.toThrow(
+      /internal to UltraApp/,
+    );
+    const nested = {
+      id: 's',
+      kind: 'subflow',
+      workflow: { name: 'inner', nodes: [{ ...deploy, kind: 'ultraapp_synth' }] },
+    };
+    await expect(manager.workflowStart({ name: 'x', cwd: tmp, nodes: [nested] } as never)).rejects.toThrow(
+      /internal to UltraApp/,
+    );
+  });
+
   it('completes as unverified when no contract is declared', async () => {
     const kernel = stubAgents(manager);
     const rec = await manager.workflowStart({ name: 'x', cwd: tmp, nodes: [{ id: 'a', kind: 'agent', prompt: 'go' }] });
@@ -125,6 +150,16 @@ describe('verifyRun', () => {
     });
     expect(bundle.passed).toBe(true);
     expect(bundle.results).toHaveLength(2);
+  });
+
+  it('refuses a label that names an existing workflow run, and writes nothing into it', async () => {
+    const kernel = stubAgents(manager);
+    const rec = await manager.workflowStart({ name: 'x', cwd: tmp, nodes: [{ id: 'a', kind: 'agent', prompt: 'go' }] });
+    await kernel.wait(rec.runId);
+    await expect(
+      manager.verifyRun({ cwd: tmp, label: rec.runId, contract: { checks: [{ type: 'command', cmd: 'true' }] } }),
+    ).rejects.toThrow(/workflow run/);
+    expect(fs.existsSync(path.join(tmp, 'wf', rec.runId, 'evidence'))).toBe(false);
   });
 
   it('refuses a contract with nothing recognisable in it', async () => {
@@ -202,5 +237,105 @@ describe('ledger verdict join', () => {
     await kernel.wait(rec.runId);
     appendRunRow(row({ session: 'in-run', parent: rec.runId }));
     expect(manager.getRunLedger({ since: '1h' }).rows[0].verified).toBeUndefined();
+  });
+});
+
+// ─── Council: decisions and control on a run that is not live here ─────────
+
+/**
+ * A council that has finished and parked for the user's decision. The council
+ * executor is stubbed with what the real one publishes on consensus, so the
+ * run is a real record on disk and nothing spawns an engine.
+ */
+async function finishedCouncil(m: SessionManager, projectDir: string): Promise<string> {
+  const kernel = (
+    m as unknown as {
+      kernel: { setExecutor: (k: string, f: unknown) => void; wait: (id: string) => Promise<unknown> };
+    }
+  ).kernel;
+  kernel.setExecutor('council', async () => ({
+    ok: true,
+    output: 'consensus',
+    data: {
+      task: 'do the thing',
+      responses: [],
+      councilStatus: 'awaiting_user',
+      agents: [{ name: 'a' }],
+      maxRounds: 1,
+      projectDir,
+    },
+  }));
+  const session = await m.councilStart('do the thing', {
+    agents: [{ name: 'a', emoji: '🔵', persona: 'p' }],
+    maxRounds: 1,
+    projectDir,
+  });
+  await kernel.wait(session.id);
+  return session.id;
+}
+
+function gitRepo(dir: string): string {
+  fs.mkdirSync(dir, { recursive: true });
+  execSync('git init -q -b main', { cwd: dir });
+  execSync('git config user.email t@t.com && git config user.name T', { cwd: dir });
+  fs.writeFileSync(path.join(dir, 'a.txt'), 'hi\n');
+  execSync('git add -A && git commit -q -m init', { cwd: dir });
+  return dir;
+}
+
+describe('council accept / reject', () => {
+  it('records accepted on the run, so council_status reports it — in this process and the next', async () => {
+    const id = await finishedCouncil(manager, gitRepo(path.join(tmp, 'repo')));
+    expect(manager.councilStatus(id)?.status).toBe('awaiting_user');
+
+    await manager.councilAccept(id);
+
+    expect(manager.councilStatus(id)?.status).toBe('accepted');
+    const next = new SessionManager();
+    try {
+      expect(next.councilStatus(id)?.status).toBe('accepted');
+    } finally {
+      await next.shutdown();
+    }
+  });
+
+  it('records rejected on the run', async () => {
+    const id = await finishedCouncil(manager, gitRepo(path.join(tmp, 'repo')));
+    await manager.councilReject(id, 'needs work');
+    expect(manager.councilStatus(id)?.status).toBe('rejected');
+  });
+});
+
+describe('council abort', () => {
+  it('says nothing was aborted when the council is not running in this process', async () => {
+    const id = await finishedCouncil(manager, gitRepo(path.join(tmp, 'repo')));
+    const result = manager.councilAbort(id);
+    expect(result.aborted).toBe(false);
+    expect(result.state).toBe('completed');
+    expect(result.reason).toMatch(/not running in this process/);
+  });
+
+  it('aborts a council that is running here', async () => {
+    const kernel = (
+      manager as unknown as {
+        kernel: { setExecutor: (k: string, f: unknown) => void; wait: (id: string) => Promise<{ state: string }> };
+      }
+    ).kernel;
+    kernel.setExecutor('council', async (_node: unknown, ctx: { signal: { aborted: boolean } }) => {
+      while (!ctx.signal.aborted) await new Promise((r) => setTimeout(r, 10));
+      return { ok: false, error: 'cancelled' };
+    });
+    const session = await manager.councilStart('do the thing', {
+      agents: [{ name: 'a', emoji: '🔵', persona: 'p' }],
+      maxRounds: 1,
+      projectDir: tmp,
+    });
+
+    expect(manager.councilAbort(session.id)).toEqual({ aborted: true });
+    expect((await kernel.wait(session.id)).state).toBe('cancelled');
+  });
+
+  it('still throws for a council that does not exist', () => {
+    expect(() => manager.councilAbort('no-such-council')).toThrow("Council 'no-such-council' not found");
   });
 });

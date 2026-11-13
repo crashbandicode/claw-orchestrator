@@ -107,15 +107,30 @@ function remoteOptions(opts: { operationId?: string; waitTimeout?: string }): {
 
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
+/**
+ * Print an API failure the same way every command does, and exit non-zero so a
+ * script can tell: a command that could not reach the server used to exit 0.
+ */
+function fail(r: unknown): void {
+  const error = r && typeof r === 'object' && 'error' in r ? (r as { error?: unknown }).error : r;
+  console.error(`Failed: ${String(error)}`);
+  process.exitCode = 1;
+}
+
+/** A usage error: said on stderr, and a non-zero exit like every other failure. */
+function usage(message: string): void {
+  console.error(`Error: ${message}`);
+  process.exitCode = 1;
+}
+
 const program = new Command();
 program.name('clawo').description('Claw Orchestrator CLI').version(getCliVersion());
 
-// Serve (standalone mode — no OpenClaw needed)
-// `clawo acp` is a thin alias for the `clawo-acp` binary. It exists so the
+// `clawo acp` runs the `clawo-acp` entry point in this process. It exists so the
 // server is discoverable from `clawo --help`, and so an ACP client can be
-// configured with a single command name. It re-execs rather than booting
-// in-process because the ACP entry point must own stdout from its first line —
-// anything this file printed first would land inside the protocol stream.
+// configured with a single command name. The ACP entry point must own stdout
+// from its first line, so nothing in this file may print before this action
+// runs — anything printed first would land inside the protocol stream.
 program
   .command('acp')
   .description('Run as an Agent Client Protocol agent over stdio (for Zed, JetBrains, dsh, …)')
@@ -124,6 +139,7 @@ program
     await import('./acp-server.js');
   });
 
+// Serve (standalone mode — no OpenClaw needed)
 program
   .command('serve')
   .description('Start standalone embedded server (for use without OpenClaw)')
@@ -162,9 +178,12 @@ program
     // Boot the ultraapp reverse-proxy router on port 19000 (with fallbacks).
     // Best-effort — failure here doesn't block serve mode; ultraapp builds
     // will simply rest at build-complete instead of progressing to deploy.
+    // `server` is created below; the router only asks for the token per request.
+    let controlToken: () => string | undefined = () => undefined;
     const router = new UltraappRouter({
       port: 19000,
       mapPath: path.join(defaultStoreRoot(), '_router.json'),
+      controlToken: () => controlToken(),
     });
     let routerStartedPort: number | null = null;
     try {
@@ -176,19 +195,29 @@ program
     }
 
     const server = new EmbeddedServer(manager, parseInt(opts.port), opts.host);
+    controlToken = () => server.controlToken();
     const port = await server.start();
-    if (port) {
-      console.log(`Standalone server running on http://127.0.0.1:${port}`);
-      console.log('Press Ctrl+C to stop');
-      const shutdown = async () => {
-        await server.stop();
-        if (routerStartedPort !== null) await router.stop().catch(() => {});
-        await manager.shutdown();
-        process.exit(0);
-      };
-      process.on('SIGINT', shutdown);
-      process.on('SIGTERM', shutdown);
+    // start() resolves 0 when the port is taken, which lets the plugin defer to
+    // a server already running. Here nothing else would serve, and the router
+    // and the manager's timer would keep the process alive doing nothing.
+    if (!port) {
+      console.error(
+        `Error: port ${opts.port} is already in use; stop the server holding it or pick another port with -p`,
+      );
+      if (routerStartedPort !== null) await router.stop().catch(() => {});
+      await manager.shutdown();
+      process.exit(1);
     }
+    console.log(`Standalone server running on http://127.0.0.1:${port}`);
+    console.log('Press Ctrl+C to stop');
+    const shutdown = async () => {
+      await server.stop();
+      if (routerStartedPort !== null) await router.stop().catch(() => {});
+      await manager.shutdown();
+      process.exit(0);
+    };
+    process.on('SIGINT', shutdown);
+    process.on('SIGTERM', shutdown);
   });
 
 program
@@ -267,13 +296,10 @@ program
 program
   .command('session-start [name]')
   .description(
-    'Start a persistent coding session (Claude Code, Codex, Antigravity, Grok Build, OpenCode, or a custom engine preset)',
+    'Start a persistent coding session (Claude Code, Codex, Antigravity, Grok Build, OpenCode, an ACP agent, or a custom engine preset)',
   )
   .option('-d, --cwd <dir>', 'Working directory')
-  .option(
-    '-e, --engine <engine>',
-    'Engine: claude (default), codex, codex-app, gemini, agy, cursor, grok, opencode, or custom',
-  )
+  .option('-e, --engine <engine>', 'Engine: claude (default), codex, codex-app, agy, grok, opencode, acp, or custom')
   .option('-m, --model <model>', 'Model to use')
   .option('--permission-mode <mode>', 'Permission mode', 'acceptEdits')
   .option('--effort <level>', 'Effort level')
@@ -295,28 +321,18 @@ program
   .option('--betas <headers>', 'Custom beta headers')
   .option('--enable-agent-teams', 'Enable agent teams')
   .option('--enable-auto-mode', 'Enable auto permission mode')
-  .option('--resume-session-id <id>', 'Resume existing session by native id. This is not a host-qualified handle.')
-  .option('--host <alias>', 'Configured execution-host alias')
-  .option('--operation-id <id>', 'Stable broker operation id')
-  .option('--wait-timeout <ms>', 'Controller wait in ms, distinct from native execution timeout')
-  .option('--parent-machine-id <uuid>', 'Origin Memento machine UUID')
-  .option('--parent-session-id <id>', 'Parent native session id')
-  .option('--parent-tool-id <id>', 'Parent provider: codex, claude_code, cursor, or opencode')
-  .option('--origin-host <name>', 'Source host display name')
+  .option('--resume-session-id <id>', 'Resume existing session by ID')
   .option('--base-url <url>', 'Custom API endpoint (for proxy)')
+  .option(
+    '--claude-account <name>',
+    "Claude engine: run under this account from the server's claude-accounts.json, or 'auto'",
+  )
   .option('--add-dir <dirs>', 'Comma-separated additional working directories')
-  .option(
-    '--ignore-user-config',
-    "Codex engines: start without the user's Codex MCP servers (engine codex also skips config.toml); keep some with --codex-mcp-servers",
-  )
-  .option(
-    '--codex-mcp-servers <names>',
-    'Codex engines, with --ignore-user-config: comma-separated MCP server names to keep from the Codex config',
-  )
   .option(
     '--custom-engine <preset>',
     'With -e custom: the id of a bundled engine preset (see `clawo engines`). Inline configs are not accepted here — that is what presets are for',
   )
+  .option('--acp-agent <preset>', 'With -e acp: the id of a bundled ACP agent preset (see `clawo engines`)')
   .action(async (name, opts) => {
     const body: Record<string, unknown> = { name: name || `session-${Date.now()}` };
     if (opts.cwd) body.cwd = opts.cwd;
@@ -325,6 +341,7 @@ program
     // this command reaches the session through the same HTTP surface that
     // refuses those — see `clawo engines` for what is available.
     if (opts.customEngine) body.customEngine = opts.customEngine;
+    if (opts.acpAgent) body.acpAgent = opts.acpAgent;
     if (opts.model) body.model = opts.model;
     if (opts.permissionMode) body.permissionMode = opts.permissionMode;
     if (opts.effort) body.effort = opts.effort;
@@ -339,24 +356,14 @@ program
         .map((s: string) => s.trim())
         .filter(Boolean);
     if (opts.resumeSessionId) body.resumeSessionId = opts.resumeSessionId;
-    if (opts.host) body.host = opts.host;
-    if (opts.parentMachineId) body.parentMachineId = opts.parentMachineId;
-    if (opts.parentSessionId) body.parentSessionId = opts.parentSessionId;
-    if (opts.parentToolId) body.parentToolId = opts.parentToolId;
-    if (opts.originHost) body.originHost = opts.originHost;
     if (opts.baseUrl) body.baseUrl = opts.baseUrl;
+    if (opts.claudeAccount) body.claudeAccount = opts.claudeAccount;
     if (opts.addDir)
       body.addDir = opts.addDir
         .split(',')
         .map((s: string) => s.trim())
         .filter(Boolean);
     if (opts.enableAutoMode) body.enableAutoMode = true;
-    if (opts.ignoreUserConfig) body.ignoreUserConfig = true;
-    if (opts.codexMcpServers)
-      body.codexMcpServers = opts.codexMcpServers
-        .split(',')
-        .map((s: string) => s.trim())
-        .filter(Boolean);
     if (opts.maxTurns) {
       const v = parseInt(opts.maxTurns);
       if (isNaN(v) || v <= 0) {
@@ -402,101 +409,61 @@ program
         .filter(Boolean);
     if (opts.enableAgentTeams) body.enableAgentTeams = true;
 
-    let result: Record<string, unknown>;
-    try {
-      result =
-        (await brokerCall(opts.host, 'session.start', body, remoteOptions(opts))) ??
-        (await api('/session/start', 'POST', body));
-    } catch (err) {
-      console.error((err as Error).message);
-      process.exit(1);
-    }
+    const result = await api('/session/start', 'POST', body);
     if (result.ok) {
-      console.log(`Session '${(result.name as string) || body.name}' started!`);
-      if (result.localName) console.log(`Local name: ${result.localName}`);
-      if (result.remoteSessionHandle) console.log(`Remote handle: ${result.remoteSessionHandle}`);
-      if (result.claudeSessionId) console.log(`Native session ID: ${result.claudeSessionId}`);
-      if (result.status) console.log(`Status: ${result.status}`);
-      if (result.operationId) console.log(`Operation: ${result.operationId}`);
-    } else console.error(`Failed: ${result.error}`);
+      console.log(`Session '${body.name}' started!`);
+      if (result.claudeSessionId) console.log(`Engine session ID: ${result.claudeSessionId}`);
+    } else fail(result.error);
   });
 
 program
-  .command('session-send <name> <message>')
+  .command('session-send <name> [message]')
   .description('Send a message to a session')
+  .option('--message-file <file>', 'Read the message from a file (for long or dash-leading text)')
   .option('--effort <level>', 'Effort level')
   .option('--plan', 'Plan mode')
-  .option('-t, --timeout <ms>', 'Native execution timeout', '300000')
-  .option('-s, --stream', 'Collect streaming chunks and include in output')
-  .option('--host <alias>', 'Configured execution-host alias')
-  .option('--operation-id <id>', 'Stable broker operation id')
-  .option('--wait-timeout <ms>', 'Controller wait in ms, distinct from the native timeout')
-  .action(async (name, message, opts) => {
-    const body = {
+  .option('-t, --timeout <ms>', 'Timeout', '300000')
+  // Kept so scripts that pass it still parse: /session/send answers when the
+  // turn ends and has no streamed form.
+  .option('-s, --stream', 'No effect: the reply arrives when the turn ends')
+  .option('--json', 'Print the whole result as JSON')
+  .action(async (name, messageArg, opts) => {
+    const message = opts.messageFile ? fs.readFileSync(opts.messageFile, 'utf-8') : messageArg;
+    if (!message) {
+      fail('give a message, or --message-file');
+      return;
+    }
+    const result = await api('/session/send', 'POST', {
       name,
       message,
       effort: opts.effort,
       plan: opts.plan,
       timeout: parseInt(opts.timeout),
-      stream: opts.stream || undefined,
-      ...(opts.host ? { host: opts.host } : {}),
-    };
-    let result: Record<string, unknown>;
-    try {
-      result =
-        (await brokerCall(opts.host, 'session.send', body, remoteOptions(opts))) ??
-        (await api('/session/send', 'POST', body));
-    } catch (err) {
-      console.error((err as Error).message);
-      process.exit(1);
-    }
-    if (result.ok) {
-      if (result.status === 'running' || result.status === 'accepted') {
-        console.log(`Operation ${result.operationId} is ${result.status}`);
-        return;
-      }
+    });
+    if (opts.json) {
+      console.log(JSON.stringify(result));
+      if (!result.ok) process.exitCode = 1;
+    } else if (result.ok) {
       console.log(result.output);
-      if (opts.stream && Array.isArray(result.chunks) && result.chunks.length > 0) {
-        console.log(`\n[${result.chunks.length} streaming chunks collected]`);
-      }
-    } else console.error(`Failed: ${result.error}`);
+    } else fail(result.error);
   });
 
 program
   .command('session-stop <name>')
   .description('Stop a session')
-  .option('--host <alias>', 'Configured execution-host alias')
-  .option('--operation-id <id>', 'Stable broker operation id')
-  .action(async (name, opts) => {
-    const body = { name, ...(opts.host ? { host: opts.host } : {}) };
-    let r: Record<string, unknown>;
-    try {
-      r =
-        (await brokerCall(opts.host, 'session.stop', body, remoteOptions(opts))) ??
-        (await api('/session/stop', 'POST', body));
-    } catch (err) {
-      console.error((err as Error).message);
-      process.exit(1);
-    }
+  .action(async (name) => {
+    const r = await api('/session/stop', 'POST', { name });
     if (r.ok) console.log(`Session '${name}' stopped.`);
-    else console.error(`Failed: ${r.error}`);
+    else fail(r.error);
   });
 
 program
   .command('session-list')
   .description('List sessions')
-  .option('--host <alias>', 'Configured execution-host alias')
-  .action(async (opts) => {
-    const body = { ...(opts.host ? { host: opts.host } : {}) };
-    let r: Record<string, unknown>;
-    try {
-      r = (await brokerCall(opts.host, 'session.list', body)) ?? (await api('/session/list'));
-    } catch (err) {
-      console.error((err as Error).message);
-      process.exit(1);
-    }
+  .action(async () => {
+    const r = await api('/session/list');
     if (!r.ok) {
-      console.error(`Failed: ${r.error}`);
+      fail(r.error);
       return;
     }
     const sessions = r.sessions as Array<{ name: string; model?: string; cwd: string }>;
@@ -510,18 +477,16 @@ program
 program
   .command('session-status <name>')
   .description('Get session status')
-  .option('--host <alias>', 'Configured execution-host alias')
+  .option('--json', 'Print the whole status as JSON')
   .action(async (name, opts) => {
-    const body = { name, ...(opts.host ? { host: opts.host } : {}) };
-    let r: Record<string, unknown>;
-    try {
-      r = (await brokerCall(opts.host, 'session.status', body)) ?? (await api('/session/status', 'POST', body));
-    } catch (err) {
-      console.error((err as Error).message);
-      process.exit(1);
+    const r = await api('/session/status', 'POST', { name });
+    if (opts.json) {
+      console.log(JSON.stringify(r));
+      if (!r.ok) process.exitCode = 1;
+      return;
     }
     if (!r.ok) {
-      console.error(`Failed: ${r.error}`);
+      fail(r.error);
       return;
     }
     const s = r.stats as Record<string, unknown>;
@@ -530,11 +495,6 @@ program
     console.log(`  Tokens: ${s.tokensIn} in / ${s.tokensOut} out`);
     console.log(`  Uptime: ${s.uptime}s`);
   });
-
-/** Print an API failure the same way every command does. */
-function fail(r: { error?: string }): void {
-  console.error(`Failed: ${r.error}`);
-}
 
 program
   .command('engines')
@@ -562,7 +522,11 @@ program
         `    verified by ${p.provenance.maintainer} against ${p.provenance.verifiedAgainst} on ${p.provenance.verifiedOn}`,
       );
       if (p.provenance.smokeUrl) console.log(`    smoke: ${p.provenance.smokeUrl}`);
-      console.log(`    use:   clawo session-start my-session -e custom --custom-engine ${p.id}`);
+      console.log(
+        p.acp
+          ? `    use:   clawo session-start my-session -e acp --acp-agent ${p.id}`
+          : `    use:   clawo session-start my-session -e custom --custom-engine ${p.id}`,
+      );
       console.log('');
     }
   });
@@ -587,7 +551,7 @@ program
     if (opts.refuted) params.set('verified', 'false');
     const r = await api(`/runs?${params.toString()}`);
     if (!r.ok) {
-      console.error(`Failed: ${r.error}`);
+      fail(r.error);
       return;
     }
     if (opts.json) {
@@ -605,7 +569,7 @@ program
   .action(async (name, pattern, opts) => {
     const r = await api('/session/grep', 'POST', { name, pattern, limit: parseInt(opts.limit) });
     if (!r.ok) {
-      console.error(`Failed: ${r.error}`);
+      fail(r.error);
       return;
     }
     console.log(`Found ${r.count} match(es)`);
@@ -619,7 +583,7 @@ program
   .action(async (name, opts) => {
     const r = await api('/session/compact', 'POST', { name, summary: opts.summary });
     if (r.ok) console.log('Compacted.');
-    else console.error(`Failed: ${r.error}`);
+    else fail(r.error);
   });
 
 // Agent management
@@ -631,7 +595,7 @@ program
     const q = opts.cwd ? `?cwd=${encodeURIComponent(opts.cwd)}` : '';
     const r = await api(`/agents${q}`);
     if (!r.ok) {
-      console.error(`Failed: ${r.error}`);
+      fail(r.error);
       return;
     }
     const agents = r.agents as Array<{ name: string; description: string }>;
@@ -656,7 +620,7 @@ program
       prompt: opts.prompt,
     });
     if (r.ok) console.log(`Agent '${name}' created at: ${r.path}`);
-    else console.error(`Failed: ${r.error}`);
+    else fail(r.error);
   });
 
 // Skills
@@ -668,7 +632,7 @@ program
     const q = opts.cwd ? `?cwd=${encodeURIComponent(opts.cwd)}` : '';
     const r = await api(`/skills${q}`);
     if (!r.ok) {
-      console.error(`Failed: ${r.error}`);
+      fail(r.error);
       return;
     }
     const skills = r.skills as Array<{ name: string; description: string }>;
@@ -695,7 +659,7 @@ program
       trigger: opts.trigger,
     });
     if (r.ok) console.log(`Skill '${name}' created at: ${r.path}`);
-    else console.error(`Failed: ${r.error}`);
+    else fail(r.error);
   });
 
 // Rules
@@ -707,7 +671,7 @@ program
     const q = opts.cwd ? `?cwd=${encodeURIComponent(opts.cwd)}` : '';
     const r = await api(`/rules${q}`);
     if (!r.ok) {
-      console.error(`Failed: ${r.error}`);
+      fail(r.error);
       return;
     }
     const rules = r.rules as Array<{ name: string; description: string; paths: string; condition: string }>;
@@ -742,7 +706,7 @@ program
       condition: opts.condition,
     });
     if (r.ok) console.log(`Rule '${name}' created at: ${r.path}`);
-    else console.error(`Failed: ${r.error}`);
+    else fail(r.error);
   });
 
 // Agent teams
@@ -752,7 +716,7 @@ program
   .action(async (name) => {
     const r = await api('/session/team-list', 'POST', { name });
     if (r.ok) console.log(r.response || 'No team info');
-    else console.error(`Failed: ${r.error}`);
+    else fail(r.error);
   });
 
 program
@@ -761,7 +725,7 @@ program
   .action(async (name, teammate, message) => {
     const r = await api('/session/team-send', 'POST', { name, teammate, message });
     if (r.ok) console.log(r.output || 'Sent');
-    else console.error(`Failed: ${r.error}`);
+    else fail(r.error);
   });
 
 // ─── workflow / verify ──────────────────────────────────────────────────────
@@ -798,7 +762,7 @@ program
       return;
     }
 
-    if (!runId) return console.error('Error: runId is required for this action');
+    if (!runId) return usage('runId is required for this action');
 
     if (action === 'show') {
       const r = await api(`/workflow/${encodeURIComponent(runId)}/state`);
@@ -809,8 +773,18 @@ program
       const run = r.run as Record<string, unknown>;
       console.log(`${String(run.runId)}  ${String(run.workflow)}  ${String(run.state)} / ${String(run.outcome)}`);
       if (run.error) console.log(`error: ${String(run.error)}`);
-      for (const node of Object.values(run.nodes as Record<string, Record<string, string>>)) {
-        console.log(`  ${String(node.id).padEnd(18)} ${String(node.kind).padEnd(11)} ${node.state}`);
+      for (const node of Object.values(run.nodes as Record<string, Record<string, unknown>>)) {
+        console.log(`  ${String(node.id).padEnd(18)} ${String(node.kind).padEnd(11)} ${String(node.state)}`);
+        // A goal runs for hours; its checkpoint is the only progress there is.
+        const g = node.kind === 'goal' ? (node.data as Record<string, unknown> | undefined) : undefined;
+        if (g) {
+          const err = g.lastError as { code?: string; message?: string } | undefined;
+          console.log(
+            `    goal ${String(g.status)}  ${String(g.tokensUsed)} tokens  ${String(g.timeUsedSeconds)}s  ` +
+              `resumes ${String(g.resumes)}  thread ${String(g.threadId)}` +
+              (err ? `\n    last error: ${err.code ?? err.message}` : ''),
+          );
+        }
       }
       return;
     }
@@ -823,7 +797,7 @@ program
     }
 
     if (action === 'steer') {
-      if (!text) return console.error('Error: steer needs text');
+      if (!text) return usage('steer needs text');
       const r = await api(`/workflow/${encodeURIComponent(runId)}/steer`, 'POST', { text });
       if (!r.ok) return fail(r);
       console.log(r.steered ? 'Steer queued.' : 'Run is not live here; nothing queued.');
@@ -838,7 +812,7 @@ program
       return;
     }
 
-    console.error(`Unknown action '${action}'. Use list | show | cancel | resume | steer | approve.`);
+    usage(`unknown action '${action}'. Use list | show | cancel | resume | steer | approve.`);
   });
 
 program
@@ -857,9 +831,386 @@ program
     console.log(formatEvidence(r.evidence as never));
   });
 
+// ─── solve / fanout — start a built-in workflow from the terminal ───────────
+
+type AgentBindingArg = { name: string; engine?: string; model?: string; acpAgent?: string };
+
+/**
+ * `claude`, `codex:gpt-6.1-sol` → an agent binding. Names are made unique. For
+ * `acp` the part after the colon names the agent rather than a model —
+ * `acp:kimi-code` — because an ACP agent picks its own model.
+ */
+function parseAgentList(list: string, seen = new Map<string, number>()): AgentBindingArg[] {
+  return list
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((item) => {
+      const i = item.indexOf(':');
+      const engine = i === -1 ? item : item.slice(0, i);
+      const rest = i === -1 ? undefined : item.slice(i + 1) || undefined;
+      const acpAgent = engine === 'acp' ? rest : undefined;
+      const model = engine === 'acp' ? undefined : rest;
+      const base = acpAgent ?? engine;
+      const n = (seen.get(base) ?? 0) + 1;
+      seen.set(base, n);
+      return {
+        name: n === 1 ? base : `${base}-${n}`,
+        engine,
+        ...(model ? { model } : {}),
+        ...(acpAgent ? { acpAgent } : {}),
+      };
+    });
+}
+
+/** Refuse an unknown engine here rather than as a failed node a minute later. */
+async function enginesKnown(agents: AgentBindingArg[]): Promise<boolean> {
+  const { ENGINE_TYPES } = await import('../src/types.js');
+  const known = ENGINE_TYPES as readonly string[];
+  const bad = agents.filter((a) => !a.engine || !known.includes(a.engine)).map((a) => a.engine || '(empty)');
+  if (bad.length) {
+    console.error(`Error: unknown engine ${bad.join(', ')}. Known: ${known.join(', ')}`);
+    process.exitCode = 1;
+    return false;
+  }
+  if (agents.some((a) => a.engine === 'acp' && !a.acpAgent)) {
+    console.error('Error: engine acp needs the agent: write acp:<preset>, e.g. acp:kimi-code (see `clawo engines`)');
+    process.exitCode = 1;
+    return false;
+  }
+  return true;
+}
+
+function collect(value: string, previous: string[]): string[] {
+  return [...previous, value];
+}
+
+/**
+ * `--check "node --test"` → a command check. Split on whitespace and run as
+ * argv, never through a shell; anything that needs quoting goes in `--contract`.
+ */
+function buildContract(
+  checks: string[],
+  contractFile: string | undefined,
+  timeoutMs?: number,
+): Record<string, unknown> | undefined {
+  if (contractFile) {
+    const raw = JSON.parse(fs.readFileSync(contractFile, 'utf-8')) as Record<string, unknown>;
+    if (!checks.length) return raw;
+    return { ...raw, checks: [...((raw.checks as unknown[]) ?? []), ...checksFromFlags(checks, timeoutMs)] };
+  }
+  return checks.length ? { checks: checksFromFlags(checks, timeoutMs) } : undefined;
+}
+
+function checksFromFlags(checks: string[], timeoutMs?: number): Array<Record<string, unknown>> {
+  return checks.map((c, i) => {
+    const [cmd, ...args] = c.trim().split(/\s+/);
+    return { id: `check-${i + 1}`, type: 'command', cmd, args, ...(timeoutMs ? { timeoutMs } : {}) };
+  });
+}
+
+type RunSnapshot = {
+  state: string;
+  outcome: string;
+  error?: string;
+  outcomeReason?: string;
+  costUsd?: number;
+  nodes: Record<string, { id: string; kind: string; state: string; startedAt?: string; endedAt?: string }>;
+};
+
+const RUN_DONE = new Set(['completed', 'failed', 'cancelled']);
+
+async function runState(runId: string): Promise<RunSnapshot | undefined> {
+  const r = await api(`/workflow/${encodeURIComponent(runId)}/state`);
+  if (!r.ok) {
+    fail(r);
+    return undefined;
+  }
+  return r.run as RunSnapshot;
+}
+
+/** Print the verdict line and return the exit code: 0 only for a completed run. */
+function printVerdict(runId: string, run: RunSnapshot): number {
+  const verdict = run.outcome === 'refuted' ? 'REFUTED' : run.outcome;
+  const cost = typeof run.costUsd === 'number' ? `  $${run.costUsd.toFixed(4)}` : '';
+  console.log(`\n${runId}  ${run.state} / ${verdict}${cost}`);
+  if (run.outcomeReason) console.log(run.outcomeReason);
+  if (run.error) console.log(`error: ${run.error}`);
+  if (run.outcome !== 'unverified') console.log(`evidence: clawo verify ${runId}`);
+  return run.state === 'completed' ? 0 : 1;
+}
+
+/**
+ * Follow a run until it ends, printing each node transition in the order it
+ * happened. Reads the run's event stream: polling the state missed transitions
+ * that came and went between two polls — a failed check and the repair it
+ * triggered printed as one line, in node order rather than time order.
+ */
+async function followRun(runId: string): Promise<number> {
+  const first = await runState(runId);
+  if (!first) return 1;
+  const kinds = new Map(Object.values(first.nodes).map((n) => [n.id, n.kind]));
+  const last = new Map<string, string>();
+  const line = (node: string, state: string): void => {
+    if (last.get(node) === state) return;
+    last.set(node, state);
+    console.log(`  ${node.padEnd(18)} ${(kinds.get(node) ?? '').padEnd(11)} ${state}`);
+  };
+  // What already happened before the stream was open, oldest first.
+  const stamp = (n: RunSnapshot['nodes'][string]): string => n.endedAt ?? n.startedAt ?? '';
+  for (const n of Object.values(first.nodes)
+    .filter((x) => x.state !== 'pending')
+    .sort((x, y) => stamp(x).localeCompare(stamp(y)))) {
+    line(n.id, n.state);
+  }
+  if (RUN_DONE.has(first.state)) return printVerdict(runId, first);
+
+  const headers: Record<string, string> = {};
+  const token = getAuthToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const ctrl = new AbortController();
+  let ended = false;
+  let wake: () => void = () => {};
+  // The stream carries the transitions; a slow poll is what decides the run is
+  // over, so a dropped connection or a missed final event cannot hang the CLI.
+  const watch = (async () => {
+    while (!ended) {
+      await new Promise<void>((res) => {
+        const t = setTimeout(res, 5000);
+        wake = () => {
+          clearTimeout(t);
+          res();
+        };
+      });
+      if (ended) break;
+      const s = await runState(runId);
+      if (!s || RUN_DONE.has(s.state)) break;
+    }
+    ctrl.abort();
+  })();
+  try {
+    const res = await fetch(`${getBaseUrl()}/workflow/${encodeURIComponent(runId)}/events`, {
+      headers,
+      signal: ctrl.signal,
+    });
+    const reader = res.body?.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    while (reader) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let cut: number;
+      while ((cut = buf.indexOf('\n\n')) !== -1) {
+        const block = buf.slice(0, cut);
+        buf = buf.slice(cut + 2);
+        if (!block.startsWith('event: workflow-event')) continue;
+        const data = block.slice(block.indexOf('data: ') + 6);
+        const e = JSON.parse(data) as { type: string; node?: string; state?: string };
+        if (e.type === 'node_state' && e.node && e.state) line(e.node, e.state);
+        if (e.type === 'run_state' && e.state && RUN_DONE.has(e.state)) ctrl.abort();
+      }
+    }
+  } catch {
+    // Aborted on purpose when the run ended, or the stream dropped: the final
+    // state below is read fresh either way.
+  }
+  ended = true;
+  wake();
+  await watch.catch(() => {});
+  const final = await runState(runId);
+  return final ? printVerdict(runId, final) : 1;
+}
+
+async function startWorkflow(
+  spec: unknown,
+  cwd: string,
+  contract: Record<string, unknown> | undefined,
+  opts: { wait?: boolean; json?: boolean },
+): Promise<string | undefined> {
+  const r = await api('/workflow/new', 'POST', { spec, cwd, contract });
+  if (!r.ok) {
+    fail(r);
+    process.exitCode = 1;
+    return undefined;
+  }
+  const runId = String(r.runId);
+  if (!opts.wait) {
+    if (opts.json) console.log(JSON.stringify({ runId, state: r.state }));
+    else console.log(`${runId} started. Follow it with: clawo workflow show ${runId}`);
+    return runId;
+  }
+  if (!opts.json) console.log(`${runId} started`);
+  process.exitCode = opts.json ? await waitQuietly(runId) : await followRun(runId);
+  if (opts.json) {
+    const s = await api(`/workflow/${encodeURIComponent(runId)}/state`);
+    console.log(JSON.stringify(s.run, null, 2));
+  }
+  return runId;
+}
+
+/** `--wait --json`: poll without printing, so stdout stays one JSON document. */
+async function waitQuietly(runId: string): Promise<number> {
+  for (;;) {
+    const r = await api(`/workflow/${encodeURIComponent(runId)}/state`);
+    const run = r.run as { state?: string } | undefined;
+    if (!r.ok || !run) return 1;
+    if (run.state === 'completed') return 0;
+    if (run.state === 'failed' || run.state === 'cancelled') return 1;
+    await new Promise((res) => setTimeout(res, 2000));
+  }
+}
+
+program
+  .command('solve')
+  .description('Fix something and have the runtime check it: triage → implement → verify → repair until green')
+  .argument('<task>', 'What to do')
+  .option(
+    '-e, --engine <engine[:model]>',
+    'Implementer engine, optionally with a model; acp:<preset> for an ACP agent',
+    'claude',
+  )
+  .option('--scouts <list>', 'Comma-separated triage agents, engine[:model] each (default: the implementer)')
+  .option('--reviewers <list>', 'Comma-separated reviewers, engine[:model] each')
+  .option(
+    '-c, --check <command>',
+    'Acceptance check the runtime runs itself, e.g. "npm test" (repeatable)',
+    collect,
+    [],
+  )
+  .option('--contract <file>', 'Acceptance contract JSON file (merged with --check)')
+  .option('--max-repairs <n>', 'Repair attempts while the checks are red', '3')
+  .option('--human-gate', 'Wait for `clawo workflow approve` before writing anything')
+  .option('--cwd <dir>', 'Project directory', process.cwd())
+  .option('-w, --wait', 'Follow the run until it ends; exit 1 unless it completes')
+  .option('--json', 'Machine-readable output')
+  .action(async (task: string, opts) => {
+    const { solveWorkflow } = await import('../src/kernel/templates/index.js');
+    const [implementer] = parseAgentList(opts.engine);
+    const scouts = opts.scouts ? parseAgentList(opts.scouts) : [{ ...implementer }];
+    const reviewers = opts.reviewers ? parseAgentList(opts.reviewers) : undefined;
+    if (!(await enginesKnown([implementer, ...scouts, ...(reviewers ?? [])]))) return;
+    const cwd = path.resolve(opts.cwd);
+    const spec = solveWorkflow({
+      task,
+      cwd,
+      scouts: scouts as never,
+      implementer: { engine: implementer.engine as never, model: implementer.model, acpAgent: implementer.acpAgent },
+      reviewers: reviewers as never,
+      humanGate: opts.humanGate,
+      maxRepairs: Math.max(0, parseInt(opts.maxRepairs, 10) || 0),
+    });
+    await startWorkflow(spec, cwd, buildContract(opts.check, opts.contract), opts);
+  });
+
+program
+  .command('fanout')
+  .description('Ask several engines the same thing in parallel, optionally with a synthesis pass')
+  .argument('<task>', 'The prompt every agent gets')
+  .option(
+    '-e, --engines <list>',
+    'Comma-separated agents, engine[:model] each; acp:<preset> for an ACP agent',
+    'claude,codex',
+  )
+  .option('-s, --synthesize', 'Merge the answers in a final pass (needs two or more agents)')
+  .option('-c, --check <command>', 'Acceptance check the runtime runs afterwards (repeatable)', collect, [])
+  .option('--contract <file>', 'Acceptance contract JSON file (merged with --check)')
+  .option('--cwd <dir>', 'Project directory', process.cwd())
+  .option('-w, --wait', 'Follow the run until it ends, then print every answer')
+  .option('--json', 'Machine-readable output')
+  .action(async (task: string, opts) => {
+    const { fanoutWorkflow } = await import('../src/kernel/templates/index.js');
+    const agents = parseAgentList(opts.engines);
+    if (!agents.length) {
+      console.error('Error: --engines needs at least one engine');
+      process.exitCode = 1;
+      return;
+    }
+    if (!(await enginesKnown(agents))) return;
+    const cwd = path.resolve(opts.cwd);
+    const spec = fanoutWorkflow({ task, cwd, agents: agents as never, synthesize: !!opts.synthesize });
+    const runId = await startWorkflow(spec, cwd, buildContract(opts.check, opts.contract), opts);
+    if (!runId || !opts.wait || opts.json) return;
+    const s = await api(`/workflow/${encodeURIComponent(runId)}/state`);
+    const node = (s.run as { nodes?: Record<string, { output?: string }> } | undefined)?.nodes?.fanout;
+    if (node?.output) console.log(`\n${node.output}`);
+  });
+
+program
+  .command('goal')
+  .description(
+    'Run a /goal on one thread (Codex or Claude Code), then have the runtime check it: goal → verify → repair',
+  )
+  .argument('[objective]', 'What the agent should achieve (or use --objective-file)')
+  .option('--objective-file <file>', 'Read the objective from a file')
+  .option('-e, --engine <engine>', 'Who runs the goal: codex | claude', 'codex')
+  .option('-m, --model <model>', "Model (default: the engine's own)")
+  .option('--effort <level>', 'Reasoning effort')
+  .option('--sandbox <mode>', "Codex's own sandbox: read-only | workspace-write | danger-full-access")
+  .option(
+    '--launcher <arg>',
+    'Run the engine under this command, one argv element per flag, e.g. --launcher ./sandbox.sh --launcher task --launcher "0 1"',
+    collect,
+    [],
+  )
+  .option(
+    '--thread <id>',
+    'Start on this existing codex thread or claude session: its goal is replaced, its history kept',
+  )
+  .option('--token-budget <n>', 'Tokens the goal may spend before it stops as budgetLimited')
+  .option('--goal-timeout <minutes>', 'Wall-clock budget for one goal pass (default: none)')
+  .option('-c, --check <command>', 'Acceptance check the runtime runs after the goal (repeatable)', collect, [])
+  .option('--check-timeout <minutes>', 'Timeout for each --check (default 10)')
+  .option('--contract <file>', 'Acceptance contract JSON file (merged with --check)')
+  .option('--max-repairs <n>', 'Times a red verdict sends the goal back to the same thread', '1')
+  .option('--cwd <dir>', 'Project directory', process.cwd())
+  .option('-w, --wait', 'Follow the run until it ends; exit 1 unless it completes')
+  .option('--json', 'Machine-readable output')
+  .action(async (objectiveArg: string | undefined, opts) => {
+    const { goalWorkflow } = await import('../src/kernel/templates/index.js');
+    const { GOAL_OBJECTIVE_MAX_CHARS } = await import('../src/kernel/nodes/goal.js');
+    if (opts.engine !== 'codex' && opts.engine !== 'claude') {
+      console.error(`Error: --engine must be codex or claude, not ${opts.engine}`);
+      process.exitCode = 1;
+      return;
+    }
+    const objective = opts.objectiveFile ? fs.readFileSync(opts.objectiveFile, 'utf-8').trim() : objectiveArg?.trim();
+    if (!objective) {
+      console.error('Error: give an objective, or --objective-file');
+      process.exitCode = 1;
+      return;
+    }
+    if ([...objective].length > GOAL_OBJECTIVE_MAX_CHARS) {
+      console.error(
+        `Error: the objective is ${[...objective].length} characters; a goal accepts at most ${GOAL_OBJECTIVE_MAX_CHARS}. ` +
+          'Put the full brief in a file in the working directory and name that file in the objective.',
+      );
+      process.exitCode = 1;
+      return;
+    }
+    const minutes = (v: string | undefined) => (v ? Math.max(1, parseFloat(v)) * 60_000 : undefined);
+    const cwd = path.resolve(opts.cwd);
+    const contract = buildContract(opts.check, opts.contract, minutes(opts.checkTimeout));
+    const spec = goalWorkflow({
+      task: objective,
+      cwd,
+      contract: contract as never,
+      engine: opts.engine,
+      model: opts.model,
+      effort: opts.effort,
+      sandboxMode: opts.sandbox,
+      launcher: opts.launcher.length ? opts.launcher : undefined,
+      threadId: opts.thread,
+      tokenBudget: opts.tokenBudget ? parseInt(opts.tokenBudget, 10) : undefined,
+      goalTimeoutMs: minutes(opts.goalTimeout),
+      maxRepairs: Math.max(0, parseInt(opts.maxRepairs, 10) || 0),
+    });
+    await startWorkflow(spec, cwd, contract, opts);
+  });
+
 program
   .command('thread-register <name>')
-  .description('Register a manually opened native thread. Does not resume it.')
+  .description('Register a manually opened native thread. session-start of that name takes it over later.')
   .requiredOption('--native-session-id <id>', 'Exact native thread id')
   .option('--host <alias>', 'Configured execution-host alias')
   .option('--parent-tool-id <id>', 'codex, claude_code, cursor, or opencode')
@@ -886,7 +1237,7 @@ program
 
 program
   .command('thread-mailbox-send <name> <message>')
-  .description('Queue a durable message for a registered manual thread')
+  .description('Queue mail for a registered manual thread, or deliver it when that thread has a live owner')
   .requiredOption('--from <identity>', 'Sender identity')
   .option('--host <alias>', 'Configured execution-host alias')
   .option('--from-host <name>', 'Origin host display name')
@@ -961,4 +1312,6 @@ program
     }
   });
 
-program.parse();
+// An action that throws (an unreadable --message-file, a contract that is not
+// JSON) is reported like any other failure, not as a stack trace.
+program.parseAsync().catch((e: unknown) => fail(e instanceof Error ? e.message : e));

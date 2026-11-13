@@ -43,7 +43,15 @@ export function evidenceRoot(runDir: string): string {
   return path.join(runDir, 'evidence');
 }
 
+/**
+ * One directory under the run's evidence root. The id can come from a request
+ * (`?evidenceId=`), so it must be a single name like the ones `makeEvidenceId`
+ * produces, never a path.
+ */
 export function evidenceDir(runDir: string, evidenceId: string): string {
+  if (!/^[\w.-]+$/.test(evidenceId) || evidenceId === '.' || evidenceId === '..') {
+    throw new Error(`Invalid evidence id ${JSON.stringify(evidenceId)}`);
+  }
   return path.join(evidenceRoot(runDir), evidenceId);
 }
 
@@ -159,6 +167,25 @@ export function listEvidence(runDir: string): string[] {
 }
 
 /** Render a bundle for the CLI. Pure — no I/O. */
+/**
+ * The few lines of a failing check's output that say why it failed. An exit
+ * code alone sends the reader to the bundle on disk; the assertion message is
+ * usually one line of it. Falls back to the last lines when nothing stands out.
+ */
+export function failureLines(tail: string, max = 4): string[] {
+  const all = tail
+    .split('\n')
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim() !== '');
+  // Skip stack frames and the property dump node prints under an error
+  // (`  code: 'ERR_ASSERTION',`), which match the pattern without adding to it.
+  const telling = all.filter(
+    (l) => /error|expected|fail|✖|not ok|assert/i.test(l) && !/^\s+at /.test(l) && !/^\s+\w+: /.test(l),
+  );
+  const picked = telling.length > 0 ? [...new Set(telling)].slice(0, max) : all.slice(-max);
+  return picked.map((l) => (l.length > 160 ? `${l.slice(0, 157)}...` : l));
+}
+
 export function formatEvidence(bundle: EvidenceBundle): string {
   const lines: string[] = [];
   lines.push(`evidence ${bundle.evidenceId}  (${bundle.passed ? 'PASSED' : 'FAILED'})`);
@@ -171,6 +198,7 @@ export function formatEvidence(bundle: EvidenceBundle): string {
   for (const r of bundle.results) {
     const mark = r.passed ? 'PASS' : r.required ? 'FAIL' : 'warn';
     lines.push(`  [${mark}] ${r.id} (${r.type})  ${r.detail}`);
+    if (!r.passed && r.tail) for (const l of failureLines(r.tail)) lines.push(`         │ ${l}`);
     if (r.artifacts?.length) lines.push(`         artifacts: ${r.artifacts.join(', ')}`);
   }
   if (bundle.changedFiles.length > 0) {

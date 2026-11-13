@@ -4,7 +4,6 @@
  */
 
 import { spawn as realSpawn, type ChildProcess } from 'node:child_process';
-import { guardChildStreams } from '../child-process-guard.js';
 
 type SpawnFn = (cmd: string, args: string[]) => ChildProcess;
 
@@ -20,16 +19,10 @@ async function run(args: string[], spawnFn: SpawnFn): Promise<RunResult> {
     const child = spawnFn('docker', args);
     let stdout = '';
     let stderr = '';
-    guardChildStreams(child);
     child.stdout?.on('data', (d: Buffer) => (stdout += d.toString()));
     child.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
     child.on('close', (code: number | null) => {
       resolve({ ok: code === 0, stdout, stderr, code: code ?? -1 });
-    });
-    // No docker binary (ENOENT) or no permission to run it: an unlistened
-    // 'error' would end the host and this promise would never settle.
-    child.on('error', (e: Error) => {
-      resolve({ ok: false, stdout, stderr: stderr + e.message, code: -1 });
     });
   });
 }
@@ -82,7 +75,18 @@ export interface DockerRunResult {
 
 export async function dockerRun(args: RunArgs): Promise<DockerRunResult> {
   const sp = args.spawnFn ?? realSpawn;
-  const cli = ['run', '-d', '--name', args.name, '--restart', 'unless-stopped', '-p', `${args.hostPort}:3000`];
+  // Loopback only: the router reaches the backend on 127.0.0.1, and a bare HOST_PORT:3000
+  // would publish it on every host interface.
+  const cli = [
+    'run',
+    '-d',
+    '--name',
+    args.name,
+    '--restart',
+    'unless-stopped',
+    '-p',
+    `127.0.0.1:${args.hostPort}:3000`,
+  ];
   for (const [k, v] of Object.entries(args.env)) cli.push('-e', `${k}=${v}`);
   for (const [host, container] of Object.entries(args.volumes)) cli.push('-v', `${host}:${container}`);
   cli.push(args.image);

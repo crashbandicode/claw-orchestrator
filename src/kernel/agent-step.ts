@@ -17,14 +17,23 @@
 
 import type { Logger } from '../logger.js';
 import type { SendOptions, SendResult, SessionConfig, SessionInfo, SessionStats } from '../types.js';
+import type { GoalSession } from './nodes/goal.js';
+import type { ClaudeGoalOpen as GoalSessionOpen } from '../claude-goal-session.js';
 
 /** Structural SessionManager surface. Declared once here; the four private copies are gone. */
 export interface SessionManagerLike {
   startSession(config: Partial<SessionConfig> & { name?: string }): Promise<SessionInfo>;
   sendMessage(name: string, message: string, options?: Partial<SendOptions>): Promise<SendResult>;
-  stopSession(name: string): Promise<void>;
+  stopSession(name: string, opts?: { keepPersisted?: boolean }): Promise<void>;
   /** Optional so lightweight fakes stay valid; success falls back to throw/no-throw without it. */
   getStatus?(name: string): SessionInfo & { stats: SessionStats };
+  /** The live `codex-app` session behind `name`, for the `goal` node. */
+  codexGoalSession?(name: string): GoalSession | undefined;
+  /**
+   * The goal surface of the session behind `name`, `codex-app` or `claude`.
+   * `open` is what the node knows about the thread; Codex keeps that itself.
+   */
+  goalSession?(name: string, open?: GoalSessionOpen): GoalSession | undefined;
 }
 
 export interface AgentStepArgs {
@@ -39,6 +48,11 @@ export interface AgentStepArgs {
   keepAlive?: boolean;
   /** Skip startSession — the caller already started this session. */
   reuseSession?: boolean;
+  /**
+   * Stop the process but keep the conversation: the next session started under
+   * this name resumes it. For a name the workflow author pinned.
+   */
+  keepConversation?: boolean;
   logger?: Logger;
 }
 
@@ -136,7 +150,7 @@ export async function runAgentStep(args: AgentStepArgs): Promise<AgentStepResult
     };
   } finally {
     if (started && !args.keepAlive) {
-      await manager.stopSession(sessionName).catch(() => {
+      await manager.stopSession(sessionName, args.keepConversation ? { keepPersisted: true } : undefined).catch(() => {
         // Best-effort teardown; a session that already died is fine.
       });
     }

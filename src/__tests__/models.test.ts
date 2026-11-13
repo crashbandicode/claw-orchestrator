@@ -53,6 +53,7 @@ describe('lookupModel', () => {
       'claude-sonnet-5-5',
       'claude-sonnet-5',
       'claude-sonnet-4-6',
+      'claude-haiku-5-5',
       'claude-haiku-4-5',
       'gpt-6-astra',
       'gpt-6-sol',
@@ -87,7 +88,7 @@ describe('resolveAlias', () => {
   it('resolves known aliases', () => {
     expect(resolveAlias('opus')).toBe('claude-opus-5-5');
     expect(resolveAlias('sonnet')).toBe('claude-sonnet-5-5');
-    expect(resolveAlias('haiku')).toBe('claude-haiku-4-5');
+    expect(resolveAlias('haiku')).toBe('claude-haiku-5-5');
     expect(resolveAlias('gemini-pro')).toBe('gemini-3.1-pro-preview');
     expect(resolveAlias('gemini-flash')).toBe('gemini-3-flash-preview');
   });
@@ -311,9 +312,18 @@ describe('claude-sonnet-5-5', () => {
     expect(getContextWindow('sonnet')).toBe(1_000_000);
   });
 
-  it('is priced from the published table, the same as Sonnet 5', () => {
-    expect(lookupModel('claude-sonnet-5-5')!.pricing).toEqual({ input: 2, output: 10, cached: 0.2 });
-    expect(lookupModel('claude-sonnet-5-5')!.pricing).toEqual(lookupModel('claude-sonnet-5')!.pricing);
+  // Same input and output as Sonnet 5, but a cache hit is 0.05× input on
+  // Sonnet 5.5 — the registry used to copy Sonnet 5's 0.1× and charge it double.
+  it('is priced from the published table', () => {
+    expect(lookupModel('claude-sonnet-5-5')!.pricing).toEqual({ input: 2, output: 10, cached: 0.1 });
+  });
+});
+
+describe('claude-haiku-5-5', () => {
+  it('takes the haiku alias, at the published base tier', () => {
+    expect(resolveAlias('haiku')).toBe('claude-haiku-5-5');
+    expect(lookupModel('claude-haiku-5-5')!.pricing).toEqual({ input: 0.1, output: 0.5, cached: 0.01 });
+    expect(getContextWindow('claude-haiku-5-5')).toBe(1_000_000);
   });
 });
 
@@ -363,13 +373,25 @@ describe('claude-fable-5', () => {
   });
 
   it('no longer owns the `fable` alias, which tracks the CLI default', () => {
-    // The CLI's own `fable` resolves to 5.1 as of 2.1.258, read back from a real
-    // turn's `modelUsage.canonicalModel`. An alias left pointing at the previous
-    // generation is the drift that has bitten this registry repeatedly — it
-    // costs alias sessions at the wrong model's rates without failing.
-    expect(resolveAlias('fable')).toBe('claude-fable-5-1');
-    expect(resolveEngineAndModel('fable')).toEqual({ engine: 'claude', model: 'claude-fable-5-1' });
-    expect(lookupModel('claude-fable-5')!.aliases ?? []).not.toContain('fable');
+    // The CLI's own `fable` resolves to 5.2 as of 2.1.321, read back from a real
+    // turn's `modelUsage`. An alias left pointing at the previous generation is
+    // the drift that has bitten this registry repeatedly — it costs alias
+    // sessions at the wrong model's rates without failing.
+    expect(resolveAlias('fable')).toBe('claude-fable-5-2');
+    expect(resolveEngineAndModel('fable')).toEqual({ engine: 'claude', model: 'claude-fable-5-2' });
+    for (const id of ['claude-fable-5', 'claude-fable-5-1']) {
+      expect(lookupModel(id)!.aliases ?? []).not.toContain('fable');
+    }
+  });
+
+  it('registers the 5.2 generation at $8/$40 with $0.20 cache reads', () => {
+    // 5.2 is cheaper than 5.1 per token and keeps the 0.025x cache-read rate.
+    for (const id of ['claude-fable-5-2', 'claude-mythos-5-2']) {
+      const m = lookupModel(id);
+      expect(m, `${id} is unregistered`).toBeDefined();
+      expect(m!.contextWindow).toBe(1_000_000);
+      expect(m!.pricing).toEqual({ input: 8, output: 40, cached: 0.2 });
+    }
   });
 
   it('prices 5.1 cache reads at the 0.025x exception, not the usual 0.1x', () => {
@@ -559,6 +581,17 @@ describe('registry covers what the engines actually offer', () => {
 // opus` resolves to, and Codex 0.156.1 added GPT-6 Sol and Luna. Every number
 // here comes from the vendors' own price tables, and each has a reverse
 // assertion so a blanket edit across the family fails the suite.
+describe('gpt-6.1-sol (Codex 0.159.3)', () => {
+  it('is priced from the published table, with a 5% cache read', () => {
+    const p = lookupModel('gpt-6.1-sol')!.pricing;
+    expect(p).toEqual({ input: 2, output: 10, cached: 0.1 });
+    expect(p.cached).toBeCloseTo(p.input * 0.05, 10);
+    expect(getContextWindow('gpt-6.1-sol')).toBe(1_050_000);
+    // Reverse: GPT-6 Sol keeps its 10% cache read.
+    expect(lookupModel('gpt-6-sol')!.pricing.cached).toBe(0.2);
+  });
+});
+
 describe('models registered on 2026-09-23', () => {
   it('prices Opus 5.5 below Opus 5, with its half-rate cache read', () => {
     expect(lookupModel('claude-opus-5-5')!.pricing).toEqual({ input: 4, output: 20, cached: 0.2 });
@@ -585,21 +618,31 @@ describe('models registered on 2026-09-23', () => {
   });
 });
 
-describe('Memento delegation routes', () => {
-  it.each(['grok-4.7', 'composer-2.5', 'composer-2.5-fast', 'gemini-3.8-flash-high'])(
-    'keeps the explicit Cursor route for %s',
-    (model) => {
-      expect(resolveEngineAndModel(model)).toEqual({ engine: 'cursor', model });
-    },
-  );
-  it.each(['nvidia', 'nvidia-b'])('preserves gateway identities in the %s pool', (provider) => {
-    for (const gateway of [
-      'nvidia/nvidia/nemotron-nano-9b-v2',
-      'openai/openai/gpt-6-astra',
-      'azure/anthropic/claude-opus-5-5',
-    ]) {
-      const model = `${provider}/${gateway}`;
-      expect(resolveEngineAndModel(model)).toEqual({ engine: 'opencode', model });
+describe('pricing a model the registry does not know', () => {
+  it('warns once per model name, not on every priced turn', async () => {
+    const { getModelPricing } = await import('../models.js');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (let i = 0; i < 5; i++) getModelPricing('warn-once-model-a');
+      getModelPricing('warn-once-model-b');
+      const calls = warn.mock.calls.map((c) => String(c[0]));
+      expect(calls.filter((m) => m.includes('warn-once-model-a'))).toHaveLength(1);
+      expect(calls.filter((m) => m.includes('warn-once-model-b'))).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('prices a gateway model from pricingOverrides, else at 0, never at another model rate', async () => {
+    const { gatewayModelPricing, overrideModelPricing, _resetPricingOverrides } = await import('../models.js');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      expect(gatewayModelPricing('gateway-only-model')).toEqual({ input: 0, output: 0 });
+      overrideModelPricing({ 'gateway-only-model': { input: 1, output: 4 } });
+      expect(gatewayModelPricing('gateway-only-model')).toMatchObject({ input: 1, output: 4 });
+    } finally {
+      _resetPricingOverrides();
+      warn.mockRestore();
     }
   });
 });

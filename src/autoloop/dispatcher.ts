@@ -57,7 +57,14 @@ import {
   type PlannerToolEffects,
   type SpawnSubagentsArgs,
 } from './planner-tools.js';
-import { extractIterComplete, extractReviewComplete, parseAgentReply } from './agent-tools.js';
+import {
+  extractClarification,
+  extractIterComplete,
+  extractLogMessages,
+  extractReviewComplete,
+  parseAgentReply,
+} from './agent-tools.js';
+import { sanitizeSecrets } from '../sanitize.js';
 
 /**
  * Character budget for the replayed transcript handed to engines without native
@@ -65,6 +72,16 @@ import { extractIterComplete, extractReviewComplete, parseAgentReply } from './a
  * long run keeps the recent context instead of growing the prompt forever.
  */
 const REPLAY_CHAR_BUDGET = 24_000;
+
+/** Sanitize, then keep ≤500 chars (prefix or tail). Null if empty/disallowed controls remain. */
+function handoffExcerpt(text: string, fromEnd: boolean): string | null {
+  let t = sanitizeSecrets(text);
+  if (t.length > 500) t = fromEnd ? t.slice(-500) : t.slice(0, 500);
+  t = t.replace(/\s+/g, ' ').trim();
+  if (/[\uD800-\uDBFF]$/.test(t)) t = t.slice(0, -1);
+  if (!t || /[\p{Cc}\p{Cf}]/u.test(t)) return null;
+  return t;
+}
 
 /**
  * Files inside <ledger>/reviewer_sandbox/ that survive `stageReviewSandbox`.
@@ -80,6 +97,23 @@ const REVIEWER_SANDBOX_PERSIST = new Set(['reviewer_memory.md', 'reviewer_log.js
  * channels we use to surface phase errors and decision points.
  */
 const UNSILENCEABLE_POLICY_KEYS = new Set(['on_phase_error', 'on_decision_needed']);
+
+/** The fixed chat-history entry for accepted chat whose delivery was not confirmed. */
+export const NOTICE_TEXT =
+  'A message that was being delivered when the run stopped may not have reached the Planner. It was not resent automatically; re-send it if needed.';
+
+/**
+ * True for an unconfirmed-chat notice entry with a canonical ISO timestamp.
+ * The timestamp is the notice's identity: one obligation may be appended more
+ * than once, and readers keep the first entry per timestamp.
+ */
+export function isUnconfirmedChatNotice(entry: unknown): entry is { who: 'system'; text: string; ts: string } {
+  if (!entry || typeof entry !== 'object') return false;
+  const e = entry as { who?: unknown; text?: unknown; ts?: unknown };
+  if (e.who !== 'system' || e.text !== NOTICE_TEXT || typeof e.ts !== 'string') return false;
+  const ms = Date.parse(e.ts);
+  return Number.isFinite(ms) && new Date(ms).toISOString() === e.ts;
+}
 
 export interface ClaudeAgentDispatcherConfig {
   manager: SessionManager;
@@ -221,9 +255,68 @@ interface DecisionLogEntry {
     | 'spawn_subagents'
     | 'phase_error'
     | 'send_timeout'
-    | 'policy_silence_blocked';
+    | 'policy_silence_blocked'
+    | 'planner_control_error';
   actor: 'planner' | 'runner' | 'dispatcher';
   payload: Record<string, unknown>;
+}
+
+const PLANNER_CONTROL_ERROR_HEADER =
+  'Planner control error. Requested actions are not confirmed; inspect run artifacts before retrying.';
+const PLANNER_CONTROL_PARSE_DETAIL = 'Unrecognized or malformed planner control block';
+const PLANNER_CONTROL_GENERIC_DETAIL = 'Planner control rejected';
+const PLANNER_CONTROL_DETAIL_LIMIT = 4;
+const PLANNER_CONTROL_DETAIL_CHARS = 160;
+const PLANNER_CONTROL_DIAGNOSTIC_CHARS = 1024;
+
+/** Batch phase for projection — selected by the dispatcher/handler branch. */
+type PlannerControlProjectionOrigin = 'validation' | 'effect' | 'parse';
+
+/**
+ * Project parse/handler errors into bounded diagnostic text for chat/audit.
+ * Validation origin uses producer-authored safe messages; parse and effect
+ * origins stay on fixed generics. Never infers trust from error text, tool
+ * prefixes, or forged properties.
+ */
+function projectPlannerControlErrors(
+  errors: Array<{ tool: string; error: string }>,
+  origin: PlannerControlProjectionOrigin,
+): {
+  diagnostic: string;
+  details: string[];
+  count: number;
+  omitted: number;
+} {
+  const count = errors.length;
+  const details: string[] = [];
+  for (const entry of errors) {
+    if (details.length >= PLANNER_CONTROL_DETAIL_LIMIT) break;
+    let detail: string;
+    if (origin === 'validation') {
+      detail = entry.error;
+    } else if (origin === 'parse') {
+      detail = PLANNER_CONTROL_PARSE_DETAIL;
+    } else {
+      detail = PLANNER_CONTROL_GENERIC_DETAIL;
+    }
+    if (detail.length > PLANNER_CONTROL_DETAIL_CHARS) {
+      detail = detail.slice(0, PLANNER_CONTROL_DETAIL_CHARS);
+    }
+    details.push(detail);
+  }
+  const omitted = Math.max(0, count - details.length);
+  const lines = [PLANNER_CONTROL_ERROR_HEADER];
+  for (let i = 0; i < details.length; i++) {
+    lines.push(`${i + 1}. ${details[i]}`);
+  }
+  if (omitted > 0) {
+    lines.push(`(${omitted} additional error(s) omitted)`);
+  }
+  let diagnostic = lines.join('\n');
+  if (diagnostic.length > PLANNER_CONTROL_DIAGNOSTIC_CHARS) {
+    diagnostic = diagnostic.slice(0, PLANNER_CONTROL_DIAGNOSTIC_CHARS);
+  }
+  return { diagnostic, details, count, omitted };
 }
 
 export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatcher {
@@ -405,6 +498,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     if (selection.engine === 'custom' && !selection.customEngine) {
       throw new Error(`${label} custom engine config is required`);
     }
+    if (selection.engine === 'acp') throw new Error(`${label} engine 'acp' is not supported by Autoloop`);
   }
 
   /**
@@ -586,6 +680,27 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   /**
+   * Start only Reviewer so a committed Coder iteration can be reviewed after
+   * owner loss. Does not start, send to, or resume Coder. Ordinary
+   * `spawnSubagents` still starts both roles.
+   */
+  async ensureReviewerForCommittedRecovery(): Promise<void> {
+    await this.ensureReviewer();
+    await this.config.onRoleSelectionChanged?.({
+      coder: {
+        engine: this.coderSelection.engine,
+        model: this.coderSelection.model,
+        effort: this.coderSelection.effort,
+      },
+      reviewer: {
+        engine: this.reviewerSelection.engine,
+        model: this.reviewerSelection.model,
+        effort: this.reviewerSelection.effort,
+      },
+    });
+  }
+
+  /**
    * Reset a single subagent — stop its session, clear the started flag, and
    * (optionally) eagerly start a fresh one. The session-level system prompt is
    * the same; persistent state lives in `<ledger>/{coder,reviewer}_memory.md`
@@ -611,6 +726,7 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       await this.config.manager.stopSession(name);
     } catch (err) {
       this.logger.warn?.(`[autoloop] resetAgent stop failed for ${name}: ${(err as Error).message}`);
+      if (this.config.manager.hasSession?.(name) ?? true) throw err;
     }
     if (agent === 'planner') this.plannerStarted = false;
     if (agent === 'coder') this.coderStarted = false;
@@ -680,7 +796,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       throw new Error(result.error);
     } catch (err) {
       this.logger.warn?.(`[autoloop] ${agent} send threw, attempting reset+retry: ${(err as Error).message}`);
-      await this.resetAgent(agent, { eagerRestart: true });
+      try {
+        await this.resetAgent(agent, { eagerRestart: true });
+      } catch (resetError) {
+        this.logger.error?.(`[autoloop] ${agent} reset failed after send error: ${(resetError as Error).message}`);
+        return { output: '', error: (resetError as Error).message, fatal: true };
+      }
       // Let the freshly-restarted subprocess settle before retrying — an
       // immediate retry routinely hits the same transient failure (e.g. the
       // old socket still in TIME_WAIT → ECONNREFUSED). Small jitter avoids
@@ -714,6 +835,22 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
   }
 
   /**
+   * Append a role's `coder_log` / `reviewer_log` entries, one JSONL row each.
+   * The prompts route these through the tool rather than a file write (the
+   * Coder may not touch `tasks/`), so this is the only writer. Best-effort.
+   */
+  private appendRoleLog(file: string, iter: number, messages: string[]): void {
+    if (messages.length === 0) return;
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      const ts = new Date().toISOString();
+      fs.appendFileSync(file, messages.map((message) => JSON.stringify({ ts, iter, message }) + '\n').join(''));
+    } catch (err) {
+      this.logger.warn?.(`[autoloop] ${path.basename(file)} append failed: ${(err as Error).message}`);
+    }
+  }
+
+  /**
    * Append a Planner-pane chat entry to <ledger>/chat.jsonl. Used by the
    * dashboard's GET /autoloop/<id>/chat_history endpoint so a browser
    * refresh / cross-process / re-opening a terminated run can replay the
@@ -729,6 +866,43 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       fs.appendFileSync(path.join(this.ledgerDir, 'chat.jsonl'), JSON.stringify(entry) + '\n');
     } catch (err) {
       this.logger.warn?.(`[autoloop] chat.jsonl append failed: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * Append the unconfirmed-chat notice with timestamp `ts` and fsync it. A
+   * torn last line is isolated with a newline rather than rewritten. Returns
+   * false on any I/O failure so the caller keeps its obligation and retries
+   * with the same timestamp.
+   */
+  appendUnconfirmedChatNotice(ts: string): boolean {
+    let fd: number | undefined;
+    try {
+      fs.mkdirSync(this.ledgerDir, { recursive: true });
+      fd = fs.openSync(path.join(this.ledgerDir, 'chat.jsonl'), 'a+');
+      const size = fs.fstatSync(fd).size;
+      let prefix = '';
+      if (size > 0) {
+        const last = Buffer.alloc(1);
+        fs.readSync(fd, last, 0, 1, size - 1);
+        if (last[0] !== 0x0a) prefix = '\n';
+      }
+      const bytes = Buffer.from(prefix + JSON.stringify({ who: 'system', text: NOTICE_TEXT, ts }) + '\n', 'utf8');
+      let written = 0;
+      while (written < bytes.length) written += fs.writeSync(fd, bytes, written, bytes.length - written);
+      fs.fsyncSync(fd);
+      return true;
+    } catch {
+      this.logger.warn?.('[autoloop] unconfirmed-chat notice append failed');
+      return false;
+    } finally {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd);
+        } catch {
+          // Closing cannot change the outcome reported above.
+        }
+      }
     }
   }
 
@@ -1029,19 +1203,47 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
     const handlerResult =
       parsed.parse_errors.length > 0
         ? {
-            emitted_messages: [],
+            emitted_messages: [] as Awaited<ReturnType<typeof applyPlannerToolCalls>>['emitted_messages'],
             errors: parsed.parse_errors.map(({ block_index, error }) => ({
               tool: `autoloop block ${block_index}`,
               error,
             })),
+            error_origin: 'parse' as const,
           }
         : await applyPlannerToolCalls(parsed.calls, effects, nextIter);
+
+    // Legacy operator sink: one raw warn per error with original tool/error.
     for (const errEntry of handlerResult.errors) {
       this.logger.warn?.(`[autoloop] tool '${errEntry.tool}' failed: ${errEntry.error}`);
     }
 
-    // Emit cleaned reply (without raw JSON blocks) for the chat tool to surface.
-    if (parsed.cleaned_reply) {
+    // Surface rejected controls as one safe diagnostic + identical chat history.
+    // Ordinary valid / prose-only / nonrecognized fences keep cleaned prose only.
+    if (handlerResult.errors.length > 0) {
+      const origin: PlannerControlProjectionOrigin =
+        handlerResult.error_origin === 'validation'
+          ? 'validation'
+          : handlerResult.error_origin === 'parse'
+            ? 'parse'
+            : 'effect';
+      const projection = projectPlannerControlErrors(handlerResult.errors, origin);
+      this.appendDecisionLog({
+        kind: 'planner_control_error',
+        actor: 'dispatcher',
+        payload: {
+          iter: nextIter,
+          dispatch_id: dispatchId,
+          count: projection.count,
+          details: projection.details,
+          omitted: projection.omitted,
+        },
+      });
+      const combined = parsed.cleaned_reply
+        ? `${projection.diagnostic}\n\n${parsed.cleaned_reply}`
+        : projection.diagnostic;
+      this.emit('planner_reply', combined);
+      this.appendChatEntry({ who: 'planner', text: combined, ts: new Date().toISOString() });
+    } else if (parsed.cleaned_reply) {
       this.emit('planner_reply', parsed.cleaned_reply);
       this.appendChatEntry({ who: 'planner', text: parsed.cleaned_reply, ts: new Date().toISOString() });
     }
@@ -1155,6 +1357,15 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
       ];
     }
     const replyText = (result.output ?? '').trim();
+    if (!replyText) {
+      const error = 'Coder returned an empty response';
+      this.appendDecisionLog({
+        kind: 'phase_error',
+        actor: 'dispatcher',
+        payload: { agent: 'coder', phase: 'send', error },
+      });
+      return [Msg.phaseError(env.iter, { agent: 'coder', phase: 'send', error })];
+    }
     const parsed = parseAgentReply(replyText);
     this.emit('coder_reply', parsed.cleaned_reply);
     if (parsed.cleaned_reply) {
@@ -1164,18 +1375,50 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         ts: new Date().toISOString(),
       });
     }
+    this.appendRoleLog(
+      path.join(this.ledgerDir, 'coder_log.jsonl'),
+      env.iter,
+      extractLogMessages(parsed.calls, 'coder_log'),
+    );
 
     const ic = extractIterComplete(parsed.calls);
     if (!ic) {
-      // No iter_complete emitted — could be a clarification request. Return a
-      // directive_ack so Planner sees it next turn.
+      // Write-time incomplete handoff: reply is in hand; no later evidence reread.
       await this.maybeCompact('coder', this.coderName);
-      return [
-        Msg.directiveAck(env.iter, {
-          understood: false,
-          clarification: parsed.cleaned_reply.slice(0, 500),
-        }),
-      ];
+      const clarificationQ = extractClarification(parsed.calls);
+      if (clarificationQ) {
+        if (!parsed.cleaned_reply) {
+          this.appendChatEntry({ who: 'coder', text: clarificationQ, ts: new Date().toISOString() });
+        }
+        const q = handoffExcerpt(clarificationQ, false);
+        if (q) return [Msg.directiveAck(env.iter, { understood: false, clarification: q })];
+      }
+      const body = clarificationQ || parsed.cleaned_reply || replyText;
+      if (!parsed.cleaned_reply && !clarificationQ) {
+        this.appendChatEntry({ who: 'coder', text: replyText, ts: new Date().toISOString() });
+      }
+      const replyFile = path.join(iterDir, `coder_reply_${dispatchId}.txt`);
+      const rel = path.relative(this.config.workspace, replyFile);
+      let persistedRel: string | null = null;
+      try {
+        fs.mkdirSync(path.dirname(replyFile), { recursive: true });
+        fs.writeFileSync(replyFile, body);
+        persistedRel = rel;
+      } catch {
+        /* write failure → report not persisted; do not probe */
+      }
+      const tail = handoffExcerpt(body, true);
+      const clarification = [
+        `Coder turn ended without a valid iter_complete (iter=${env.iter}). No review was requested and the iteration was not advanced.`,
+        'You may: (1) send_directive for the same iteration to continue the existing Coder, (2) ask the user, or (3) stop.',
+        tail
+          ? `Coder reply tail (bounded, truncated excerpt): ${tail}`
+          : 'Coder reply tail omitted (disallowed form after sanitization).',
+        persistedRel
+          ? `Full coder reply persisted at handoff: ${persistedRel}`
+          : 'Full coder reply was not persisted (write failed).',
+      ].join('\n');
+      return [Msg.directiveAck(env.iter, { understood: false, clarification })];
     }
 
     // Persist eval output to ledger.
@@ -1400,6 +1643,12 @@ export class ClaudeAgentDispatcher extends EventEmitter implements AgentDispatch
         ts: new Date().toISOString(),
       });
     }
+    // In the sandbox, where it survives restaging and the Reviewer can reread it.
+    this.appendRoleLog(
+      path.join(this.reviewerSandboxDir, 'reviewer_log.jsonl'),
+      env.payload.iter,
+      extractLogMessages(parsed.calls, 'reviewer_log'),
+    );
 
     const rc = extractReviewComplete(parsed.calls);
     if (!rc) {

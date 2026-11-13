@@ -20,16 +20,18 @@ import type { AgentBinding, EngineType } from '../types.js';
 // ─── Run + node state ───────────────────────────────────────────────────────
 
 /**
- * `completed` is reachable only from `verifying`. A run carrying a contract
- * whose evidence is red goes to `failed`, never to `completed` — that is the
- * whole point of the state machine.
+ * `completed` is entered from `running` once control runs out of nodes; a
+ * verifier holds the run in `verifying` only while its checks run. A run
+ * carrying a contract whose evidence is red goes to `failed`, never to
+ * `completed` — that is the whole point of the state machine — and so does a
+ * run that declares a run-level contract and ends without having run it.
  */
 export type RunState = 'pending' | 'running' | 'awaiting_human' | 'verifying' | 'completed' | 'failed' | 'cancelled';
 
 /**
  * Whether anything independent of the agent checked the work.
  * - `verified`   — a contract ran and every required check passed.
- * - `unverified` — no contract was declared. We do not know.
+ * - `unverified` — no contract ran, or its verdict no longer describes the tree. We do not know.
  * - `refuted`    — a contract ran and a required check failed.
  */
 export type RunOutcome = 'verified' | 'unverified' | 'refuted';
@@ -47,6 +49,7 @@ export type NodeKind =
   | 'router'
   | 'subflow'
   | 'autoloop'
+  | 'goal'
   | 'ultraapp_synth'
   | 'ultraapp_deploy';
 
@@ -66,9 +69,18 @@ export interface AgentNode extends NodeBase, AgentBinding {
   kind: 'agent';
   prompt: string;
   cwd?: string;
-  /** Reuse a named session across nodes; omitted means one session per attempt. */
+  /**
+   * Pin the session name to keep one conversation across visits and nodes: each
+   * turn's process stops when it ends, and the next start under this name
+   * resumes the conversation (engines that resume by id). The name outlives the
+   * run, so make it unique to the run. Omitted means a new session per attempt.
+   */
   sessionName?: string;
   permissionMode?: string;
+  /** Standing instructions for the session, appended to its system prompt. */
+  appendSystemPrompt?: string;
+  /** Tools the session may not use (`--disallowed-tools`). Engines `claude` and `grok`; refused on the others. */
+  disallowedTools?: string[];
 }
 
 /**
@@ -96,6 +108,28 @@ export interface FanoutAgentSpec extends AgentBinding {
   sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
   baseUrl?: string;
   ultracode?: boolean;
+  /**
+   * Fan-out only: this agent's own working directory, absolute or relative to the
+   * node's `cwd`. Council seats ignore it; they get worktrees of their own.
+   */
+  cwd?: string;
+  /**
+   * Fan-out only: run this agent as a goal instead of one turn — a `/goal` on its
+   * engine (`codex` or `claude`, required) with this objective, under the same
+   * rules as a `goal` node: the goal ends when its judge or the agent says it is
+   * met, out of budget, or blocked, and stalls and capacity errors are resumed.
+   * It runs as a child run with one goal node, so a resumed parent picks it up
+   * where it was rather than starting it again.
+   */
+  objective?: string;
+  /** Goal agents: tokens the goal may spend. */
+  tokenBudget?: number;
+  /** Goal agents: resuming after usage limits, overload and stalls (as on a goal node). */
+  capacityRetry?: { max: number; backoffMs?: number };
+  /** Goal agents: an active goal with no turn and no news for this long is resumed. */
+  stallMs?: number;
+  /** Goal agents: how long the goal may run. Default: the kernel's node timeout. */
+  timeoutMs?: number;
 }
 
 export interface FanoutNode extends NodeBase {
@@ -105,6 +139,8 @@ export interface FanoutNode extends NodeBase {
   synthesize?: boolean;
   synthesisEngine?: EngineType;
   synthesisModel?: string;
+  /** The ACP agent preset for a synthesis pass on engine `acp`. */
+  synthesisAcpAgent?: string;
   synthesisPermissionMode?: string;
   maxTurnsPerAgent?: number;
   maxBudgetUsd?: number;
@@ -117,11 +153,17 @@ export interface FanoutNode extends NodeBase {
   agentTimeoutMs?: number;
 }
 
+/** One council seat: a fan-out agent plus the emoji its charter and transcript show. */
+export interface CouncilAgentSpec extends FanoutAgentSpec {
+  emoji?: string;
+}
+
 export interface CouncilNode extends NodeBase {
   kind: 'council';
   task: string;
-  agents: FanoutAgentSpec[];
+  agents: CouncilAgentSpec[];
   projectDir?: string;
+  /** Omitted means `DEFAULT_MAX_ROUNDS`, the same default `council_start` uses. */
   maxRounds?: number;
   maxTurnsPerAgent?: number;
   maxBudgetUsd?: number;
@@ -189,6 +231,52 @@ export interface AutoloopNode extends NodeBase {
 }
 
 /**
+ * A `/goal`: one thread working on one objective, turn after turn on its own,
+ * until the goal leaves `active`. A Codex `codex-app` thread by default, or a
+ * Claude Code session with `engine: 'claude'`.
+ *
+ * The thread id is checkpointed on the node, so a resumed run reattaches the
+ * same thread rather than starting the objective over. A revisit after a red
+ * verifier sets a new objective on that thread, prefixed with the failing
+ * checks. Like `autoloop`, it has no default node timeout; `timeoutMs` is the
+ * wall-clock budget.
+ */
+export interface GoalNode extends NodeBase {
+  kind: 'goal';
+  objective: string;
+  /** Who runs the goal. Default `codex`. */
+  engine?: 'codex' | 'claude';
+  cwd?: string;
+  model?: string;
+  effort?: string;
+  /** Codex's own sandbox; Claude Code has no equivalent and ignores it. */
+  sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  /** Argv prefix the engine runs under, e.g. a sandbox wrapper. Caller-authored. */
+  launcher?: string[];
+  /**
+   * Start on this existing codex-app thread instead of a new one: its goal is
+   * replaced by `objective`, and the agent keeps the thread's history. Used
+   * once; a resumed run follows the thread id it checkpointed.
+   */
+  threadId?: string;
+  /** Tokens the goal may spend; it ends as `budgetLimited` past this. */
+  tokenBudget?: number;
+  /**
+   * Resuming a goal that stopped on a usage limit, an overloaded endpoint or a
+   * stall. `max` counts attempts, made or not; past it the node fails. Default
+   * 20 attempts, backoff from 60 s doubling to at most 15 min.
+   */
+  capacityRetry?: { max: number; backoffMs?: number };
+  /** An active goal with no turn and no notification for this long is resumed. Default 5 min. */
+  stallMs?: number;
+  /**
+   * Tools the session may not use (`--disallowed-tools`). `claude` only: Codex's
+   * app-server has no per-thread tool list, so it is refused there.
+   */
+  disallowedTools?: string[];
+}
+
+/**
  * UltraApp's two expensive stages.
  *
  * They are their own kinds for the same reason `autoloop` is: the engine behind
@@ -208,6 +296,8 @@ export interface UltraappSynthNode extends NodeBase {
   /** Absolute per-run directory; the council project and the codebase live under it. */
   runDir: string;
   slug: string;
+  /** Where to put the consensus codebase. Absent on runs recorded before builds were versioned: `versions/v1/codebase`. */
+  codebasePath?: string;
 }
 
 export interface UltraappDeployNode extends NodeBase {
@@ -229,6 +319,7 @@ export type NodeSpec =
   | RouterNode
   | SubflowNode
   | AutoloopNode
+  | GoalNode
   | UltraappSynthNode
   | UltraappDeployNode;
 
@@ -240,7 +331,10 @@ export interface WorkflowSpec {
   cwd?: string;
   /**
    * Run-level acceptance contract. When present the kernel appends an implicit
-   * terminal verifier, so `completed` always means "a contract passed".
+   * terminal verifier unless the spec places its own `contract: 'run'` one, and a
+   * run that ends without a verdict from such a verifier fails — so `completed`
+   * always means "this contract ran and passed". An outcome of `unverified` on a
+   * completed run says the verdict stopped describing the tree afterwards.
    */
   contract?: AcceptanceContract;
   /** Loop bound. Exceeding it fails the run rather than spinning. Default 50. */
@@ -306,7 +400,10 @@ export interface RunRecord {
   baseSha?: string;
   /**
    * The test files and test configuration as the run found them, for the
-   * protected-tests check. Taken only when the spec has a verifier or a subflow.
+   * protected-tests check. Taken only when the run-level contract or a
+   * verifier's inline contract has a `command` check and does not set
+   * `protectTests: false`, or the spec has a subflow (`needsTestSnapshot`). A
+   * subflow child uses its parent's, when the parent has one.
    */
   baseTests?: TestSnapshot;
   /** Recorded for the record. Never consulted to decide completion. */
@@ -331,9 +428,10 @@ export interface RunRecord {
     sideEffectSeq: number;
   };
   /**
-   * Count of completed nodes that can touch the workspace (`agent`, `fanout`,
-   * `council`, `subflow`). Compared against the value stored on the verdict, so
-   * the kernel knows whether anything ran after the checks at all.
+   * Count of node results absorbed from kinds that can touch the workspace —
+   * every kind but `verifier`, `router` and `human_gate` (`SIDE_EFFECT_KINDS` in
+   * the engine). Compared against the value stored on the verdict, so the
+   * kernel knows whether anything ran after the checks at all.
    */
   sideEffectSeq?: number;
 }

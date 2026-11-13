@@ -14,17 +14,32 @@
  *     conversation continuity (Codex 0.119+).
  */
 
-import { spawn } from 'node:child_process';
-import { guardChildStreams } from './child-process-guard.js';
-import { writeFileSync, unlinkSync, readFileSync, readdirSync } from 'node:fs';
+import { killEngineTree, spawnEngine } from './engine-spawn.js';
+import { resolveCodexMcpDisableArgs, validateCodexMcpSelection } from './codex-mcp.js';
+import {
+  writeFileSync,
+  unlinkSync,
+  readFileSync,
+  readdirSync,
+  openSync,
+  fstatSync,
+  readSync,
+  closeSync,
+} from 'node:fs';
 import { tmpdir, homedir } from 'node:os';
 import { join } from 'node:path';
 
-import type { SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
+import type {
+  EffortLevel,
+  GeneratedImage,
+  SessionConfig,
+  SessionSendOptions,
+  StreamEvent,
+  TurnResult,
+} from './types.js';
 import { SESSION_EVENT } from './constants.js';
 import { BaseOneShotSession } from './base-oneshot-session.js';
-import { resolveWindowsNodeInvocation } from './windows-command.js';
-import { resolveCodexMcpDisableArgs, validateCodexMcpSelection } from './codex-mcp.js';
+import { sanitizeSecrets } from './sanitize.js';
 
 // ─── Codex JSON event shapes (subset we consume) ────────────────────────────
 //
@@ -64,6 +79,22 @@ interface CodexTurnFailed {
 interface CodexError {
   type: 'error';
   message?: string;
+}
+
+/**
+ * Codex's `model_reasoning_effort` value for an engine-agnostic effort, or
+ * undefined to leave it to codex. `auto` means "leave it to the engine".
+ *
+ * codex 0.149's ladder is none|minimal|low|medium|high|xhigh|max|ultra, and its
+ * release notes call out `max` and `ultra` as selectable levels. Every level in
+ * our union has a same-named counterpart, so this is a passthrough. codex does
+ * not validate the value — it sends whatever it is given — so an unknown level
+ * would fail at the API, not at spawn. That is why the ladder is listed rather
+ * than guessed.
+ */
+export function codexReasoningEffort(effort: EffortLevel | undefined): string | undefined {
+  const known: ReadonlySet<string> = new Set(['low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
+  return effort && known.has(effort) ? effort : undefined;
 }
 
 // ─── PersistentCodexSession ─────────────────────────────────────────────────
@@ -109,31 +140,15 @@ export class PersistentCodexSession extends BaseOneShotSession {
   /** Guards the rollout lookup so it runs at most once per session. */
   private _rolloutRead = false;
 
+  /** This thread's rollout file, once found. */
+  private _rolloutPath?: string;
+
   /**
-   * `-c` overrides disable every configured server not in `codexMcpServers` and
-   * add an inert transport stub. Set only for a non-empty selection; undefined
-   * means `--ignore-user-config` alone does the job.
+   * The model codex reports it ran, from the rollout's `turn_context`. With no
+   * `--model`, codex runs the `model` in the user's `~/.codex/config.toml`, and
+   * pricing that session at this wrapper's default misstates its cost.
    */
-  private _mcpDisableArgs?: string[];
-
-  override async start(): Promise<this> {
-    await this._refreshMcpDisableArgs();
-    return super.start();
-  }
-
-  /** Resolve the selection against the servers the config defines right now. */
-  private async _refreshMcpDisableArgs(): Promise<void> {
-    const selection = validateCodexMcpSelection(this.options, 'codex');
-    if (this.options.ignoreUserConfig !== true || !selection || selection.length === 0) {
-      this._mcpDisableArgs = undefined;
-      return;
-    }
-    this._mcpDisableArgs = await resolveCodexMcpDisableArgs({
-      codexBin: this.engineBin,
-      cwd: this.options.cwd,
-      keep: selection,
-    });
-  }
+  private _codexModel?: string;
 
   constructor(config: SessionConfig, codexBin?: string) {
     super(config, codexBin || process.env.CODEX_BIN || 'codex', {
@@ -165,6 +180,10 @@ export class PersistentCodexSession extends BaseOneShotSession {
   // ── Context accounting ─────────────────────────────────────────────────
 
   /** Codex's enforced limit when we know it, else the model registry's. */
+  protected override _billedModel(): string | undefined {
+    return this.options.model || this._codexModel;
+  }
+
   protected override _effectiveContextWindow(): number {
     return this._codexContextWindow ?? super._effectiveContextWindow();
   }
@@ -186,11 +205,31 @@ export class PersistentCodexSession extends BaseOneShotSession {
       const root = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'sessions');
       const match = this._findRolloutFile(root, `-${this.codexThreadId}.jsonl`);
       if (!match) return;
+      this._rolloutPath = match;
 
       const text = readFileSync(match, 'utf8');
 
       const windowMatch = /"model_context_window":\s*(\d+)/.exec(text);
       if (windowMatch) this._codexContextWindow = Number(windowMatch[1]);
+
+      if (!this.options.model) {
+        let lastModel: string | undefined;
+        for (const line of text.split('\n')) {
+          if (!line.includes('"turn_context"')) continue;
+          try {
+            const entry = JSON.parse(line) as { type?: string; payload?: { model?: unknown } };
+            if (entry.type === 'turn_context' && typeof entry.payload?.model === 'string') {
+              lastModel = entry.payload.model;
+            }
+          } catch {
+            /* a torn last line is expected while codex is still writing */
+          }
+        }
+        if (lastModel) {
+          this._codexModel = lastModel;
+          this._updateCost();
+        }
+      }
 
       // Last entry wins — it is the thread total as of the most recent turn.
       if (this._prevCumulativeIn === undefined) {
@@ -204,6 +243,60 @@ export class PersistentCodexSession extends BaseOneShotSession {
       }
     } catch {
       /* best effort — registry fallback covers every failure mode */
+    }
+  }
+
+  /**
+   * Prompt size of the latest request codex recorded for this thread.
+   *
+   * A turn makes one request per tool round, and `turn.completed.usage` — or
+   * the difference between two of them — sums them all: it is the turn's spend,
+   * not the context's size. The rollout records each request's own usage as a
+   * `token_count` event's `last_token_usage`, whose `input_tokens` includes the
+   * cached reads. Only the file's tail is read; undefined when there is no
+   * rollout (an `--ephemeral` thread) or nothing in it to read.
+   */
+  private _lastRequestPrompt(): number | undefined {
+    if (!this._rolloutPath) return undefined;
+    let fd: number | undefined;
+    try {
+      fd = openSync(this._rolloutPath, 'r');
+      const size = fstatSync(fd).size;
+      const len = Math.min(size, 256 * 1024);
+      const buf = Buffer.alloc(len);
+      readSync(fd, buf, 0, len, size - len);
+      const all = buf.toString('utf8').match(/"last_token_usage":\s*\{[^}]*\}/g);
+      const last = all?.[all.length - 1];
+      if (!last) return undefined;
+      const parsed = JSON.parse(`{${last}}`) as { last_token_usage?: { input_tokens?: number } };
+      const prompt = parsed.last_token_usage?.input_tokens;
+      return typeof prompt === 'number' && prompt > 0 ? prompt : undefined;
+    } catch {
+      return undefined;
+    } finally {
+      if (fd !== undefined) closeSync(fd);
+    }
+  }
+
+  /**
+   * Files Codex's built-in image generation has saved for this thread.
+   *
+   * `codex exec --json` emits no event for a generated image; the only record
+   * is the file, under `$CODEX_HOME/generated_images/<thread_id>/`. Diffing the
+   * directory around a turn gives that turn's images. Empty until the thread
+   * id is known — a new thread's first turn reports it before it ends.
+   */
+  private _generatedImages(): Set<string> {
+    if (!this.codexThreadId) return new Set();
+    const dir = join(process.env.CODEX_HOME || join(homedir(), '.codex'), 'generated_images', this.codexThreadId);
+    try {
+      return new Set(
+        readdirSync(dir)
+          .filter((f) => /\.(png|jpe?g|webp|gif)$/i.test(f))
+          .map((f) => join(dir, f)),
+      );
+    } catch {
+      return new Set();
     }
   }
 
@@ -241,7 +334,27 @@ export class PersistentCodexSession extends BaseOneShotSession {
    * First turn:    `codex exec [--sandbox W] --skip-git-repo-check --json --model M -C cwd <msg>`
    * Resume turns:  `codex exec resume <thread_id> [--sandbox W] --skip-git-repo-check --json --model M -C cwd <msg>`
    */
-  private _buildArgs(message: string): string[] {
+  private _mcpDisableArgs?: string[];
+
+  override async start(): Promise<this> {
+    await this._refreshMcpDisableArgs();
+    return super.start();
+  }
+
+  private async _refreshMcpDisableArgs(): Promise<void> {
+    const selection = validateCodexMcpSelection(this.options, 'codex');
+    if (this.options.ignoreUserConfig !== true || !selection || selection.length === 0) {
+      this._mcpDisableArgs = undefined;
+      return;
+    }
+    this._mcpDisableArgs = await resolveCodexMcpDisableArgs({
+      codexBin: this.engineBin,
+      cwd: this.options.cwd,
+      keep: selection,
+    });
+  }
+
+  private _buildArgs(): string[] {
     const args: string[] = ['exec'];
     const isResume = !!this.codexThreadId;
     const sandbox = this.options.sandboxMode || 'workspace-write';
@@ -281,43 +394,28 @@ export class PersistentCodexSession extends BaseOneShotSession {
     // not the orchestrator's: a `model = …` line in it silently decides which
     // model an orchestrated run uses and which one we then price it as. Auth
     // still resolves from CODEX_HOME, so this does not log the session out.
-    if (this.options.ignoreUserConfig) {
-      // --ignore-user-config drops the selected MCP servers' definitions along with the
-      // rest, so a selection is built from per-server disable/stub overrides instead
-      // (resolved at start and before each turn; see codex-mcp.ts).
-      if (this._mcpDisableArgs) args.push(...this._mcpDisableArgs);
-      else args.push('--ignore-user-config');
-    }
+    if (this._mcpDisableArgs) args.push(...this._mcpDisableArgs);
+    else if (this.options.ignoreUserConfig) args.push('--ignore-user-config');
     // Extra writable roots. Rejected by `exec resume` (like --sandbox/-C), and
     // the resumed thread keeps the roots the first turn opened.
     if (!isResume && this.options.addDir?.length) {
       for (const dir of this.options.addDir) args.push('--add-dir', dir);
     }
-    args.push(message);
+    // `-` reads the prompt from stdin. On Windows `codex` is an npm `.cmd` shim
+    // that runs through cmd.exe, which would cut a prompt at its first newline
+    // and mis-split one with an unbalanced quote; stdin carries it unchanged.
+    args.push('-');
     return args;
   }
 
   /**
    * Map the engine-agnostic `effort` to Codex's reasoning-effort config override
    * (`-c model_reasoning_effort=<level>`), which both `exec` and `exec resume`
-   * accept. `auto` and `ultracode` are ignored — `auto` means "leave it to the
-   * engine", and `ultracode` is a Claude-only setting, not an effort level.
+   * accept.
    */
   private _reasoningEffortArgs(): string[] {
-    const e = this.options.effort;
-    if (!e || e === 'auto') return [];
-    // codex 0.149's ladder is none|minimal|low|medium|high|xhigh|max|ultra, and
-    // its release notes call out `max` and `ultra` as selectable levels. Every
-    // level in our union now has a same-named counterpart, so this is a
-    // passthrough. It used to fold `max` down to `xhigh`, which was correct
-    // when `max` did not exist and is a silent downgrade now.
-    //
-    // `-c` values are not validated at parse time — codex prints
-    // `reasoning effort: <whatever>` and sends it — so an unknown level fails
-    // at the API, not at spawn. That is why the ladder is listed rather than
-    // guessed.
-    const known: ReadonlySet<string> = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
-    return known.has(e) ? ['-c', `model_reasoning_effort=${e}`] : [];
+    const e = codexReasoningEffort(this.options.effort);
+    return e ? ['-c', `model_reasoning_effort=${e}`] : [];
   }
 
   /**
@@ -347,19 +445,12 @@ export class PersistentCodexSession extends BaseOneShotSession {
   }
 
   protected _run(message: string, options: SessionSendOptions): Promise<TurnResult> {
-    // Only a selection needs this: it is the one case that lists the configured
-    // servers, and a server added to the config mid-session must not slip in.
-    // Everything else spawns synchronously, exactly as before.
-    if (!this._mcpDisableArgs) return this._runTurn(message, options);
-    return this._refreshMcpDisableArgs().then(() => this._runTurn(message, options));
-  }
-
-  private _runTurn(message: string, options: SessionSendOptions): Promise<TurnResult> {
     // Read before spawning: on a resumed thread the baseline has to be the
     // cumulative total as of the *previous* turn, and this turn is about to
     // append its own to the same file.
     this._readRollout();
-    const args = this._buildArgs(message);
+    const imagesBefore = this._generatedImages();
+    const args = this._buildArgs();
     const timeout = options.timeout || 300_000;
 
     return new Promise<TurnResult>((resolve, reject) => {
@@ -370,20 +461,22 @@ export class PersistentCodexSession extends BaseOneShotSession {
       let turnError: string | undefined;
       let settled = false;
 
-      const invocation = resolveWindowsNodeInvocation(this.engineBin);
-      const proc = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
+      const proc = spawnEngine(this.engineBin, args, {
+        launcher: this.options.launcher,
         cwd: this.options.cwd,
         env: { ...process.env },
-        stdio: ['ignore', 'pipe', 'pipe'],
-        windowsHide: process.platform === 'win32',
+        stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
-      guardChildStreams(proc);
+      // A process that dies before reading surfaces through 'close'; the write
+      // error itself carries nothing more.
+      proc.stdin?.on('error', () => {});
+      proc.stdin?.end(message);
 
       const timer = setTimeout(() => {
         if (!settled) {
           settled = true;
-          proc.kill('SIGTERM');
+          killEngineTree(proc);
           reject(new Error('Timeout waiting for Codex response'));
         }
       }, timeout);
@@ -479,8 +572,9 @@ export class PersistentCodexSession extends BaseOneShotSession {
       });
 
       proc.stderr?.on('data', (data: Buffer) => {
-        stderr += data.toString();
-        this.emit(SESSION_EVENT.LOG, `[codex-stderr] ${data.toString()}`);
+        const sanitized = sanitizeSecrets(data.toString());
+        stderr += sanitized;
+        this.emit(SESSION_EVENT.LOG, `[codex-stderr] ${sanitized}`);
       });
 
       proc.on('close', (code) => {
@@ -522,13 +616,18 @@ export class PersistentCodexSession extends BaseOneShotSession {
         // A fresh session has no rollout to read until its first turn has
         // created one; retry now that the thread id is known.
         this._readRollout();
+        // The context is the turn's last request, which only the rollout records.
+        const lastRequestPrompt = this._lastRequestPrompt();
+        if (lastRequestPrompt !== undefined) this._reportTurnInputTokens(lastRequestPrompt);
         this._addHistory({ text: assistantText, code });
 
+        const images = [...this._generatedImages()].filter((p) => !imagesBefore.has(p));
         const event: StreamEvent = {
           type: 'result',
           result: assistantText,
           stop_reason: ok ? 'end_turn' : 'error',
           session_id: this.codexThreadId,
+          ...(images.length ? { generated_images: images.map((path): GeneratedImage => ({ path })) } : {}),
         };
 
         this.emit(SESSION_EVENT.RESULT, event);

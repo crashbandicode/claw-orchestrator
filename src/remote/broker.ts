@@ -7,7 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { ENGINE_TYPES, PARENT_TOOL_IDS, type EffortLevel, type ParentToolId, type SessionConfig } from '../types.js';
 import { sanitizeCwd } from '../validation.js';
 import type { RemoteBrokerHost } from './broker-host.js';
-import { DurableMailbox, type MailMessage } from './mailbox.js';
+import { DurableMailbox, type MailMessage, type MailThread } from './mailbox.js';
 import { OperationStore } from './operation-store.js';
 import {
   MAX_FRAME_BYTES,
@@ -257,6 +257,8 @@ export class RemoteBroker {
         return { ok: true, ...this.sessions.getStatus(requiredString(payload.name, 'name')) };
       case 'session.overview':
         return this.sessions.health();
+      case 'session.side':
+        return this.sessionSide(payload);
       case 'inbox.send':
         return this.inboxSend(payload);
       case 'inbox.read':
@@ -282,12 +284,8 @@ export class RemoteBroker {
     const name = optionalString(payload.name, 'name') ?? `session-${Date.now()}`;
     if (name.includes('::')) throw new Error('Session name cannot contain ::');
     const resumeSessionId = optionalString(payload.resumeSessionId, 'resumeSessionId');
-    if (this.options.mailbox.getThread(name)) {
-      throw new Error(`Refusing to start managed session '${name}' over a registered manual thread`);
-    }
-    if (resumeSessionId && this.options.mailbox.findByNativeSessionId(resumeSessionId)) {
-      throw new Error(`Refusing to give native session '${resumeSessionId}' a second managed owner`);
-    }
+    const manual = this.manualThreadFor(name, resumeSessionId);
+    this.assertCanOwn(name, resumeSessionId ?? manual?.nativeSessionId);
     const originHost = optionalString(payload.originHost, 'originHost');
     if (originHost) assertHostAlias(originHost);
     const parentMachineId = optionalString(payload.parentMachineId, 'parentMachineId');
@@ -307,6 +305,11 @@ export class RemoteBroker {
     }
     if (parentMachineId) config.parentMachineId = parentMachineId.toLowerCase();
     if (parentToolId) config.parentToolId = parentToolId;
+    if (manual && !config.resumeSessionId) config.resumeSessionId = manual.nativeSessionId;
+    if (!config.engine && manual) {
+      const inferred = this.engineForManual(manual);
+      if (inferred) config.engine = inferred;
+    }
     if (typeof config.engine === 'string' && !(ENGINE_TYPES as readonly string[]).includes(config.engine)) {
       throw new Error(`Unknown engine '${config.engine}'`);
     }
@@ -335,6 +338,19 @@ export class RemoteBroker {
         ...(plan ? { plan: true } : {}),
       });
       return { ok: true, ...result };
+    } finally {
+      this.sessions.releaseSessionHold(name);
+    }
+  }
+
+  private async sessionSide(payload: Record<string, unknown>): Promise<unknown> {
+    const name = requiredString(payload.name, 'name');
+    const prompt = requiredText(payload.prompt, 'prompt');
+    const timeout = this.finiteNumber(payload.timeout, 'timeout');
+    if (!this.sessions.hasLiveSession(name)) throw new Error(`Session '${name}' not found`);
+    this.sessions.holdSession(name);
+    try {
+      return await this.sessions.codexSide(name, prompt, timeout);
     } finally {
       this.sessions.releaseSessionHold(name);
     }
@@ -485,8 +501,22 @@ export class RemoteBroker {
 
   private async inboxDeliver(payload: Record<string, unknown>): Promise<unknown> {
     const name = requiredString(payload.name, 'name');
-    if (this.options.mailbox.getThread(name) && !this.sessions.hasLiveSession(name)) {
-      throw new Error(`Manual thread '${name}' is read and acked by its owner; refusing to resume it`);
+    const thread = this.options.mailbox.getThread(name);
+    if (thread && !this.sessions.hasLiveSession(name)) {
+      const engine = optionalString(payload.engine, 'engine') ?? this.engineForManual(thread);
+      if (!engine) {
+        throw new Error(
+          `Manual thread '${name}' has no live session. Pass engine to start it (opencode, codex-app, claude, or cursor).`,
+        );
+      }
+      const cwd = optionalString(payload.cwd, 'cwd');
+      await this.sessionStart({
+        name,
+        engine,
+        resumeSessionId: thread.nativeSessionId,
+        ...(cwd ? { cwd } : {}),
+        ...(thread.parentToolId ? { parentToolId: thread.parentToolId } : {}),
+      });
     }
     if (!this.sessions.hasLiveSession(name)) throw new Error(`Session '${name}' not found`);
     let delivered = 0;
@@ -518,9 +548,6 @@ export class RemoteBroker {
     if (!this.options.mailbox.getThread(name)) {
       throw new Error(`Manual thread '${name}' is not registered; refusing to resume`);
     }
-    if (this.sessions.hasLiveSession(name)) {
-      throw new Error(`Refusing to attach a second owner to live session '${name}'`);
-    }
     return this.inboxSend({ ...payload, to: name });
   }
 
@@ -550,6 +577,43 @@ export class RemoteBroker {
     const waited = await this.options.mailbox.wait(name, waitTimeout, this.shutdownAbort.signal);
     if (this.shutdownAbort.signal.aborted) throw new Error('broker shutting down');
     return { ok: true, timedOut: waited.timedOut, count: waited.messages.length, messages: waited.messages };
+  }
+
+  /** A registered manual thread may be started. A live managed session may not gain a second owner. */
+  private manualThreadFor(name: string, resumeSessionId?: string): MailThread | undefined {
+    const byName = this.options.mailbox.getThread(name);
+    const byNative = resumeSessionId ? this.options.mailbox.findByNativeSessionId(resumeSessionId) : undefined;
+    if (byName && resumeSessionId && byName.nativeSessionId !== resumeSessionId) {
+      throw new Error(`Resume id '${resumeSessionId}' does not match manual thread '${byName.name}'`);
+    }
+    if (byName && byNative && byName.name !== byNative.name) {
+      throw new Error(`Native session '${resumeSessionId}' belongs to manual thread '${byNative.name}'`);
+    }
+    return byName ?? byNative;
+  }
+
+  private assertCanOwn(name: string, nativeSessionId?: string): void {
+    if (this.sessions.hasLiveSession(name)) {
+      throw new Error(`Refusing to attach a second owner to live session '${name}'`);
+    }
+    if (!nativeSessionId) return;
+    const owner = this.sessions.listSessions().find((session) => session.claudeSessionId === nativeSessionId);
+    if (owner) throw new Error(`Refusing to attach a second owner to live session '${owner.name}'`);
+  }
+
+  private engineForManual(thread: MailThread): SessionConfig['engine'] | undefined {
+    switch (thread.parentToolId) {
+      case 'codex':
+        return 'codex-app';
+      case 'claude_code':
+        return 'claude';
+      case 'cursor':
+        return 'cursor';
+      case 'opencode':
+        return 'opencode';
+      default:
+        return thread.nativeSessionId.startsWith('ses_') ? 'opencode' : undefined;
+    }
   }
 
   private parentTool(value: unknown): ParentToolId | undefined {

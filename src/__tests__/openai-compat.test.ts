@@ -4,6 +4,10 @@
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import * as path from 'node:path';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as http from 'node:http';
+import * as net from 'node:net';
 import {
   resolveSessionKey,
   sessionNameFromKey,
@@ -18,9 +22,11 @@ import {
   serializeConversationHistory,
   type OpenAIChatMessage,
   isToolsPerMessageModeEnabled,
+  compatTurnTimeoutMs,
   noToolsSystemPrompt,
   buildSessionSystemPrompt,
   handleChatCompletion,
+  compatSessionDir,
   __resetSeededConversations,
   __seededConversationCount,
 } from '../openai-compat.js';
@@ -38,7 +44,7 @@ describe('resolveEngineAndModel', () => {
   it('maps short aliases to claude engine', () => {
     expect(resolveEngineAndModel('opus')).toEqual({ engine: 'claude', model: 'claude-opus-5-5' });
     expect(resolveEngineAndModel('sonnet')).toEqual({ engine: 'claude', model: 'claude-sonnet-5-5' });
-    expect(resolveEngineAndModel('haiku')).toEqual({ engine: 'claude', model: 'claude-haiku-4-5' });
+    expect(resolveEngineAndModel('haiku')).toEqual({ engine: 'claude', model: 'claude-haiku-5-5' });
   });
 
   it('maps GPT-5.4 models to codex engine', () => {
@@ -378,19 +384,32 @@ describe('sessionNameFromKey', () => {
     expect(sessionNameFromKey('default')).toBe('openai-default');
   });
 
-  // The name becomes a directory: handleChatCompletion builds
-  // `os.tmpdir()/openclaw-compat-<name>`, mkdirs it recursively, and starts the
-  // session there under bypassPermissions. The key is whatever the caller put in
-  // `x-session-id` or `user`. Measured before the fix: the path resolved to
-  // `/var/folders/xy/etc/newdir` — outside the temp dir entirely.
+  // The name becomes a directory: handleChatCompletion runs the session in
+  // `compatSessionDir(<name>)` under bypassPermissions. The key is whatever the
+  // caller put in `x-session-id` or `user`. Measured before the fix: the path
+  // resolved to `/var/folders/xy/etc/newdir` — outside the temp dir entirely.
   it('cannot carry a path out of the directory it names', () => {
-    const os = { tmpdir: () => '/tmp' };
+    const root = path.join(os.homedir(), '.claw-orchestrator', 'compat');
     for (const evil of ['../../../../etc/newdir', '../..', 'a/b', 'a\\b', '..', '.', 'x/../../../y', 'nul\u0000byte']) {
       const name = sessionNameFromKey(evil);
-      const dir = path.join(os.tmpdir(), `openclaw-compat-${name}`);
-      expect(path.dirname(dir)).toBe(os.tmpdir());
+      expect(path.dirname(compatSessionDir(name))).toBe(root);
       expect(name).not.toContain('/');
       expect(name).not.toContain('..');
+    }
+  });
+
+  // On a shared host the system temp dir lets anyone create the directory first.
+  it('runs sessions in a private directory of this user, and refuses one that is not', () => {
+    const dir = compatSessionDir('openai-private');
+    expect(fs.statSync(dir).mode & 0o777).toBe(0o700);
+    expect(fs.statSync(path.dirname(dir)).mode & 0o777).toBe(0o700);
+    expect(compatSessionDir('openai-private')).toBe(dir);
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), 'compat-elsewhere-'));
+    try {
+      fs.symlinkSync(elsewhere, path.join(path.dirname(dir), 'openai-planted'));
+      expect(() => compatSessionDir('openai-planted')).toThrow(/not this user's own directory/);
+    } finally {
+      fs.rmSync(elsewhere, { recursive: true, force: true });
     }
   });
 
@@ -699,6 +718,23 @@ describe('buildToolPromptBlock', () => {
 // ─── parseToolCallsFromText ─────────────────────────────────────────────────
 
 describe('parseToolCallsFromText', () => {
+  // The text is model output. The former pattern backtracked cubically on an
+  // opening tag followed by whitespace and no closing tag: 4,000 spaces took ~9 s.
+  it('scans in linear time when a block is never closed', () => {
+    const text = 'before <tool_calls>' + ' '.repeat(4_000) + ' after';
+    const started = Date.now();
+    const r = parseToolCallsFromText(text);
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(r.toolCalls).toEqual([]);
+  });
+
+  it('reads several blocks and keeps the text around them', () => {
+    const r = parseToolCallsFromText(
+      'a <tool_calls> [{"name":"x","arguments":{}}] </tool_calls> b <tool_calls>[{"name":"y"}]</tool_calls> c',
+    );
+    expect(r.toolCalls.map((c) => c.function.name)).toEqual(['x', 'y']);
+  });
+
   it('returns text-only when no tool_calls tags', () => {
     const result = parseToolCallsFromText('Hello, world!');
     expect(result.textContent).toBe('Hello, world!');
@@ -2674,6 +2710,220 @@ describe('handleChatCompletion — streaming an engine that does not emit deltas
 
     expect(contentOf(written)).toBe('the whole answer');
   });
+
+  it('parses tool calls out of the returned output when nothing streamed', async () => {
+    // With `tools` the path buffers the deltas to parse them, and an engine with no delta channel
+    // leaves that buffer empty — the reply has to be read from the return value instead.
+    const manager = {
+      startSession: async (c: Record<string, unknown>) => ({ name: c.name as string }),
+      sendMessage: async () => ({
+        output: '<tool_calls>\n[{"name": "get_weather", "arguments": {"city": "Tokyo"}}]\n</tool_calls>',
+        events: [],
+      }),
+      stopSession: async () => {},
+      listSessions: () => [],
+      getStatus: () => ({ stats: { tokensIn: 1, tokensOut: 1, contextPercent: 1 } }),
+      compactSession: async () => ({}),
+    };
+    const { res, written } = recordingRes();
+
+    await handleChatCompletion(
+      manager as never,
+      {
+        model: 'opencode/x',
+        stream: true,
+        messages: [{ role: 'user', content: 'weather in Tokyo?' }],
+        tools: [
+          {
+            type: 'function',
+            function: { name: 'get_weather', description: 'Weather', parameters: { type: 'object' } },
+          },
+        ],
+      },
+      {},
+      res,
+    );
+
+    const frames = sseFrames({ sse: written }) as Array<{
+      choices?: Array<{
+        delta?: { content?: string; tool_calls?: Array<{ function: { name: string; arguments: string } }> };
+        finish_reason?: string | null;
+      }>;
+    }>;
+    const calls = frames.flatMap((f) => f.choices?.[0]?.delta?.tool_calls ?? []);
+    expect(calls.map((c) => c.function.name)).toEqual(['get_weather']);
+    expect(JSON.parse(calls[0].function.arguments)).toEqual({ city: 'Tokyo' });
+    expect(frames.at(-1)?.choices?.[0]?.finish_reason).toBe('tool_calls');
+    expect(contentOf(written)).not.toContain('<tool_calls>');
+  });
+});
+
+// ── The status webhook is best-effort: a URL it cannot POST to must not fail the completion.
+//
+//    `http.request` throws synchronously on an `https://` or malformed URL, and the first status
+//    report sits inside the same try block as the send.
+describe('handleChatCompletion — an unusable OPENAI_COMPAT_STATUS_URL', () => {
+  let saved: string | undefined;
+  beforeEach(() => {
+    __resetSeededConversations();
+    saved = process.env.OPENAI_COMPAT_STATUS_URL;
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.OPENAI_COMPAT_STATUS_URL;
+    else process.env.OPENAI_COMPAT_STATUS_URL = saved;
+  });
+
+  for (const url of ['https://127.0.0.1:1/status', 'not a url']) {
+    it(`answers a non-streaming request with ${JSON.stringify(url)} set`, async () => {
+      process.env.OPENAI_COMPAT_STATUS_URL = url;
+      const { manager, sent } = fakeManager();
+      const { res, seen } = recordingRes();
+
+      await handleChatCompletion(
+        manager,
+        { model: 'gpt-5.5', messages: [{ role: 'user', content: 'hello' }] },
+        { 'x-session-id': 'demo' },
+        res,
+      );
+
+      expect(sent).toHaveLength(1);
+      expect(seen.status).toBe(200);
+      expect(JSON.parse(seen.body).choices[0].message.content).toBe('ok');
+    });
+
+    it(`answers a streaming request with ${JSON.stringify(url)} set`, async () => {
+      process.env.OPENAI_COMPAT_STATUS_URL = url;
+      const { manager, sent } = fakeManager();
+      const { res, seen } = recordingRes();
+
+      await handleChatCompletion(
+        manager,
+        streamingBody([{ role: 'user', content: 'hello' }]),
+        { 'x-session-id': 'demo' },
+        res,
+      );
+
+      expect(sent).toHaveLength(1);
+      const frames = sseFrames(seen);
+      expect(frames.some((f) => f.error)).toBe(false);
+      expect(frames.map((f) => f.choices?.[0]?.delta?.content ?? '').join('')).toBe('ok');
+    });
+  }
+
+  it('drops a status request the endpoint never answers once the 2s timeout passes', async () => {
+    // The `timeout` option only emits an event; without a handler that destroys the request, every
+    // report to a hung endpoint holds a socket open for as long as the endpoint does.
+    const opened: net.Socket[] = [];
+    const closed: net.Socket[] = [];
+    const server = http.createServer(() => {
+      /* never answers */
+    });
+    server.on('connection', (socket) => {
+      opened.push(socket);
+      socket.on('close', () => closed.push(socket));
+    });
+    await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+    process.env.OPENAI_COMPAT_STATUS_URL = `http://127.0.0.1:${(server.address() as net.AddressInfo).port}/status`;
+    try {
+      const { manager } = fakeManager();
+      const { res, seen } = recordingRes();
+      await handleChatCompletion(
+        manager,
+        { model: 'gpt-5.5', messages: [{ role: 'user', content: 'hello' }] },
+        { 'x-session-id': 'demo' },
+        res,
+      );
+      expect(seen.status).toBe(200);
+      await new Promise((resolve) => setTimeout(resolve, 2_600));
+      expect(opened.length).toBeGreaterThan(0);
+      expect(closed).toHaveLength(opened.length);
+    } finally {
+      server.closeAllConnections();
+      server.close();
+    }
+  }, 10_000);
+});
+
+// ── `usage` is this request's, not the session's running total.
+//
+//    Every engine's stats accumulate over the session, so on a persistent session the totals read
+//    after a send include every earlier turn, and prompt_tokens grew on every request. The send's
+//    own tokens come back on its result, measured by the manager inside its per-session chain.
+describe('handleChatCompletion — usage is per request', () => {
+  beforeEach(__resetSeededConversations);
+
+  /**
+   * A manager whose stats are running totals, the way every engine keeps them, and whose send
+   * reports what it added, the way SessionManager does. Turn k costs k×100 in, k×10 out.
+   */
+  function cumulativeManager() {
+    const totals = new Map<string, { tokensIn: number; tokensOut: number; turns: number }>();
+    return {
+      startSession: async (c: Record<string, unknown>) => {
+        totals.set(c.name as string, { tokensIn: 0, tokensOut: 0, turns: 0 });
+        return { name: c.name as string };
+      },
+      sendMessage: async (name: string) => {
+        const t = totals.get(name)!;
+        t.turns += 1;
+        t.tokensIn += t.turns * 100;
+        t.tokensOut += t.turns * 10;
+        return { output: 'ok', events: [], usage: { tokensIn: t.turns * 100, tokensOut: t.turns * 10 } };
+      },
+      stopSession: async (name: string) => {
+        totals.delete(name);
+      },
+      listSessions: () => [...totals.keys()].map((name) => ({ name })),
+      getStatus: (name: string) => {
+        const t = totals.get(name);
+        if (!t) throw new Error('session is gone');
+        return { stats: { tokensIn: t.tokensIn, tokensOut: t.tokensOut, contextPercent: 1 } };
+      },
+      compactSession: async () => ({}),
+    };
+  }
+
+  type Usage = { prompt_tokens: number; completion_tokens: number; total_tokens: number };
+
+  it('non-streaming reports the tokens of this turn alone', async () => {
+    const manager = cumulativeManager();
+    const usages: Usage[] = [];
+    for (let i = 0; i < 3; i++) {
+      const { res, seen } = recordingRes();
+      await handleChatCompletion(
+        manager,
+        { model: 'gpt-5.5', messages: [{ role: 'user', content: `turn ${i}` }] },
+        { 'x-session-id': 'usage-ns' },
+        res,
+      );
+      usages.push((JSON.parse(seen.body) as { usage: Usage }).usage);
+    }
+    expect(usages).toEqual([
+      { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+      { prompt_tokens: 200, completion_tokens: 20, total_tokens: 220 },
+      { prompt_tokens: 300, completion_tokens: 30, total_tokens: 330 },
+    ]);
+  });
+
+  it('streaming reports the tokens of this turn alone', async () => {
+    const manager = cumulativeManager();
+    const usages: Array<Usage | undefined> = [];
+    for (let i = 0; i < 3; i++) {
+      const { res, seen } = recordingRes();
+      await handleChatCompletion(
+        manager,
+        streamingBody([{ role: 'user', content: `turn ${i}` }]),
+        { 'x-session-id': 'usage-st' },
+        res,
+      );
+      usages.push((sseFrames(seen).at(-1) as { usage?: Usage }).usage);
+    }
+    expect(usages).toEqual([
+      { prompt_tokens: 100, completion_tokens: 10, total_tokens: 110 },
+      { prompt_tokens: 200, completion_tokens: 20, total_tokens: 220 },
+      { prompt_tokens: 300, completion_tokens: 30, total_tokens: 330 },
+    ]);
+  });
 });
 
 // ─── handleChatCompletion — the history wiring, not the predicate ─────────────────────────────
@@ -3402,5 +3652,88 @@ describe('fenceHistoryTags — invisible filler between the bracket and the tag 
       { role: 'user', content: 'b' },
     ]);
     expect(Date.now() - started).toBeLessThan(2_000);
+  });
+});
+
+// ─── compat turn timeout ─────────────────────────────────────────────────────
+//
+// The session manager's default send timeout (TURN_TIMEOUT_MS, 5 min) cut off gateway agents
+// whose single reply runs longer — a nightly job writing a long log in one tool call timed out at
+// exactly 300 s, twice per run, and the gateway fell back to a weaker model. Compat sends now
+// carry their own, longer ceiling.
+
+describe('compatTurnTimeoutMs', () => {
+  let saved: string | undefined;
+  beforeEach(() => {
+    saved = process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS;
+    delete process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS;
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS;
+    else process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS = saved;
+  });
+
+  it('defaults to 30 minutes when the env var is unset', () => {
+    expect(compatTurnTimeoutMs()).toBe(1_800_000);
+  });
+
+  it('uses a positive number from the env var', () => {
+    process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS = '3600000';
+    expect(compatTurnTimeoutMs()).toBe(3_600_000);
+  });
+
+  it('ignores values that are not a positive number', () => {
+    for (const v of ['', '0', '-5', 'abc', 'Infinity']) {
+      process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS = v;
+      expect(compatTurnTimeoutMs()).toBe(1_800_000);
+    }
+  });
+});
+
+describe('handleChatCompletion passes the compat turn timeout to sendMessage', () => {
+  let saved: string | undefined;
+  beforeEach(() => {
+    saved = process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS;
+    process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS = '1234567';
+  });
+  afterEach(() => {
+    if (saved === undefined) delete process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS;
+    else process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS = saved;
+  });
+
+  const managerRecording = (seen: Array<number | undefined>) => ({
+    startSession: async (c: Record<string, unknown>) => ({ name: c.name as string }),
+    sendMessage: async (_n: string, _m: string, opts?: { timeout?: number }) => {
+      seen.push(opts?.timeout);
+      return { output: 'ok', events: [] };
+    },
+    stopSession: async () => {},
+    listSessions: () => [],
+    getStatus: () => ({ stats: { tokensIn: 1, tokensOut: 1, contextPercent: 1 } }),
+    compactSession: async () => ({}),
+  });
+
+  it('on the non-streaming path', async () => {
+    const seen: Array<number | undefined> = [];
+    const { res } = recordingRes();
+    await handleChatCompletion(
+      managerRecording(seen) as never,
+      { model: 'claude-sonnet-4-5', messages: [{ role: 'user', content: 'hi' }] },
+      {},
+      res,
+    );
+    expect(seen).toEqual([1_234_567]);
+  });
+
+  it('on the streaming path', async () => {
+    const seen: Array<number | undefined> = [];
+    const { res } = recordingRes();
+    await handleChatCompletion(
+      managerRecording(seen) as never,
+      { model: 'claude-sonnet-4-5', stream: true, messages: [{ role: 'user', content: 'hi' }] },
+      {},
+      res,
+    );
+    expect(seen).toEqual([1_234_567]);
   });
 });

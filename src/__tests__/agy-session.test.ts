@@ -13,8 +13,9 @@ import * as fs from 'node:fs';
 
 // Mock child_process before importing the session
 const mockSpawn = vi.fn();
-vi.mock('node:child_process', () => ({
-  spawn: (...args: unknown[]) => mockSpawn(...args),
+vi.mock('../engine-spawn.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../engine-spawn.js')>()),
+  spawnEngine: (...args: unknown[]) => mockSpawn(...args),
 }));
 
 // Import after mocking
@@ -126,6 +127,18 @@ describe('PersistentAgySession', () => {
       expect(spawnArgs).toContain('--model');
       expect(spawnArgs).toContain('gemini-3.5-flash');
       expect(spawnArgs).toContain('--log-file');
+      expect(spawnArgs).not.toContain('--settings');
+    });
+
+    it('passes settings through as --settings', async () => {
+      const settings = '{"autoUpdates":false}';
+      const session = new PersistentAgySession({ name: 'test', cwd: '/tmp', settings } as never);
+      await session.start();
+      const sendPromise = session.send('hello', { waitForComplete: true });
+      setTimeout(() => succeedProc(mockProc), 10);
+      await sendPromise;
+      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+      expect(spawnArgs[spawnArgs.indexOf('--settings') + 1]).toBe(settings);
     });
 
     it('uses plan mode for read-only sessions', async () => {
@@ -862,6 +875,56 @@ describe('PersistentAgySession', () => {
       expect(stats.cachedTokens).toBe(7);
       // The id comes off the stream, so no log-file scrape is needed.
       expect(session.conversationId).toBe('11111111-2222-3333-4444-555555555555');
+    });
+
+    it("measures the context by the turn's last request, not the turn's summed usage", async () => {
+      // agy's `result.usage` sums every request of the turn, and `input_tokens`
+      // leaves the cached reads out. Each `agent_response` step reports its own
+      // request; the last one is the context. Shapes from agy 1.5.3.
+      const session = new PersistentAgySession({ name: 'test', cwd: '/tmp' });
+      await session.start();
+      const conv = 'fb445f86-e702-4506-8b45-56fe7b56ddb9';
+      const step = (input: number, cached: number, conversation_id = conv) =>
+        JSON.stringify({
+          event: 'step_update',
+          step_update: {
+            conversation_id,
+            state: 'DONE',
+            step_type: 'agent_response',
+            usage: { input_tokens: input, output_tokens: 40, cache_read_tokens: cached },
+          },
+        }) + '\n';
+
+      const p = session.send('hello', { waitForComplete: true });
+      setTimeout(() => {
+        feedText(mockProc, JSON.stringify({ event: 'init', conversation_id: conv }) + '\n');
+        for (const [input, cached] of [
+          [200_000, 0],
+          [2_000, 199_000],
+          [2_000, 201_000],
+          [2_000, 203_000],
+        ])
+          feedText(mockProc, step(input, cached));
+        // A subagent works in a conversation of its own.
+        feedText(mockProc, step(600_000, 0, '99999999-8888-7777-6666-555555555555'));
+        feedText(
+          mockProc,
+          JSON.stringify({
+            event: 'result',
+            result: {
+              conversation_id: conv,
+              status: 'SUCCESS',
+              response: 'done',
+              usage: { input_tokens: 806_000, output_tokens: 200, cache_read_tokens: 603_000 },
+            },
+          }) + '\n',
+        );
+        closeProc(mockProc, 0);
+      }, 10);
+      await p;
+
+      // 205,000 of a 1M window, not the summed 806,000 (81%).
+      expect(session.getStats().contextPercent).toBe(21);
     });
 
     it('takes the conversation id from the init event', async () => {

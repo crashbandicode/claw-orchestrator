@@ -11,8 +11,7 @@
  *   - Consistent lifecycle semantics (start/stop/pause/resume)
  */
 
-import { spawn } from 'node:child_process';
-import { guardChildStreams } from './child-process-guard.js';
+import { spawnEngine } from './engine-spawn.js';
 import * as readline from 'node:readline';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -23,13 +22,34 @@ import { estimateTokens } from './models.js';
 import { sanitizeSecrets } from './sanitize.js';
 import { SESSION_EVENT } from './constants.js';
 import { BaseOneShotSession } from './base-oneshot-session.js';
+import { cursorLauncherEnv, resolveCursorRuntime, resolveWindowsBareCommand } from './windows-command.js';
 import {
   loadCursorModelCatalog,
   resolveCursorModelEffort,
   resolveCursorParameterizedModelEffort,
 } from './cursor-model-effort.js';
 import { loadCursorParameterizedCatalog } from './cursor-parameterized-catalog.js';
-import { cursorLauncherEnv, resolveCursorRuntime, resolveWindowsBareCommand } from './windows-command.js';
+
+export interface CursorInvocation {
+  command: string;
+  prefixArgs: string[];
+  env: Record<string, string>;
+}
+
+/**
+ * Cursor's Windows installer exposes `.cmd` / `.ps1` launchers. Spawning those
+ * wrappers needs a shell, and the wrapper itself runs Windows PowerShell 5.1.
+ * Resolve them to the installed node.exe + index.js pair. Other platforms keep
+ * the command unchanged.
+ */
+export function resolveCursorInvocation(engineBin: string, platform = process.platform): CursorInvocation {
+  const bin = resolveWindowsBareCommand(engineBin, platform);
+  if (platform !== 'win32' || !/\.(?:cmd|ps1)$/i.test(bin)) {
+    return { command: bin, prefixArgs: [], env: {} };
+  }
+  const runtime = resolveCursorRuntime(bin);
+  return { command: runtime.node, prefixArgs: [runtime.entry], env: cursorLauncherEnv(bin) };
+}
 
 /**
  * Enforced read-only for Cursor Agent.
@@ -52,30 +72,6 @@ const READ_ONLY_CLI_CONFIG = JSON.stringify({
   permissions: { allow: [], deny: ['Write(**)', 'Edit(**)', 'Shell(**)'] },
 });
 
-export interface CursorInvocation {
-  command: string;
-  prefixArgs: string[];
-  env: Record<string, string>;
-}
-
-/**
- * Cursor's Windows installer exposes `.cmd` / `.ps1` launchers, but
- * `child_process.spawn()` cannot execute those wrappers directly without a
- * shell (`spawn EINVAL`), and the wrapper itself runs Windows PowerShell 5.1,
- * which Claw does not use. The wrapper is resolved to the newest installed
- * version's bundled node.exe + index.js pair instead (see windows-command.ts),
- * at launch time so a Cursor self-update is picked up. A bare `cursor-agent`
- * is first looked up on PATH, where only the `.cmd` exists.
- */
-export function resolveCursorInvocation(engineBin: string, platform = process.platform): CursorInvocation {
-  const bin = resolveWindowsBareCommand(engineBin, platform);
-  if (platform !== 'win32' || !/\.(?:cmd|ps1)$/i.test(bin)) {
-    return { command: bin, prefixArgs: [], env: {} };
-  }
-  const runtime = resolveCursorRuntime(bin);
-  return { command: runtime.node, prefixArgs: [runtime.entry], env: cursorLauncherEnv(bin) };
-}
-
 // ─── PersistentCursorSession ────────────────────────────────────────────────
 
 export class PersistentCursorSession extends BaseOneShotSession {
@@ -94,19 +90,6 @@ export class PersistentCursorSession extends BaseOneShotSession {
 
   protected override _continuesConversation(): boolean {
     return !!this.cursorChatId;
-  }
-
-  /**
-   * Record Cursor's own chat id at most once and announce it immediately.
-   * System init can fire again on later turns and on `--resume`; those repeats
-   * must not emit a second identity.
-   */
-  private _adoptNativeChatId(raw: unknown): void {
-    if (raw == null) return;
-    const id = String(raw).replace(/^cursor-live-/, '');
-    if (!id || this.cursorChatId) return;
-    this.cursorChatId = id;
-    this.emit(SESSION_EVENT.NATIVE_IDENTITY, id);
   }
 
   constructor(config: SessionConfig, cursorBin?: string) {
@@ -160,20 +143,9 @@ export class PersistentCursorSession extends BaseOneShotSession {
     super._cleanupProc();
   }
 
-  protected _run(message: string, options: SessionSendOptions): Promise<TurnResult> {
-    try {
-      return this._spawnTurn(message, options);
-    } catch (err) {
-      return Promise.reject(err);
-    }
-  }
-
-  private async _spawnTurn(message: string, options: SessionSendOptions): Promise<TurnResult> {
+  protected async _run(message: string, options: SessionSendOptions): Promise<TurnResult> {
     // agent -p <prompt> [--force | --mode plan] --trust --output-format stream-json
     const readOnly = this.options.sandboxMode === 'read-only';
-    // `--single-turn` is intentionally absent. Cursor continues an active goal
-    // inside this process only when that flag is off. `cursor_goal_set` sends
-    // the same `/goal <objective>` text the TUI submits and relies on this.
     const args: string[] = ['-p', message];
     // `--mode plan` steers the model toward read-only behavior; the binding
     // guarantee comes from the deny config injected via the process cwd below.
@@ -191,10 +163,8 @@ export class PersistentCursorSession extends BaseOneShotSession {
     if (this.cursorChatId) args.push('--resume', this.cursorChatId);
 
     const invocation = resolveCursorInvocation(this.engineBin);
-    // Cursor has no `--effort` flag. Session and per-turn effort are applied by
-    // selecting a same-family catalog id or parameterized `--model` from the
-    // live catalog. --list-models omits newer parameterized models, so a miss
-    // uses Cursor's ACP discovery without creating a chat or running inference.
+    // Cursor has no `--effort` flag. Session and per-turn effort select a
+    // same-family catalog id, or a parameterized model from the live catalog.
     const turnEffort = options.effort ?? this.options.effort;
     if (turnEffort && turnEffort !== 'auto') {
       let resolved: string | undefined;
@@ -210,9 +180,7 @@ export class PersistentCursorSession extends BaseOneShotSession {
         if (!this.isReady) throw new Error('Cursor session stopped during model discovery');
         resolved = resolveCursorParameterizedModelEffort(this.options.model, turnEffort, catalog);
       }
-      if (!resolved) {
-        throw new Error(`Cursor effort '${turnEffort}' resolved to no --model value`);
-      }
+      if (!resolved) throw new Error(`Cursor effort '${turnEffort}' resolved to no --model value`);
       args.push('--model', resolved);
     } else if (this.options.model) {
       args.push('--model', this.options.model);
@@ -233,14 +201,13 @@ export class PersistentCursorSession extends BaseOneShotSession {
       let settled = false;
       let gotUsageFromEvents = false;
 
-      const proc = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
+      const proc = spawnEngine(invocation.command, [...invocation.prefixArgs, ...args], {
+        launcher: this.options.launcher,
         cwd: spawnCwd,
         env: { ...process.env, ...invocation.env },
         stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: process.platform === 'win32',
       });
       this.currentProc = proc;
-      guardChildStreams(proc);
 
       const timer = setTimeout(() => {
         if (!settled) {
@@ -351,9 +318,11 @@ export class PersistentCursorSession extends BaseOneShotSession {
       case 'system':
         // Init event — extract session_id if available
         // The raw id is what `--resume` expects; the prefixed one is our
-        // display/persistence handle. Announce native identity as soon as the
-        // stream names it, not when the turn later completes.
-        if (event.session_id) this._adoptNativeChatId(event.session_id);
+        // display/persistence handle.
+        if (event.session_id && !this.cursorChatId) {
+          this.cursorChatId = String(event.session_id);
+          this.emit(SESSION_EVENT.NATIVE_IDENTITY, this.cursorChatId);
+        }
         if (event.session_id && !this.sessionId?.startsWith('cursor-live-')) {
           this.sessionId = `cursor-live-${event.session_id}`;
         }

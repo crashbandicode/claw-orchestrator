@@ -14,8 +14,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 const mockSpawn = vi.fn();
-vi.mock('node:child_process', () => ({
-  spawn: (...args: unknown[]) => mockSpawn(...args),
+vi.mock('../engine-spawn.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../engine-spawn.js')>()),
+  spawnEngine: (...args: unknown[]) => mockSpawn(...args),
 }));
 
 const { PersistentCodexSession } = await import('../persistent-codex-session.js');
@@ -24,12 +25,20 @@ function createMockProcess() {
   const proc = new EventEmitter() as EventEmitter & {
     stdout: Readable;
     stderr: EventEmitter;
+    stdin: { written: string; on: ReturnType<typeof vi.fn>; end: (text?: string) => void };
     kill: ReturnType<typeof vi.fn>;
     pid: number;
     exitCode: null;
   };
   proc.stdout = new Readable({ read() {} });
   proc.stderr = new EventEmitter();
+  proc.stdin = {
+    written: '',
+    on: vi.fn(),
+    end(text?: string) {
+      this.written += text ?? '';
+    },
+  };
   proc.kill = vi.fn();
   proc.pid = 4242;
   proc.exitCode = null;
@@ -94,6 +103,28 @@ describe('PersistentCodexSession', () => {
     expect(existsSync(schemaPath)).toBe(false);
   });
 
+  it('redacts secrets from stderr in its log lines and in the error a failed turn rejects with', async () => {
+    const session = new PersistentCodexSession({ name: 'test', cwd: '/tmp' });
+    const logs: string[] = [];
+    session.on('log', (line: string) => logs.push(line));
+    await session.start();
+
+    const sendPromise = session.send('hi', { waitForComplete: true });
+    setTimeout(() => {
+      mockProc.stderr.emit('data', Buffer.from('auth failed: OPENAI_API_KEY=sk-live-0123456789abcdef\n'));
+      mockProc.stdout.push(null);
+      mockProc.emit('close', 1);
+    }, 10);
+    const err = await sendPromise.then(
+      () => undefined,
+      (e: Error) => e,
+    );
+
+    expect(logs.join('')).toContain('OPENAI_API_KEY=***');
+    expect(logs.join('')).not.toContain('0123456789abcdef');
+    expect(err?.message ?? '').not.toContain('0123456789abcdef');
+  });
+
   it('omits --output-schema when no jsonSchema is configured', async () => {
     const session = new PersistentCodexSession({ name: 'test', cwd: '/tmp' });
     await session.start();
@@ -117,7 +148,8 @@ describe('PersistentCodexSession', () => {
     const first = session.send('hi', { waitForComplete: true });
     setTimeout(() => runTurn(mockProc, 'thread-7'), 10);
     await first;
-    expect((mockSpawn.mock.calls[0][1] as string[]).at(-1)).toBe('SEAT RULES\n\n---\n\nhi');
+    expect((mockSpawn.mock.calls[0][1] as string[]).at(-1)).toBe('-');
+    expect(mockProc.stdin.written).toBe('SEAT RULES\n\n---\n\nhi');
 
     const secondProc = createMockProcess();
     mockSpawn.mockReturnValueOnce(secondProc);
@@ -126,7 +158,26 @@ describe('PersistentCodexSession', () => {
     await second;
     const secondArgs = mockSpawn.mock.calls[1][1] as string[];
     expect(secondArgs.slice(0, 3)).toEqual(['exec', 'resume', 'thread-7']);
-    expect(secondArgs.at(-1)).toBe('again');
+    expect(secondArgs.at(-1)).toBe('-');
+    expect(secondProc.stdin.written).toBe('again');
+  });
+
+  // On Windows `codex` is an npm .cmd shim run through cmd.exe, which cuts an
+  // argument at its first newline and mis-splits an unbalanced quote. The
+  // prompt therefore never travels on argv.
+  it('sends the prompt on stdin, never on argv', async () => {
+    const session = new PersistentCodexSession({ name: 'test', cwd: '/tmp' });
+    await session.start();
+    const prompt = 'line one says "hi\nline two';
+
+    const p = session.send(prompt, { waitForComplete: true });
+    setTimeout(() => runTurn(mockProc, 'thread-stdin'), 10);
+    await p;
+
+    const args = mockSpawn.mock.calls[0][1] as string[];
+    expect(args.at(-1)).toBe('-');
+    expect(args.some((a) => a.includes('line one'))).toBe(false);
+    expect(mockProc.stdin.written).toBe(prompt);
   });
 
   it('does not repeat appendSystemPrompt when the session resumes an existing thread', async () => {
@@ -141,7 +192,7 @@ describe('PersistentCodexSession', () => {
     const sendPromise = session.send('continue', { waitForComplete: true });
     setTimeout(() => runTurn(mockProc, '019c6dcb-93ad-7dc1-b531-418d213b8761'), 10);
     await sendPromise;
-    expect((mockSpawn.mock.calls[0][1] as string[]).at(-1)).toBe('continue');
+    expect(mockProc.stdin.written).toBe('continue');
   });
 
   it('starts with exec resume when resumeSessionId contains a Codex thread ID', async () => {
@@ -526,6 +577,116 @@ describe('PersistentCodexSession', () => {
     session.stop();
   });
 
+  // A turn makes one request per tool round, and the difference between two
+  // `turn.completed` totals sums them: it is the turn's spend, not the
+  // context's size. The rollout records each request's own usage in a
+  // `token_count` event's `last_token_usage`; the turn's last one is the context.
+  it("measures contextPercent by the turn's last request, not the turn's summed usage", async () => {
+    const tokenCount = (last: number, total: number) =>
+      JSON.stringify({
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            total_token_usage: { input_tokens: total, cached_input_tokens: 0, output_tokens: 10 },
+            last_token_usage: { input_tokens: last, cached_input_tokens: last - 1_000, output_tokens: 10 },
+            model_context_window: 258_400,
+          },
+        },
+      });
+    writeRollout('thread-req', [
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_started', model_context_window: 258_400 } }),
+      tokenCount(60_000, 60_000),
+      tokenCount(61_000, 121_000),
+      tokenCount(62_000, 183_000),
+      tokenCount(63_000, 246_000),
+    ]);
+    const session = new PersistentCodexSession({ name: 'test', cwd: '/tmp', model: 'gpt-5.5' });
+    await session.start();
+
+    const p = session.send('hi', { waitForComplete: true });
+    setTimeout(() => {
+      mockProc.stdout.push(JSON.stringify({ type: 'thread.started', thread_id: 'thread-req' }) + '\n');
+      mockProc.stdout.push(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 246_000 } }) + '\n');
+      mockProc.stdout.push(null);
+      mockProc.emit('close', 0);
+    }, 10);
+    await p;
+
+    // 63,000 / 258,400 = 24%, where the turn's sum read 95%. Spend is still the sum.
+    expect(session.getStats().contextPercent).toBe(24);
+    expect(session.getStats().tokensIn).toBe(246_000);
+    session.stop();
+  });
+
+  // With no --model, codex runs the model in the user's ~/.codex/config.toml.
+  // Pricing that at the wrapper default understated an Astra session 2x on
+  // input; the rollout's turn_context names the model that actually ran.
+  it('prices a session with no model as the model codex reports it ran', async () => {
+    writeRollout('thread-model', [
+      JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-6-astra', effort: 'high' } }),
+    ]);
+    const session = new PersistentCodexSession({ name: 'test', cwd: '/tmp' });
+    await session.start();
+
+    const p = session.send('hi', { waitForComplete: true });
+    setTimeout(() => {
+      mockProc.stdout.push(JSON.stringify({ type: 'thread.started', thread_id: 'thread-model' }) + '\n');
+      mockProc.stdout.push(
+        JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1_000_000, output_tokens: 0 } }) + '\n',
+      );
+      mockProc.stdout.push(null);
+      mockProc.emit('close', 0);
+    }, 10);
+    await p;
+
+    const cost = session.getCost();
+    expect(cost.model).toBe('gpt-6-astra');
+    expect(cost.pricing.inputPer1M).toBe(10);
+    expect(session.getStats().costUsd).toBeCloseTo(10, 6);
+    session.stop();
+  });
+
+  // `codex exec --json` emits no event for a generated image; the file under
+  // $CODEX_HOME/generated_images/<thread>/ is the only record of it.
+  it('reports the images a turn saved, not ones already there', async () => {
+    const dir = join(codexHome, 'generated_images', 'thread-img');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'exec-old.png'), 'x');
+    const session = new PersistentCodexSession({ name: 'test', cwd: '/tmp', resumeSessionId: 'thread-img' });
+    await session.start();
+
+    const p = session.send('draw', { waitForComplete: true });
+    setTimeout(() => {
+      writeFileSync(join(dir, 'exec-new.png'), 'y');
+      writeFileSync(join(dir, 'notes.txt'), 'z');
+      mockProc.stdout.push(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 1 } }) + '\n');
+      mockProc.stdout.push(null);
+      mockProc.emit('close', 0);
+    }, 10);
+    const result = (await p) as { event: Record<string, unknown> };
+    expect(result.event.generated_images).toEqual([{ path: join(dir, 'exec-new.png') }]);
+    session.stop();
+  });
+
+  it('keeps the configured model over the one in the rollout', async () => {
+    writeRollout('thread-pinned', [JSON.stringify({ type: 'turn_context', payload: { model: 'gpt-6-astra' } })]);
+    const session = new PersistentCodexSession({ name: 'test', cwd: '/tmp', model: 'gpt-6-luna' });
+    await session.start();
+
+    const p = session.send('hi', { waitForComplete: true });
+    setTimeout(() => {
+      mockProc.stdout.push(JSON.stringify({ type: 'thread.started', thread_id: 'thread-pinned' }) + '\n');
+      mockProc.stdout.push(JSON.stringify({ type: 'turn.completed', usage: { input_tokens: 10 } }) + '\n');
+      mockProc.stdout.push(null);
+      mockProc.emit('close', 0);
+    }, 10);
+    await p;
+
+    expect(session.getCost().model).toBe('gpt-6-luna');
+    session.stop();
+  });
+
   // A resumed thread arrives with a token history this process never saw, so
   // the first `turn.completed` reports a cumulative total covering turns that
   // predate the session. Treating that as the turn's own prompt would report a
@@ -616,122 +777,5 @@ describe('PersistentCodexSession', () => {
       expect(stats.turnsSucceeded).toBe(1);
       session.stop();
     });
-  });
-});
-
-describe('PersistentCodexSession — MCP server selection', () => {
-  const MCP_LIST = JSON.stringify([
-    { name: 'maas_slack', enabled: true, transport: { type: 'streamable_http', url: 'https://x.invalid/mcp' } },
-    { name: 'docs', enabled: true, transport: { type: 'stdio', command: '/bin/docs' } },
-  ]);
-
-  function listProc(listing: string) {
-    const p = new EventEmitter() as EventEmitter & { stdout: EventEmitter; stderr: EventEmitter };
-    p.stdout = new EventEmitter();
-    p.stderr = new EventEmitter();
-    queueMicrotask(() => {
-      p.stdout.emit('data', Buffer.from(listing));
-      p.emit('close', 0);
-    });
-    return p;
-  }
-
-  const execCalls = () => mockSpawn.mock.calls.filter((c) => (c[1] as string[])[0] === 'exec');
-  const listCalls = () => mockSpawn.mock.calls.filter((c) => (c[1] as string[])[0] === 'mcp');
-
-  beforeEach(() => {
-    process.env.CODEX_HOME = codexHome;
-    mockSpawn.mockReset();
-  });
-
-  it('uses --ignore-user-config alone, and never lists servers, when nothing is selected', async () => {
-    const proc = createMockProcess();
-    mockSpawn.mockReturnValue(proc);
-    const session = new PersistentCodexSession({
-      name: 'test',
-      cwd: '/tmp',
-      permissionMode: 'bypassPermissions',
-      ignoreUserConfig: true,
-    });
-    await session.start();
-    const p = session.send('hi', { waitForComplete: true });
-    setTimeout(() => runTurn(proc, 'thread-mcp-none'), 10);
-    await p;
-    const args = execCalls()[0][1] as string[];
-    expect(args).toContain('--ignore-user-config');
-    expect(args.join(' ')).not.toContain('mcp_servers');
-    expect(listCalls()).toHaveLength(0);
-    session.stop();
-  });
-
-  it('keeps only the selected servers by disabling the others instead of --ignore-user-config', async () => {
-    const proc = createMockProcess();
-    mockSpawn.mockImplementation((_cmd: string, args: string[]) => (args[0] === 'mcp' ? listProc(MCP_LIST) : proc));
-    const session = new PersistentCodexSession({
-      name: 'test',
-      cwd: '/tmp',
-      permissionMode: 'bypassPermissions',
-      ignoreUserConfig: true,
-      codexMcpServers: ['docs'],
-    });
-    await session.start();
-    expect(listCalls()).toHaveLength(1);
-
-    const p = session.send('hi', { waitForComplete: true });
-    setTimeout(() => runTurn(proc, 'thread-mcp-docs'), 10);
-    await p;
-    const args = execCalls()[0][1] as string[];
-    expect(args).not.toContain('--ignore-user-config');
-    expect(args).toEqual(
-      expect.arrayContaining([
-        '-c',
-        'mcp_servers.maas_slack.enabled=false',
-        '-c',
-        'mcp_servers.maas_slack.url="http://127.0.0.1:9/"',
-      ]),
-    );
-    expect(args.join(' ')).not.toContain('mcp_servers.docs');
-    // Re-resolved before the turn, so a server added to the config meanwhile cannot slip in.
-    expect(listCalls()).toHaveLength(2);
-    session.stop();
-  });
-
-  it('applies the same overrides on a resumed turn', async () => {
-    const proc = createMockProcess();
-    mockSpawn.mockImplementation((_cmd: string, args: string[]) => (args[0] === 'mcp' ? listProc(MCP_LIST) : proc));
-    const session = new PersistentCodexSession({
-      name: 'test',
-      cwd: '/tmp',
-      permissionMode: 'bypassPermissions',
-      ignoreUserConfig: true,
-      codexMcpServers: [],
-    });
-    await session.start();
-    const p1 = session.send('one', { waitForComplete: true });
-    setTimeout(() => runTurn(proc, 'thread-mcp-resume'), 10);
-    await p1;
-
-    const proc2 = createMockProcess();
-    mockSpawn.mockImplementation((_cmd: string, args: string[]) => (args[0] === 'mcp' ? listProc(MCP_LIST) : proc2));
-    const p2 = session.send('two', { waitForComplete: true });
-    setTimeout(() => runTurn(proc2, 'thread-mcp-resume'), 10);
-    await p2;
-    // An empty selection is "no servers": the whole file is ignored natively.
-    const second = execCalls()[1][1] as string[];
-    expect(second.slice(0, 3)).toEqual(['exec', 'resume', 'thread-mcp-resume']);
-    expect(second).toContain('--ignore-user-config');
-    session.stop();
-  });
-
-  it('refuses to start on an unknown server name', async () => {
-    mockSpawn.mockImplementation(() => listProc(MCP_LIST));
-    const session = new PersistentCodexSession({
-      name: 'test',
-      cwd: '/tmp',
-      permissionMode: 'bypassPermissions',
-      ignoreUserConfig: true,
-      codexMcpServers: ['missing'],
-    });
-    await expect(session.start()).rejects.toThrow(/Unknown MCP server in codexMcpServers: missing/);
   });
 });

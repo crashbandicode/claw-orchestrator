@@ -15,10 +15,14 @@ import * as crypto from 'node:crypto';
 import { SessionManager } from './session-manager.js';
 import { sanitizeCwd, validateRegex } from './validation.js';
 import { resolveSecretRefs } from './kernel/secrets.js';
+import { summarize, type RunSummary } from './kernel/store.js';
 import { validateAutoloopTimeoutConfig } from './autoloop/types.js';
+import { isUnconfirmedChatNotice } from './autoloop/dispatcher.js';
+import { boundedErrorReason } from './sanitize.js';
 import type { EffortLevel, EngineType } from './types.js';
 import { handleChatCompletion } from './openai-compat.js';
 import { getModelList } from './models.js';
+import { MAX_UPLOAD_BODY_BYTES } from './ultraapp/files.js';
 
 import {
   DEFAULT_SERVER_PORT,
@@ -26,6 +30,7 @@ import {
   RATE_LIMIT_MAX_REQUESTS,
   RATE_LIMIT_WINDOW_MS,
   OPENAI_COMPAT_SESSION_PREFIX,
+  DEFAULT_MAX_ROUNDS,
 } from './constants.js';
 
 // Grace period for server.close() to drain connections before lingering
@@ -37,7 +42,11 @@ function autoloopErrorStatus(error: unknown): number {
   if (/^Autoloop run '.+' not found in registry$/.test(message)) return 404;
   if (/^Autoloop with id '.+' (?:already exists|is being deleted|is still starting)$/.test(message)) return 409;
   if (/^Autoloop session name '.+' is already in use$/.test(message)) return 409;
-  if (/^(?:Planner|Coder|Reviewer) engine '.+' is not supported$/.test(message)) return 400;
+  // The caller's workspace refuses the start; the same request succeeds once
+  // the worktree is clean and the run ledger can be ignored.
+  if (/^Autoloop workspace has uncommitted changes\b/.test(message)) return 409;
+  if (/^Autoloop could not isolate the run ledger from Git$/.test(message)) return 409;
+  if (/^(?:Planner|Coder|Reviewer) engine '.+' is not supported(?: by Autoloop)?$/.test(message)) return 400;
   if (/^(?:Planner|Coder|Reviewer) effort\b/.test(message)) return 400;
   // Any custom-engine config complaint is caller error, not a server fault.
   // The old form pinned a single dotted segment and the verb "must be", so
@@ -55,13 +64,19 @@ function autoloopErrorStatus(error: unknown): number {
 }
 
 /**
- * Custom engines name an arbitrary executable (`bin`) plus argv and env. That
- * is fine for a local, programmatic caller, but this HTTP surface is routinely
- * reverse-tunnelled to a public hostname, and its auth token is a *monitoring*
- * credential — it was never meant to confer "run any binary on the host".
- * Accepting a custom-engine object from the request body would turn any
- * dashboard session into remote code execution, so the network surface refuses
- * it outright. Built-in engines (the actual ask in #72) stay fully selectable.
+ * The HTTP token is a full-control credential: a request that carries it can
+ * already run commands as the server's user — a `bypassPermissions` session, a
+ * contract `command` check, the `launcher` of a session or a workflow `goal`
+ * node. So this refusal is not a security boundary, and nothing should rely on
+ * it as one; the threat model is in skills/references/getting-started.md
+ * (Security model).
+ *
+ * What it keeps is that credential-bearing engine configs — a binary, its argv
+ * and an env that usually carries credentials — never travel in request bodies
+ * or get stored in run specs (see kernel/secrets.ts). Over HTTP they are chosen
+ * by bundled preset id, or on autoloop resume by `*CustomEngineRef` name
+ * resolved from the server's environment. Built-in engines (the actual ask in
+ * #72) stay fully selectable.
  */
 //
 // Matched by SHAPE, not by an allowlist of known keys, and applied to every
@@ -71,7 +86,51 @@ function autoloopErrorStatus(error: unknown): number {
 // so `/session/start` handed the object straight to `startSession()`, which
 // dispatches it to `PersistentCustomSession` and spawns `bin`. A per-route
 // guard is only ever as good as the memory of whoever adds the next route.
-const CUSTOM_ENGINE_KEY = /custom_?engines?$/i;
+// `acpAgent` is the same thing for the `acp` engine: an inline config names the
+// command to run.
+const CUSTOM_ENGINE_KEY = /(custom_?engines?|acp_?agents?)$/i;
+
+/**
+ * The routes a GET (or HEAD) may reach: reads that change nothing. Every other
+ * route answers only POST. An allow-list rather than a list of state-changing
+ * routes, so a route added later, or a path `route()` also matches with extra
+ * segments (`/ultraapp/<id>/answer/x`), is refused by default.
+ */
+const READ_ROUTES = new Set([
+  '/health',
+  '/login',
+  '/dashboard',
+  '/dashboard/',
+  '/dashboard/index.html',
+  '/dash',
+  '/dash/',
+  '/session/list',
+  '/session/status',
+  '/session/grep',
+  '/session/cost',
+  '/session/team-list',
+  '/runs',
+  '/agents',
+  '/skills',
+  '/rules',
+  '/v1/models',
+  '/v1/sessions',
+  '/council/list',
+  '/workflow/list',
+  '/autoloop/list',
+  '/ultraapp/list',
+]);
+const READ_ROUTE_PATTERN =
+  /^\/(?:council\/[^/]+\/(?:state|events)|workflow\/[^/]+\/(?:state|evidence|events)|autoloop\/[^/]+\/(?:state|push_log|chat_history|events|resume-requirements)|ultraapp\/(?!new$)[^/]+(?:\/(?:artifacts|events))?)$/;
+
+function isReadRoute(path: string): boolean {
+  return READ_ROUTES.has(path) || READ_ROUTE_PATTERN.test(path);
+}
+
+/** A Host header naming this machine by a loopback name, with or without a port. */
+const LOOPBACK_HOST = /^(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/i;
+/** A browser Origin on this machine. 0.0.0.0 is a bind address, never a real Origin. */
+const LOOPBACK_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 const MAX_SCAN_DEPTH = 12;
 
 /**
@@ -121,8 +180,13 @@ function findCustomEngineKey(value: unknown, depth = 0, trail = ''): string | nu
  */
 function isInlineCustomEngine(value: unknown): boolean {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
-  const cfg = value as { bin?: unknown; binEnv?: unknown };
-  return typeof cfg.bin === 'string' || typeof cfg.binEnv === 'string';
+  const cfg = value as { bin?: unknown; binEnv?: unknown; command?: unknown; commandEnv?: unknown };
+  return (
+    typeof cfg.bin === 'string' ||
+    typeof cfg.binEnv === 'string' ||
+    typeof cfg.command === 'string' ||
+    typeof cfg.commandEnv === 'string'
+  );
 }
 
 function rejectCustomEngineOverHttp(body: unknown): string | null {
@@ -170,6 +234,63 @@ function sseSender(res: http.ServerResponse): (event: string, data: unknown) => 
 /** Test seam: the guard is invisible from outside, and an unguarded write throws where nothing catches it. */
 export const __sseSenderForTest = sseSender;
 
+/**
+ * The request target as a URL, or undefined when it is not an origin-form path
+ * this server serves. `//host/...` is a network-path reference, not a path, and
+ * some targets make `new URL` throw.
+ */
+export function parseRequestTarget(target: string | undefined, port: number): URL | undefined {
+  const raw = target || '/';
+  if (!raw.startsWith('/') || raw.startsWith('//')) return undefined;
+  try {
+    return new URL(raw, `http://localhost:${port}`);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Fail one request that threw outside a route's own handling, and keep serving. */
+function failRequest(res: http.ServerResponse, err: unknown): void {
+  console.warn(`[embedded-server] request failed: ${boundedErrorReason(err)}`);
+  try {
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    res.writeHead(500, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'Internal error' }));
+  } catch {
+    res.destroy();
+  }
+}
+
+/** Compare a presented secret with the expected one in constant time. */
+export function sameSecret(presented: string | null | undefined, expected: string): boolean {
+  if (typeof presented !== 'string') return false;
+  const a = Buffer.from(presented);
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
+/**
+ * Where `/login` sends the browser: a path on this server, never another site.
+ * Resolved the way a browser resolves `Location`, so `/\\evil.com`, a tab or
+ * newline inside `//`, and `/.//evil.com` cannot turn into another host.
+ */
+export function loginRedirectTarget(raw: string | null | undefined): string {
+  const fallback = '/dashboard';
+  if (!raw || !raw.startsWith('/')) return fallback;
+  const base = 'http://clawo.invalid';
+  let u: URL;
+  try {
+    u = new URL(raw, base);
+  } catch {
+    return fallback;
+  }
+  if (u.origin !== base || u.pathname.startsWith('//')) return fallback;
+  return u.pathname + u.search + u.hash;
+}
+
 export class EmbeddedServer {
   private server: http.Server | null = null;
   private manager: SessionManager;
@@ -191,9 +312,12 @@ export class EmbeddedServer {
     const now = Date.now();
     const window = this._rateWindows.get(ip) || [];
     const recent = window.filter((t) => now - t < RATE_LIMIT_WINDOW_MS);
-    recent.push(now);
     this._rateWindows.set(ip, recent);
-    return recent.length <= this._rateLimit;
+    // A refused request is not recorded: the window stays at most the limit
+    // long, and a client over it is let back in as soon as the window allows.
+    if (recent.length >= this._rateLimit) return false;
+    recent.push(now);
+    return true;
   }
 
   /**
@@ -202,6 +326,19 @@ export class EmbeddedServer {
    * We accept any 32+ hex-char string (the format crypto.randomBytes(32)
    * produces) — anything else is treated as garbage and rotated out.
    */
+  /**
+   * The token a request must carry right now, or undefined when auth is off.
+   * Read fresh: another clawo instance can rewrite the token file mid-life (see
+   * the request handler). The UltraApp router asks for it too, to keep it from
+   * app backends.
+   */
+  controlToken(): string | undefined {
+    if (!this.authToken) return undefined;
+    const env = process.env.OPENCLAW_SERVER_TOKEN;
+    if (typeof env === 'string' && env !== '' && env !== 'disabled') return env;
+    return this._readPersistedToken() ?? this.authToken;
+  }
+
   private _readPersistedToken(): string | null {
     const tokenPath = path.join(os.homedir(), '.openclaw', 'server-token');
     try {
@@ -246,7 +383,8 @@ export class EmbeddedServer {
       this.authToken = null;
       console.warn(
         '[embedded-server] OPENCLAW_SERVER_TOKEN=disabled — authentication is OFF. ' +
-          'All endpoints are reachable to any process that can connect. Only safe on a trusted single-user host.',
+          'All endpoints are reachable to any process that can connect; only loopback Host names and origins are served. ' +
+          'Only safe on a trusted single-user host.',
       );
     } else if (envToken) {
       this.authToken = envToken;
@@ -274,7 +412,16 @@ export class EmbeddedServer {
     this._rateLimitCleanupTimer.unref();
 
     return new Promise((resolve, reject) => {
-      this.server = http.createServer((req, res) => this.handleRequest(req, res));
+      // The boundary every request passes: a throw in the handler fails that
+      // request, never the process. In the OpenClaw plugin the process is the
+      // gateway itself.
+      this.server = http.createServer((req, res) => {
+        try {
+          this.handleRequest(req, res);
+        } catch (err) {
+          failRequest(res, err);
+        }
+      });
 
       this.server.on('error', (err: NodeJS.ErrnoException) => {
         // start() failed after the rate-limit timer was armed — clear it so it
@@ -299,8 +446,17 @@ export class EmbeddedServer {
         // Bound successfully — NOW persist the token. A second instance that
         // loses EADDRINUSE never reaches this callback and leaves the file alone.
         if (this.authToken) {
-          this._writeTokenFile(this.authToken);
-          const tokenFile = path.join(os.homedir(), '.openclaw', 'server-token');
+          // A server given its token through OPENCLAW_SERVER_TOKEN does not
+          // own the shared file when another server already wrote one: a
+          // second instance on another port would otherwise swap the token
+          // every file-reading client uses for the first one.
+          const persisted = this._readPersistedToken();
+          const envToken = process.env.OPENCLAW_SERVER_TOKEN;
+          const ownsFile = !envToken || !persisted || persisted === this.authToken;
+          if (ownsFile) this._writeTokenFile(this.authToken);
+          const tokenFile = ownsFile
+            ? path.join(os.homedir(), '.openclaw', 'server-token')
+            : 'none (token from OPENCLAW_SERVER_TOKEN)';
           console.log(`[embedded-server] Listening on http://${this.host}:${this.port} (auth enabled)`);
           console.log(`[embedded-server] Token file: ${tokenFile}`);
           // Only print the token-bearing convenience URL to an interactive TTY.
@@ -362,15 +518,53 @@ export class EmbeddedServer {
   }
 
   private handleRequest(req: http.IncomingMessage, res: http.ServerResponse): void {
-    // CORS — localhost by default; /v1/ paths allow all origins (for webchat frontends)
+    // With auth off (OPENCLAW_SERVER_TOKEN=disabled) only the network guards the
+    // agents behind these routes, so a web page in a browser on this host must
+    // not reach them. A DNS-rebound hostname arrives with a foreign Host; a page
+    // on another site sends its Origin (on every cross-origin POST, preflighted
+    // or not) or, for a plain <img>/<script> GET, Sec-Fetch-Site: cross-site.
+    // While auth is off, serve only loopback Host names and loopback origins.
+    const authOff = !this.authToken;
+    if (authOff) {
+      const reqOrigin = req.headers.origin;
+      const foreignHost = !LOOPBACK_HOST.test(req.headers.host ?? '');
+      const foreignOrigin = reqOrigin !== undefined && !LOOPBACK_ORIGIN.test(reqOrigin);
+      const crossSiteNoOrigin = reqOrigin === undefined && req.headers['sec-fetch-site'] === 'cross-site';
+      if (foreignHost || foreignOrigin || crossSiteNoOrigin) {
+        req.resume();
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            ok: false,
+            error:
+              'Authentication is disabled, so only requests from this host (Host and Origin localhost, 127.0.0.1 or [::1]) are served',
+          }),
+        );
+        return;
+      }
+    }
+
+    // Parsed once, here, before anything reads it. `new URL()` throws on a target
+    // such as `//[/` (a network-path reference with an invalid host), and a throw
+    // from this listener is uncaught: it would end the process, which for the
+    // plugin is the OpenClaw Gateway, before any token check. A target that
+    // parses but is not a path (`//host/...`) is refused too.
+    const url = parseRequestTarget(req.url, this.port);
+    if (!url) {
+      req.resume();
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'Invalid request target' }));
+      return;
+    }
+    const path = url.pathname;
+
+    // CORS — localhost by default; with auth on, /v1/ paths allow all origins
+    // (for webchat frontends) and OPENCLAW_CORS_ORIGINS=* allows all paths.
     const origin = req.headers.origin || '';
-    const urlPath = new URL(req.url || '/', `http://localhost:${this.port}`).pathname;
     const corsAllowAll = process.env.OPENCLAW_CORS_ORIGINS === '*';
-    const isV1Path = urlPath.startsWith('/v1/');
-    // 0.0.0.0 is a bind/wildcard address, never a legitimate browser Origin —
-    // don't reflect it back as an allowed CORS origin.
-    const isLocalhost = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/.test(origin);
-    if (isLocalhost || isV1Path || corsAllowAll) {
+    const isV1Path = path.startsWith('/v1/');
+    const isLocalhost = LOOPBACK_ORIGIN.test(origin);
+    if (isLocalhost || (!authOff && (isV1Path || corsAllowAll))) {
       res.setHeader('Access-Control-Allow-Origin', origin || '*');
     }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
@@ -384,8 +578,18 @@ export class EmbeddedServer {
       return;
     }
 
-    const url = new URL(req.url || '/', `http://localhost:${this.port}`);
-    const path = url.pathname;
+    // Health answers before authentication, rate limiting and body reading. It
+    // needs none of them, and it is the one route open without a token, so a
+    // request to it must neither have its body buffered nor count against the
+    // rate limit that authenticated clients from the same address share.
+    if (path === '/health') {
+      req.resume();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(
+        JSON.stringify({ ok: true, version: this.manager.getVersion(), sessions: this.manager.listSessions().length }),
+      );
+      return;
+    }
 
     // Auth: accept Bearer header, `clawo_auth` cookie, or `?token=` query.
     // We re-read ~/.openclaw/server-token PER REQUEST (64-byte read, kernel
@@ -394,23 +598,17 @@ export class EmbeddedServer {
     // mid-life; a reverse proxy that reads the file fresh on every request
     // would then inject a token we no longer hold, and we would 401 everything
     // it forwards.
-    if (this.authToken && path !== '/health') {
-      const envExplicit =
-        typeof process.env.OPENCLAW_SERVER_TOKEN === 'string' &&
-        process.env.OPENCLAW_SERVER_TOKEN !== '' &&
-        process.env.OPENCLAW_SERVER_TOKEN !== 'disabled';
-      const liveToken = envExplicit
-        ? (process.env.OPENCLAW_SERVER_TOKEN as string)
-        : (this._readPersistedToken() ?? this.authToken);
+    if (this.authToken) {
+      const liveToken = this.controlToken() as string;
 
       const authHeader = req.headers.authorization || '';
       const queryToken = url.searchParams.get('token');
       const cookieHeader = req.headers.cookie || '';
       const cookieToken = /(?:^|;\s*)clawo_auth=([^;]+)/.exec(cookieHeader)?.[1];
 
-      const bearerOk = authHeader === `Bearer ${liveToken}`;
-      const queryOk = queryToken === liveToken;
-      const cookieOk = cookieToken === liveToken;
+      const bearerOk = sameSecret(authHeader, `Bearer ${liveToken}`);
+      const queryOk = sameSecret(queryToken, liveToken);
+      const cookieOk = sameSecret(cookieToken, liveToken);
 
       if (!bearerOk && !queryOk && !cookieOk) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -440,10 +638,31 @@ export class EmbeddedServer {
       return;
     }
 
+    // Only reads answer GET/HEAD; everything else answers only POST. route() does
+    // not look at the method and gives a non-POST request an empty body, so
+    // without this a GET ran state-changing routes: GET /session/start started a
+    // session, and an <img> on a same-site page could answer a workflow gate.
+    const readMethod = req.method === 'GET' || req.method === 'HEAD';
+    if (req.method !== 'POST' && !(readMethod && isReadRoute(path))) {
+      req.resume();
+      const message = 'This route accepts only POST';
+      res.writeHead(405, { 'Content-Type': 'application/json', Allow: 'POST' });
+      res.end(
+        JSON.stringify(
+          path.startsWith('/v1/')
+            ? { error: { message, type: 'invalid_request_error' } }
+            : { ok: false, error: message },
+        ),
+      );
+      return;
+    }
+
     // Read body for POST — require JSON content type (CSRF mitigation)
     if (req.method === 'POST') {
       const contentType = req.headers['content-type'] || '';
-      if (!contentType.includes('application/json')) {
+      // The media type itself, not a substring: `text/plain;application/json` is a
+      // CORS-safelisted type a cross-site page can send without a preflight.
+      if (contentType.split(';')[0].trim().toLowerCase() !== 'application/json') {
         // Drain before answering. Ending a response while the peer is still
         // writing lets the connection be torn down under it, which surfaces on
         // the client as `write ECONNRESET` — and in a test run as a non-zero exit
@@ -456,12 +675,15 @@ export class EmbeddedServer {
         res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
         return;
       }
+      // An ultraapp upload carries the file itself, base64 inside JSON, so that
+      // one route is sized to the upload limit; every other body stays small.
+      const bodyLimit = /^\/ultraapp\/[^/]+\/files$/.test(path) ? MAX_UPLOAD_BODY_BYTES : MAX_BODY_SIZE;
       let body = '';
       let aborted = false;
       req.on('data', (chunk) => {
         if (aborted) return;
         body += chunk;
-        if (body.length > MAX_BODY_SIZE) {
+        if (body.length > bodyLimit) {
           aborted = true;
           res.writeHead(413, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: 'Payload too large' }));
@@ -478,10 +700,10 @@ export class EmbeddedServer {
           res.end(JSON.stringify({ ok: false, error: 'Invalid JSON' }));
           return;
         }
-        this.route(path, parsed, url.searchParams, res, req.headers);
+        this.route(path, parsed, url.searchParams, res, req.headers).catch((err) => failRequest(res, err));
       });
     } else {
-      this.route(path, {}, url.searchParams, res, req.headers);
+      this.route(path, {}, url.searchParams, res, req.headers).catch((err) => failRequest(res, err));
     }
   }
 
@@ -664,13 +886,6 @@ export class EmbeddedServer {
         return;
       }
 
-      // ─── Health ──────────────────────────────────────────────────
-
-      if (path === '/health') {
-        json(200, { ok: true, version: this.manager.getVersion(), sessions: this.manager.listSessions().length });
-        return;
-      }
-
       // ─── OpenAI-Compatible Routes ─────────────────────────────
 
       if (path === '/v1/chat/completions') {
@@ -729,10 +944,7 @@ export class EmbeddedServer {
       if (path === '/login') {
         // Auth gate above already passed (queryOk set the cookie via Set-Cookie),
         // so reaching here means the token is valid.
-        const raw = query.get('redirect') || '/dashboard';
-        // Same-origin only: must start with '/', not '//', and contain no scheme.
-        const safe = /^\/(?!\/)/.test(raw) && !/^\/[a-z][a-z0-9+.-]*:/i.test(raw) ? raw : '/dashboard';
-        res.writeHead(302, { Location: safe });
+        res.writeHead(302, { Location: loginRedirectTarget(query.get('redirect')) });
         res.end();
         return;
       }
@@ -820,14 +1032,14 @@ export class EmbeddedServer {
               persona:
                 'You are agent A, a careful planner. Lay out the approach and architecture before changing code.',
               engine: 'claude',
-              model: 'claude-opus-4-7',
+              model: 'opus',
             },
             {
               name: 'agent-B',
               emoji: '🟠',
               persona: 'You are agent B, a pragmatic implementer. Make the change small, focused, and review-ready.',
               engine: 'claude',
-              model: 'claude-opus-4-7',
+              model: 'opus',
             },
             {
               name: 'agent-C',
@@ -835,10 +1047,10 @@ export class EmbeddedServer {
               persona:
                 'You are agent C, a critical reviewer. Block consensus until the quality bar is met — be specific about what is missing.',
               engine: 'claude',
-              model: 'claude-opus-4-7',
+              model: 'opus',
             },
           ],
-          maxRounds: (body as { maxRounds?: number }).maxRounds ?? 15,
+          maxRounds: (body as { maxRounds?: number }).maxRounds ?? DEFAULT_MAX_ROUNDS,
           defaultPermissionMode: 'bypassPermissions',
         });
         json(200, { ok: true, id: session.id, status: session.status });
@@ -858,9 +1070,10 @@ export class EmbeddedServer {
 
       // ─── Workflow kernel — list / new / state / control / evidence / SSE ─
       //
-      // Same conventions as /runs and /autoloop/*: any method reaches the route,
-      // POST bodies win over query params, and the whole block sits behind the
-      // shared auth + rate limit.
+      // Reads (list, state, evidence, events) answer GET as well as POST, with POST
+      // bodies winning over query params; the actions (new, cancel, resume, steer,
+      // approve) answer only POST. The whole block sits behind the shared auth +
+      // rate limit.
 
       if (path === '/workflow/list') {
         json(200, {
@@ -899,7 +1112,14 @@ export class EmbeddedServer {
             Connection: 'keep-alive',
           });
           const send = sseSender(res);
-          const snapshot = this.manager.workflowList({ limit: 1000 }).find((r) => r.runId === runId);
+          // Read the named run itself: a listing is capped and newest first, so
+          // an older run would open with no snapshot.
+          let snapshot: RunSummary | undefined;
+          try {
+            snapshot = summarize(this.manager.workflowStatus(runId));
+          } catch {
+            // Unknown or unreadable run — the stream opens without a snapshot.
+          }
           if (snapshot) send('snapshot', snapshot);
           const unsubscribe = this.manager.onWorkflowEvent((e) => {
             if (e.runId === runId) send('workflow-event', e.event);
@@ -932,7 +1152,12 @@ export class EmbeddedServer {
               json(200, { ok: true, ...this.manager.workflowSteer(runId, String(body.text ?? '')) });
               return;
             case 'approve':
-              json(200, { ok: true, ...(await this.manager.workflowApprove(runId, body.approved !== false)) });
+              // Only an explicit boolean answers a gate: an empty body is not an approval.
+              if (typeof body.approved !== 'boolean') {
+                json(400, { ok: false, error: 'approve requires `approved`: true or false' });
+                return;
+              }
+              json(200, { ok: true, ...(await this.manager.workflowApprove(runId, body.approved)) });
               return;
             case 'evidence': {
               const bundle = this.manager.workflowEvidence(
@@ -1121,14 +1346,23 @@ export class EmbeddedServer {
         const pathMod = await import('node:path');
         const file = pathMod.join(status.ledger_dir, 'chat.jsonl');
         const lines: unknown[] = [];
+        // One notice may be appended more than once; its timestamp is its identity.
+        const noticeTimestamps = new Set<string>();
         if (fsMod.existsSync(file)) {
           for (const line of fsMod.readFileSync(file, 'utf-8').split('\n')) {
             if (!line.trim()) continue;
+            let entry: unknown;
             try {
-              lines.push(JSON.parse(line));
+              entry = JSON.parse(line);
             } catch {
               /* skip malformed line */
+              continue;
             }
+            if (isUnconfirmedChatNotice(entry)) {
+              if (noticeTimestamps.has(entry.ts)) continue;
+              noticeTimestamps.add(entry.ts);
+            }
+            lines.push(entry);
           }
         }
         json(200, { ok: true, entries: lines });
@@ -1250,7 +1484,8 @@ export class EmbeddedServer {
         }
         // Validate run exists synchronously so 404 surfaces cleanly. After
         // this point we hand the message off to the runner and return.
-        if (!this.manager.getAutoloop(id)) {
+        const live = this.manager.getAutoloop(id);
+        if (!live) {
           // Only a run the store still holds can be resumed; anything else —
           // a mistyped id included — is simply not found. MCP and CLI callers
           // use this endpoint too, so the hint names the API, not a button.
@@ -1268,13 +1503,22 @@ export class EmbeddedServer {
           });
           return;
         }
-        this.manager.autoloopChat(id, text).catch((err) => {
+        // 202 means the chat is in the run checkpoint, not that the Planner
+        // has it: acceptance is synchronous, delivery is not.
+        let env: ReturnType<SessionManager['acceptAutoloopChat']>;
+        try {
+          env = this.manager.acceptAutoloopChat(id, text);
+        } catch (err) {
+          json(autoloopErrorStatus(err), { ok: false, error: (err as Error).message });
+          return;
+        }
+        json(202, { ok: true, queued: true });
+        void live.runner.send(env).catch((err: unknown) => {
           // Late failures (planner errors, runner shutdown mid-dispatch) flow
           // to SSE as planner_error events; this catch only exists to keep
           // unhandled rejection from crashing the server.
-          console.warn(`[autoloop/${id}] chat dispatch failed: ${(err as Error).message}`);
+          console.warn(`[autoloop/${id}] chat dispatch failed: ${boundedErrorReason(err)}`);
         });
-        json(202, { ok: true, queued: true });
         return;
       }
 
@@ -1521,7 +1765,10 @@ export class EmbeddedServer {
       }
     } catch (err) {
       const message = (err as Error).message;
-      if (path.startsWith('/v1/')) {
+      // A route that already answered, or opened a stream, cannot get a 500 too.
+      if (res.headersSent) {
+        res.destroy();
+      } else if (path.startsWith('/v1/')) {
         res.writeHead(500, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: { message, type: 'server_error', code: null } }));
       } else {

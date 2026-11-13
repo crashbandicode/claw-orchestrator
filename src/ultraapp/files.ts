@@ -4,7 +4,14 @@ import * as path from 'node:path';
 import * as crypto from 'node:crypto';
 import { spawn } from 'node:child_process';
 
-const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+export const MAX_UPLOAD_BYTES = 100 * 1024 * 1024;
+
+/**
+ * The request body `POST /ultraapp/<id>/files` must accept for an upload of
+ * {@link MAX_UPLOAD_BYTES}: the file travels base64-encoded inside JSON, which is
+ * 4/3 of its size, plus a small envelope for the filename.
+ */
+export const MAX_UPLOAD_BODY_BYTES = Math.ceil(MAX_UPLOAD_BYTES / 3) * 4 + 64 * 1024;
 
 export interface PathValidationOptions {
   allow: string[];
@@ -78,12 +85,23 @@ export async function extractMetadata(p: string, opts: ExtractMetaOptions = {}):
   } catch {
     /* missing file — return empty */
   }
-  const fileRes = await runner('file', [p]);
+  // `--` and the `file:` protocol: a path is only ever a path, never an option or a URL.
+  const fileRes = await runner('file', ['--', p]);
   if (fileRes.ok) {
     const m = fileRes.stdout.trim();
     meta.fileType = m.includes(': ') ? m.slice(m.indexOf(': ') + 2) : m;
   }
-  const ffRes = await runner('ffprobe', ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', p]);
+  const ffRes = await runner('ffprobe', [
+    '-v',
+    'quiet',
+    '-protocol_whitelist',
+    'file',
+    '-print_format',
+    'json',
+    '-show_format',
+    '-show_streams',
+    `file:${p}`,
+  ]);
   if (ffRes.ok && ffRes.stdout.trim().length > 0) {
     try {
       meta.ffprobe = JSON.parse(ffRes.stdout);

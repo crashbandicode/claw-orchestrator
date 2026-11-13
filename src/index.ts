@@ -24,14 +24,21 @@ import {
   type CustomEngineConfig,
   PARENT_TOOL_IDS,
 } from './types.js';
+import { RemoteEndpoint } from './remote/endpoint.js';
+import type { BrokerMethod } from './remote/protocol.js';
 import type { FanoutConfig } from './fanout.js';
-import { councilWorkflow, fanoutWorkflow, solveWorkflow, type SolveArgs } from './kernel/templates/index.js';
-import { readEvents as readKernelEvents } from './kernel/store.js';
+import {
+  councilWorkflow,
+  fanoutWorkflow,
+  goalWorkflow,
+  solveWorkflow,
+  type GoalArgs,
+  type SolveArgs,
+} from './kernel/templates/index.js';
+import { isValidRunId, readEvents as readKernelEvents } from './kernel/store.js';
 import { resolveSecretRefs } from './kernel/secrets.js';
 import type { RunState, WorkflowSpec } from './kernel/types.js';
 import { AUTOLOOP_TIMEOUT_SCHEMA, validateAutoloopTimeoutConfig } from './autoloop/types.js';
-import { RemoteEndpoint } from './remote/endpoint.js';
-import type { BrokerMethod } from './remote/protocol.js';
 
 const REMOTE_CALL_PROPERTIES = {
   host: {
@@ -57,12 +64,14 @@ export { SessionManager } from './session-manager.js';
 export { PersistentClaudeSession } from './persistent-session.js';
 export { BaseOneShotSession, type OneShotEngineConfig } from './base-oneshot-session.js';
 export { PersistentCodexSession } from './persistent-codex-session.js';
+export { PersistentCodexAppServerSession } from './persistent-codex-app-session.js';
 export { PersistentGeminiSession } from './persistent-gemini-session.js';
 export { PersistentAgySession } from './persistent-agy-session.js';
 export { PersistentCursorSession } from './persistent-cursor-session.js';
 export { PersistentGrokSession } from './persistent-grok-session.js';
 export { PersistentOpencodeSession } from './persistent-opencode-session.js';
 export { PersistentCustomSession } from './persistent-custom-session.js';
+export { PersistentAcpSession } from './persistent-acp-session.js';
 export { Council, getDefaultCouncilConfig } from './council.js';
 export { AutoloopRunner } from './autoloop/runner.js';
 export { ClaudeAgentDispatcher } from './autoloop/dispatcher.js';
@@ -71,6 +80,7 @@ export type { AutoloopEnvelope, AnyAutoloopMessage, AutoloopMessageType, Autoloo
 export type { AgentDispatcher, AutoloopConfig, AutoloopState, AutoloopStatus, PushPolicy } from './autoloop/types.js';
 export { parseConsensus, stripConsensusTags, hasConsensusMarker } from './consensus.js';
 export { sanitizeCwd, validateRegex, validateName } from './validation.js';
+export type { SafeRegex } from './validation.js';
 export { type Logger, createConsoleLogger, nullLogger } from './logger.js';
 export { CircuitBreaker } from './circuit-breaker.js';
 export { InboxManager, type SessionLookup } from './inbox-manager.js';
@@ -106,7 +116,7 @@ interface PluginAPI {
     match?: string;
     handler: (...args: unknown[]) => Promise<boolean>;
   }): void;
-  registerService(def: { id: string; start: () => void; stop: () => void | Promise<void> }): void;
+  registerService(def: { id: string; start: () => void; stop: () => void }): void;
 }
 
 function isAgentToolResult(result: unknown): result is AgentToolResult {
@@ -128,6 +138,37 @@ function normalizeToolResult(result: unknown): AgentToolResult {
     details: result,
   };
 }
+
+const ACP_AGENT_SCHEMA = {
+  description:
+    'The ACP agent (required when engine is "acp"): the id of a bundled preset (`clawo engines`), or, from a local caller only, an inline config.',
+  oneOf: [
+    { type: 'string', description: 'Preset id, e.g. "kimi-code"' },
+    {
+      type: 'object',
+      properties: {
+        name: { type: 'string', description: 'Display name' },
+        command: { type: 'string', description: 'Command that serves ACP on stdio' },
+        commandEnv: { type: 'string', description: 'Env var that overrides command' },
+        args: { type: 'array', items: { type: 'string' }, description: 'Arguments, e.g. ["acp"]' },
+        env: { type: 'object', additionalProperties: { type: 'string' } },
+      },
+      required: ['name', 'command'],
+    },
+  ],
+};
+
+/**
+ * `acpAgent` on the surfaces that write their agents into a stored run spec
+ * (fan-out, council, workflow templates): a preset id only. An inline config can
+ * carry an environment, and the spec is written to disk.
+ */
+const AUTOLOOP_ENGINES = ENGINE_TYPES.filter((e) => e !== 'acp');
+
+const ACP_AGENT_ID_SCHEMA = {
+  type: 'string',
+  description: 'With engine "acp": the id of a bundled ACP agent preset (`clawo engines`), such as kimi-code or dsh.',
+};
 
 const CUSTOM_ENGINE_SCHEMA = {
   type: 'object',
@@ -178,13 +219,25 @@ const CUSTOM_ENGINE_SCHEMA = {
 } as const;
 
 /**
+ * `customEngine` on the surfaces that also take a preset id: session_start,
+ * session_handoff and council agents all reach `_createSession`, which expands a
+ * string through resolveCustomEngine. Autoloop roles validate an inline config
+ * and take CUSTOM_ENGINE_SCHEMA itself.
+ */
+const CUSTOM_ENGINE_OR_PRESET_SCHEMA = {
+  description:
+    'Custom engine (required when engine is "custom"): the id of a bundled preset (`clawo engines`), or, from a local caller only, an inline config.',
+  oneOf: [{ type: 'string', description: 'Preset id, e.g. "zcode"' }, CUSTOM_ENGINE_SCHEMA],
+};
+
+/**
  * OpenClaw plugin object — standard format
  */
 const plugin = {
   id: 'claw-orchestrator',
   name: 'Claw Orchestrator',
   description:
-    'Run Claude Code, Codex, Antigravity, Grok Build, OpenCode and custom coding CLIs as one unified runtime — persistent sessions, multi-agent council, worktree isolation, multi-model proxy',
+    'Run Claude Code, Codex, Antigravity, Grok Build, OpenCode, any ACP agent and custom coding CLIs as one unified runtime — persistent sessions, multi-agent council, worktree isolation, multi-model proxy',
 
   register(api: PluginAPI): void {
     const rawConfig = (api.pluginConfig || {}) as Partial<PluginConfig>;
@@ -252,7 +305,6 @@ const plugin = {
       delete body.stream;
       delete body.executionHost;
       delete body.remoteSessionHandle;
-      // Mailbox wait is the broker operation. Other tools use waitTimeout only as the controller wait.
       const clientWait = method === 'thread.wait' ? undefined : waitTimeout;
       if (method !== 'thread.wait') delete body.waitTimeout;
       return remote.call(host, method, body, { operationId, waitTimeoutMs: clientWait });
@@ -302,7 +354,7 @@ const plugin = {
     registerTool({
       name: 'session_start',
       description:
-        'Start a persistent coding session. Engines: claude (default) for the Claude Code CLI, codex for the OpenAI Codex CLI, agy for the Google Antigravity CLI, grok for the xAI Grok Build CLI, opencode for the sst/opencode CLI, or custom for any user-configured coding agent CLI.',
+        'Start a persistent coding session. Engines: claude (default) for the Claude Code CLI, codex for the OpenAI Codex CLI, agy for the Google Antigravity CLI, grok for the xAI Grok Build CLI, opencode for the sst/opencode CLI, acp for any Agent Client Protocol agent (Kimi Code, dsh, OpenCode, Claude Code via an ACP adapter), or custom for any user-configured coding agent CLI.',
       parameters: {
         type: 'object',
         properties: {
@@ -312,14 +364,19 @@ const plugin = {
             type: 'string',
             enum: ENGINE_TYPES,
             description:
-              'Engine to use (default: claude). codex = `codex exec` per send (no /goal). codex-app = long-running `codex app-server` with thread/goal RPCs and codex_side. cursor = `cursor-agent`; `cursor_goal_set` sends `/goal` and that process keeps working while the goal is active. agy = Google Antigravity CLI (Gemini CLI successor; plain-text output, tokens estimated, conversation resume handled automatically). opencode = sst/opencode CLI (provider-agnostic; pass model as `provider/model`). Use "custom" with customEngine config for any CLI.',
+              'Engine to use (default: claude). codex = `codex exec` per send (no /goal). codex-app = long-running `codex app-server` with /goal support. agy = Google Antigravity CLI (stream-json output with reported token usage; the conversation is resumed by its id on each send). grok = xAI Grok Build CLI (reports its own per-turn cost). opencode = sst/opencode CLI (provider-agnostic; pass model as `provider/model`). acp = any Agent Client Protocol agent, chosen with acpAgent. Use "custom" with customEngine config for any CLI. gemini and cursor are legacy, kept for existing callers: use agy and grok instead.',
           },
           model: { type: 'string', description: 'Model to use (opus, sonnet, haiku, gpt-5.5, agy-pro, etc.)' },
+          claudeAccount: {
+            type: 'string',
+            description:
+              "Claude engine only. The Claude account to run under, by name from the server's claude-accounts.json, or 'auto' for the first available one in its rotation. A session on an account in the rotation moves to the next account when it reaches its usage limit and continues the same conversation. Omit for the file's default, else the CLI's own login.",
+          },
           permissionMode: {
             type: 'string',
             enum: ['acceptEdits', 'bypassPermissions', 'default', 'manual', 'dontAsk', 'plan', 'auto'],
           },
-          effort: { type: 'string', enum: EFFORT_LEVELS },
+          effort: { type: 'string', enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'auto'] },
           allowedTools: {
             type: 'array',
             maxItems: 200,
@@ -327,8 +384,27 @@ const plugin = {
             description: 'Tools to auto-approve',
           },
           disallowedTools: { type: 'array', maxItems: 200, items: { type: 'string' }, description: 'Tools to deny' },
+          tools: {
+            type: ['string', 'array'],
+            items: { type: 'string' },
+            description:
+              'Claude engine only. The built-in tool set (`--tools`): names such as ["Bash", "Edit", "Read"], "" for none, or "default".',
+          },
+          addDir: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Directories the session may use besides cwd (`--add-dir`). Claude and Codex; a resumed Codex thread keeps the directories its first turn opened.',
+          },
           maxTurns: { type: 'number', description: 'Max agent loop turns' },
           maxBudgetUsd: { type: 'number', description: 'Max API spend (USD)' },
+          autoCompactPercent: {
+            type: 'number',
+            minimum: 1,
+            maximum: 99,
+            description:
+              'Compact the conversation before a send once context use reaches this percentage. Off by default; for long-lived sessions, where cost grows with context size',
+          },
           systemPrompt: { type: 'string', description: 'Replace system prompt' },
           appendSystemPrompt: {
             type: 'string',
@@ -351,16 +427,27 @@ const plugin = {
             description: 'MCP server config file(s)',
           },
           settings: { type: 'string', description: 'Settings.json path or inline JSON' },
+          pluginUrl: {
+            type: ['string', 'array'],
+            items: { type: 'string' },
+            description: 'Claude engine only. Plugin .zip URL(s) fetched for this session only (`--plugin-url`).',
+          },
           ultracode: {
             type: 'boolean',
             description:
-              'Claude engine only. Enable "ultracode" / dynamic workflows: Claude plans a JS orchestration script per substantive task and fans out to subagents. Injected as the ultracode:true settings key (not a --effort value).',
+              'Claude engine only. Enable "ultracode" / dynamic workflows: Claude plans a JS orchestration script per substantive task and fans out to subagents. Injected as the ultracode:true settings key (not a --effort value). A workflow runs in the background: session_send returns the launch reply, and the completion arrives later in a turn that no send returns.',
           },
           sandboxMode: {
             type: 'string',
             enum: ['read-only', 'workspace-write', 'danger-full-access'],
             description:
-              'Sandbox policy. Codex supports all values; other built-in engines map read-only to their native plan/read-only mode.',
+              'Sandbox policy. Codex supports all values (default workspace-write). read-only is enforced on claude, agy, grok and opencode through their own plan/read-only modes; a custom engine must map it via permissionModes or the session refuses to start. The acp engine refuses read-only, because the agent runs its own tools; its permission answers follow permissionMode.',
+          },
+          launcher: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              'Argv prefix every engine process of this session runs under, e.g. a sandbox wrapper: ["/opt/sandbox.sh", "task"]. Any engine. It runs with your authority, like a contract command check.',
           },
           codexProfile: {
             type: 'string',
@@ -370,14 +457,13 @@ const plugin = {
           ignoreUserConfig: {
             type: 'boolean',
             description:
-              "Codex engines only (codex, codex-app). Start without the user's Codex MCP servers, so the session is decided by what the caller passed rather than by the machine's own Codex config. engine codex also skips $CODEX_HOME/config.toml altogether (`codex exec --ignore-user-config`); codex-app, which has no such flag, disables each configured server with `-c` and a same-type inert transport stub derived from `transport.type`, while still reading the rest of the file. Auth still resolves from CODEX_HOME. Keep specific servers with codexMcpServers.",
+              "Codex engines (`codex`, `codex-app`). Run without the user's MCP servers. With no `codexMcpServers` selection this is `codex exec --ignore-user-config`. With a selection, those named servers stay and the rest are disabled. Auth still resolves from CODEX_HOME.",
           },
           codexMcpServers: {
             type: 'array',
-            maxItems: 64,
-            items: { type: 'string', pattern: '^[A-Za-z0-9_-]{1,64}$' },
+            items: { type: 'string' },
             description:
-              "Codex engines only, and only with ignoreUserConfig: true. Names of MCP servers to keep from the user's Codex config; every other configured server is switched off. Omitted or empty = no MCP servers. A name the config does not define, or has disabled, fails the start with the available names. With a selection the engine codex no longer uses --ignore-user-config (it would drop the selected definitions), so the rest of config.toml loads too; explicit model, sandbox and effort still win. The resolver uses only server names, enabled state, and transport.type; configured commands, URLs, headers, tokens and env are never retained, logged or passed to a command line.",
+              'Codex engines only, and only with ignoreUserConfig. MCP server names to keep from the user config. An unknown or disabled name is rejected. Commands, URLs, headers, and tokens are never read.',
           },
           restricted: {
             type: 'boolean',
@@ -403,6 +489,11 @@ const plugin = {
           forwardSubagentText: {
             type: 'boolean',
             description: 'Forward subagent text and thinking into the output stream (Claude engine)',
+          },
+          chrome: {
+            type: 'boolean',
+            description:
+              "Let the session use the user's Chrome through the Claude in Chrome extension, with its sign-ins (Claude engine; off by default)",
           },
           permissionPromptTool: {
             type: 'string',
@@ -459,11 +550,12 @@ const plugin = {
             description:
               'AWS Bedrock service tier (sets ANTHROPIC_BEDROCK_SERVICE_TIER). Only effective when routing through Bedrock.',
           },
-          customEngine: CUSTOM_ENGINE_SCHEMA,
+          customEngine: CUSTOM_ENGINE_OR_PRESET_SCHEMA,
+          acpAgent: ACP_AGENT_SCHEMA,
           resumeSessionId: {
             type: 'string',
             description:
-              'Resume an existing native engine session. For codex-app, use the full stats.codexThreadId (also returned as stats.sessionId), never a legacy codex-app wrapper ID. A failed or mismatched Codex resume returns an error without starting a new thread.',
+              "Resume an earlier conversation by the engine's own id instead of starting fresh: a Claude Code session id (`--resume`), a Codex or codex-app thread id, an Antigravity conversation id, a Grok or OpenCode session id, an ACP agent's session id, or a custom engine's id when its config maps a resume flag. A registered manual thread is resumed from its native session id when this is omitted.",
           },
           parentMachineId: {
             type: 'string',
@@ -471,8 +563,7 @@ const plugin = {
           },
           parentSessionId: {
             type: 'string',
-            description:
-              'Exact parent native thread or session id. A first-line MEMENTO-DELEGATE-FROM marker can fill this later if omitted.',
+            description: 'Exact parent native thread or session id.',
           },
           parentToolId: {
             type: 'string',
@@ -513,10 +604,15 @@ const plugin = {
           message: { type: 'string', description: 'Message to send' },
           effort: {
             type: 'string',
-            enum: EFFORT_LEVELS.filter((level) => level !== 'auto'),
-            description: 'Effort for this message',
+            enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+            description:
+              'Effort for this message. agy, grok and opencode pass it to the engine for this turn; on claude, high and above prefix the message with `ultrathink` (a persistent custom engine does the same for high and max). Other engines ignore it.',
           },
-          plan: { type: 'boolean', description: 'Enable plan mode' },
+          plan: {
+            type: 'boolean',
+            description:
+              'Ask for a plan only: claude and persistent custom engines prefix the message with a plan-only instruction. The permission mode is unchanged (start with sandboxMode read-only to enforce it); other engines ignore this flag.',
+          },
           timeout: { type: 'number', description: 'Timeout in ms (default 300000)' },
           stream: {
             type: 'boolean',
@@ -529,26 +625,29 @@ const plugin = {
       },
       execute: async (_id, args) => {
         return callRouted('session.send', args, async () => {
-          const wantChunks = args.stream as boolean | undefined;
-          const chunks: string[] = [];
+        const wantChunks = args.stream as boolean | undefined;
+        const chunks: string[] = [];
 
-          const result = await getManager().sendMessage(args.name as string, args.message as string, {
-            effort: args.effort as EffortLevel | undefined,
-            plan: args.plan as boolean | undefined,
-            timeout: args.timeout as number | undefined,
-            // When stream:true, collect chunks into array for caller.
-            // True mid-tool streaming requires SDK-level support (not yet available).
-            onChunk: wantChunks
-              ? (chunk: string) => {
-                  chunks.push(chunk);
-                }
-              : undefined,
-          });
-          return {
-            ok: true,
-            ...result,
-            ...(wantChunks ? { chunks } : {}),
-          };
+        const result = await getManager().sendMessage(args.name as string, args.message as string, {
+          effort: args.effort as EffortLevel | undefined,
+          plan: args.plan as boolean | undefined,
+          timeout: args.timeout as number | undefined,
+          // When stream:true, collect chunks into array for caller.
+          // True mid-tool streaming requires SDK-level support (not yet available).
+          onChunk: wantChunks
+            ? (chunk: string) => {
+                chunks.push(chunk);
+              }
+            : undefined,
+        });
+        return {
+          // A turn that failed (an error result, or an engine that exited mid-turn)
+          // comes back with `error` set; `ok` says the same, so a caller that reads
+          // only `ok` does not take an unfinished turn for a reply.
+          ok: !result.error,
+          ...result,
+          ...(wantChunks ? { chunks } : {}),
+        };
         });
       },
     });
@@ -579,7 +678,8 @@ const plugin = {
             description:
               'Upper bound on the carried history, in characters (default 240000, minimum 4000). When the conversation is longer, the opening request and the newest turns are kept and the turns between them are left out.',
           },
-          customEngine: CUSTOM_ENGINE_SCHEMA,
+          customEngine: CUSTOM_ENGINE_OR_PRESET_SCHEMA,
+          acpAgent: ACP_AGENT_SCHEMA,
         },
         required: ['name', 'engine'],
       },
@@ -591,6 +691,7 @@ const plugin = {
           message: args.message as string | undefined,
           maxChars: args.maxChars as number | undefined,
           customEngine: args.customEngine as Parameters<SessionManager['handoffSession']>[1]['customEngine'],
+          acpAgent: args.acpAgent as Parameters<SessionManager['handoffSession']>[1]['acpAgent'],
         });
         return { ok: true, ...result };
       },
@@ -600,7 +701,8 @@ const plugin = {
 
     registerTool({
       name: 'session_stop',
-      description: 'Stop a persistent coding session',
+      description:
+        'Stop a persistent coding session and remove it from the resume registry, so a later session_start under the same name begins a new conversation',
       parameters: {
         type: 'object',
         properties: {
@@ -621,12 +723,13 @@ const plugin = {
 
     registerTool({
       name: 'session_list',
-      description: 'List all active coding sessions',
+      description:
+        'List the active coding sessions, and the persisted ones that a session_start under the same name resumes',
       parameters: { type: 'object', properties: { ...REMOTE_CALL_PROPERTIES } },
       execute: async (_id, args) => {
         return callRouted('session.list', args, async () => {
-          if (!manager) return { ok: true, sessions: [], persisted: [] };
-          return { ok: true, sessions: manager.listSessions(), persisted: manager.listPersistedSessions() };
+          const m = getManager();
+          return { ok: true, sessions: m.listSessions(), persisted: m.listPersistedSessions() };
         });
       },
     });
@@ -658,7 +761,8 @@ const plugin = {
 
     registerTool({
       name: 'coding_session_status',
-      description: 'Get detailed status of a coding session (context %, tokens, cost, uptime)',
+      description:
+        'Get detailed status of a coding session: context %, tokens, cost and spend cap, turns, tool calls, retries, start time and last activity',
       parameters: {
         type: 'object',
         properties: {
@@ -679,7 +783,8 @@ const plugin = {
 
     registerTool({
       name: 'session_grep',
-      description: 'Search session history for events matching a regex pattern',
+      description:
+        "Search the session's in-memory event history (its 100 most recent events) for a regex pattern, case-insensitive",
       parameters: {
         type: 'object',
         properties: {
@@ -738,7 +843,8 @@ const plugin = {
 
     registerTool({
       name: 'team_list',
-      description: 'List teammates in an agent team session (requires enableAgentTeams)',
+      description:
+        "List the other active sessions as this session's teammates, with engine, idle/busy/paused state and turn count. Works on every engine; enableAgentTeams is not required.",
       parameters: {
         type: 'object',
         properties: { name: { type: 'string', description: 'Session name' } },
@@ -754,7 +860,8 @@ const plugin = {
 
     registerTool({
       name: 'team_send',
-      description: 'Send a message to a specific teammate in an agent team session',
+      description:
+        'Send a message to another active session through the cross-session inbox: delivered now if it is idle, queued if it is busy.',
       parameters: {
         type: 'object',
         properties: {
@@ -779,7 +886,7 @@ const plugin = {
     registerTool({
       name: 'session_update_tools',
       description:
-        'Update allowedTools or disallowedTools for a running session. Restarts the session process with --resume to apply the new tool constraints while preserving conversation history. Rejects if the session is currently busy.',
+        'Update allowedTools or disallowedTools for a running session. Restarts the session process with --resume to apply the new tool constraints while preserving conversation history. Rejects if the session is currently busy. Without merge:true both lists are replaced, so a list you omit is cleared.',
       parameters: {
         type: 'object',
         properties: {
@@ -846,7 +953,7 @@ const plugin = {
           path: {
             type: 'string',
             description:
-              'Project path to purge (resolved to absolute). Ignored when all=true. Defaults to current cwd.',
+              "Project path to purge (resolved to absolute). Ignored when all=true. Defaults to the orchestrator process's working directory.",
           },
           all: {
             type: 'boolean',
@@ -957,13 +1064,6 @@ const plugin = {
       },
     });
 
-    // ─── Tool: cursor_goal_set ──────────────────────────────────────────
-    //
-    // Cursor's slash command is `submitMessage("/goal <objective>")`. Headless
-    // `-p` sends that same user message, and the process continues the goal
-    // until it is complete or cleared as long as `--single-turn` is absent.
-    // This wrapper only formats that text and refuses any other engine.
-
     registerTool({
       name: 'cursor_goal_set',
       description:
@@ -980,14 +1080,18 @@ const plugin = {
             type: 'number',
             description: 'Timeout in ms for the whole pursuit (default 300000). Raise it for a long goal.',
           },
+          ...REMOTE_CALL_PROPERTIES,
         },
         required: ['name', 'objective'],
       },
       execute: async (_id, args) => {
-        return await getManager().cursorGoalSet(
-          args.name as string,
-          args.objective as string,
-          args.timeout as number | undefined,
+        const objective = typeof args.objective === 'string' ? args.objective.trim() : '';
+        if (!objective) throw new Error('Cursor /goal requires an objective');
+        return callRouted(
+          'session.send',
+          { ...args, message: `/goal ${objective}` },
+          async () =>
+            getManager().cursorGoalSet(args.name as string, objective, args.timeout as number | undefined),
         );
       },
     });
@@ -1027,7 +1131,7 @@ const plugin = {
     registerTool({
       name: 'codex_review',
       description:
-        'Run a non-interactive Codex code review (`codex review`). Pick exactly one diff scope: uncommitted (working-tree changes), base (vs branch), or commit (vs SHA). Output is plain text — Codex `review` does not emit JSON.',
+        'Run a non-interactive Codex code review (`codex review`). Pick at most one diff scope — uncommitted (working-tree changes), base (vs branch), or commit (vs SHA); passing two is an error. Output is plain text — Codex `review` does not emit JSON.',
       parameters: {
         type: 'object',
         properties: {
@@ -1064,128 +1168,86 @@ const plugin = {
       },
     });
 
-    // ─── Tools: codex_goal_* and codex_side (Codex 0.165 app-server) ────
+    // ─── Tools: codex_goal_* (codex-app thread/goal/* RPCs) ─────────────
     //
-    // Goals are thread/goal/set, thread/goal/get, and thread/goal/clear.
-    // Pause and resume are status updates. These calls do not wait for the
-    // model to pursue the objective; the long-lived app-server does that.
-    // codex_side is an ephemeral thread/fork that does not replace the parent
-    // thread. Every one of these tools requires engine: "codex-app".
+    // Thin wrappers over the app-server's typed goal RPCs, scoped to sessions
+    // started with engine: "codex-app". Calls against any other engine surface
+    // a clear error rather than silently no-op'ing.
+
+    const GOAL_SHAPE =
+      'Returns { ok, goal } where goal is { objective, status: "active"|"paused"|"blocked"|"usageLimited"|"budgetLimited"|"complete", tokenBudget, tokensUsed, timeUsedSeconds, ... } or null.';
 
     registerTool({
       name: 'codex_goal_set',
-      description:
-        'Set a long-horizon objective on a codex-app session via thread/goal/set (status active, origin user). Does not wait for Codex to pursue it. Requires engine: "codex-app".',
+      description: `Set a long-horizon objective on a codex-app session (thread/goal/set). Codex then works turn after turn on its own until the goal leaves "active". Requires engine: "codex-app". ${GOAL_SHAPE}`,
       parameters: {
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Session name (must be a codex-app session).' },
           objective: {
             type: 'string',
-            description:
-              'The objective text. Codex pursues this inside the app-server until it is paused, cleared, or complete.',
+            description: 'The objective text. Codex will pursue this across turns until achieved, paused, or cleared.',
           },
-          timeout: {
+          tokenBudget: {
             type: 'number',
-            description: 'Unused. Goal RPCs return when the server stores the goal, not when pursuit finishes.',
+            description: 'Optional token budget; the goal stops as "budgetLimited" once it is spent.',
           },
         },
         required: ['name', 'objective'],
       },
       execute: async (_id, args) => {
-        return await getManager().codexGoalCommand(
-          args.name as string,
-          args.objective as string,
-          args.timeout as number | undefined,
-        );
+        return await getManager().codexGoal(args.name as string, {
+          action: 'set',
+          objective: args.objective as string,
+          tokenBudget: args.tokenBudget as number | undefined,
+        });
       },
     });
 
-    registerTool({
-      name: 'codex_goal_get',
-      description:
-        'Read the goal on a codex-app session via thread/goal/get (objective, status, tokensUsed, timeUsedSeconds, tokenBudget). Returns null if no goal is set. Does not start a turn.',
-      parameters: {
-        type: 'object',
-        properties: { name: { type: 'string', description: 'Session name (must be a codex-app session).' } },
-        required: ['name'],
-      },
-      execute: async (_id, args) => {
-        return getManager().codexGoalGet(args.name as string);
-      },
-    });
-
-    registerTool({
-      name: 'codex_goal_pause',
-      description: 'Pause goal pursuit on a codex-app session via thread/goal/set status paused, origin user.',
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'Session name.' },
-          timeout: { type: 'number', description: 'Timeout in ms (default 120000).' },
+    for (const [action, description] of [
+      ['get', 'Read the goal of a codex-app session from the app-server (thread/goal/get). Sends no turn.'],
+      ['pause', 'Pause goal pursuit on a codex-app session (thread/goal/set status "paused").'],
+      ['resume', 'Resume a paused or stopped goal on a codex-app session (thread/goal/set status "active").'],
+      ['clear', 'Remove the goal from a codex-app session (thread/goal/clear).'],
+    ] as const) {
+      registerTool({
+        name: `codex_goal_${action}`,
+        description: `${description} ${GOAL_SHAPE}`,
+        parameters: {
+          type: 'object',
+          properties: { name: { type: 'string', description: 'Session name (must be a codex-app session).' } },
+          required: ['name'],
         },
-        required: ['name'],
-      },
-      execute: async (_id, args) => {
-        return await getManager().codexGoalCommand(args.name as string, 'pause', args.timeout as number | undefined);
-      },
-    });
-
-    registerTool({
-      name: 'codex_goal_resume',
-      description: 'Resume a paused goal on a codex-app session via thread/goal/set status active, origin user.',
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'Session name.' },
-          timeout: { type: 'number', description: 'Timeout in ms (default 120000).' },
+        execute: async (_id, args) => {
+          return await getManager().codexGoal(args.name as string, { action });
         },
-        required: ['name'],
-      },
-      execute: async (_id, args) => {
-        return await getManager().codexGoalCommand(args.name as string, 'resume', args.timeout as number | undefined);
-      },
-    });
+      });
+    }
 
-    registerTool({
-      name: 'codex_goal_clear',
-      description: 'Clear the goal on a codex-app session via thread/goal/clear, origin user.',
-      parameters: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'Session name.' },
-          timeout: { type: 'number', description: 'Timeout in ms (default 120000).' },
-        },
-        required: ['name'],
-      },
-      execute: async (_id, args) => {
-        return await getManager().codexGoalCommand(args.name as string, 'clear', args.timeout as number | undefined);
-      },
-    });
+    // ─── Codex app-server v2 RPC tools (codex-app engine, Codex 0.137) ────
 
     registerTool({
       name: 'codex_side',
       description:
-        'Ask one question on an ephemeral fork of a codex-app thread (Codex /side). Does not replace the parent thread or steal a parent turn. The parent conversation must already have a turn. Requires engine: "codex-app".',
+        'Ask one question on an ephemeral fork of a codex-app thread. The parent thread id does not change, and a parent turn already running is left alone. Requires engine: "codex-app" and a conversation that has already started.',
       parameters: {
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Session name (must be a codex-app session).' },
-          prompt: { type: 'string', description: 'The side question. It runs on the fork, not the parent thread.' },
-          timeout: { type: 'number', description: 'Timeout in ms for the side answer (default 120000).' },
+          prompt: { type: 'string', description: 'The question for the side conversation.' },
+          timeout: { type: 'number', description: 'Timeout in ms (default 120000).' },
+          ...REMOTE_CALL_PROPERTIES,
         },
         required: ['name', 'prompt'],
       },
       execute: async (_id, args) => {
-        return await getManager().codexSide(
-          args.name as string,
-          args.prompt as string,
-          args.timeout as number | undefined,
+        const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+        if (!prompt) throw new Error('Codex side conversation requires a prompt');
+        return callRouted('session.side', { ...args, prompt }, async () =>
+          getManager().codexSide(args.name as string, prompt, args.timeout as number | undefined),
         );
       },
     });
-
-    // ─── Codex app-server v2 RPC tools (codex-app engine, Codex 0.137) ────
 
     registerTool({
       name: 'codex_interrupt',
@@ -1305,12 +1367,15 @@ const plugin = {
             description:
               'The shared task sent to every agent, after persona role instructions when supplied; a non-empty per-agent prompt replaces it.',
           },
-          projectDir: { type: 'string', description: 'Working directory all agents run in.' },
+          projectDir: {
+            type: 'string',
+            description: 'Working directory the agents run in, unless an agent names its own cwd.',
+          },
           agents: {
             type: 'array',
             maxItems: 16,
             description:
-              'Agent specs: { name, engine?, model?, effort?, prompt?, persona?, baseUrl?, permissionMode?, customEngine? }.',
+              "Agent specs: { name, engine?, model?, effort?, prompt?, persona?, cwd?, baseUrl?, permissionMode?, sandboxMode?, customEngine?, acpAgent? }. cwd gives an agent its own working directory (absolute, or relative to projectDir); agents that all write code need one each, or they edit the same files. permissionMode uses each engine's own permission handling as in session_start; workers that must not write should set sandboxMode to read-only. sandboxMode uses the same values and per-engine behavior as session_start.",
             items: {
               type: 'object',
               properties: {
@@ -1330,7 +1395,45 @@ const plugin = {
                   description:
                     'Per-agent role instructions prepended to the shared task when no non-empty prompt is supplied.',
                 },
+                cwd: {
+                  type: 'string',
+                  description:
+                    "This agent's own working directory, absolute or relative to projectDir. Defaults to projectDir.",
+                },
+                objective: {
+                  type: 'string',
+                  description:
+                    'Run this agent as a goal (a /goal on engine claude or codex, which must be set) instead of one turn: it works until the objective is met, out of budget, or blocked, with stalls and capacity errors resumed. Not with synthesize.',
+                },
+                tokenBudget: { type: 'number', description: 'Goal agents: tokens the goal may spend.' },
+                timeoutMs: {
+                  type: 'number',
+                  description: "Goal agents: how long the goal may run. Default: the kernel's node timeout (30 min).",
+                },
+                stallMs: {
+                  type: 'number',
+                  description: 'Goal agents: an active goal with no turn and no news for this long is resumed.',
+                },
+                capacityRetry: {
+                  type: 'object',
+                  description: 'Goal agents: resume attempts after usage limits, overload or stalls.',
+                  properties: { max: { type: 'number' }, backoffMs: { type: 'number' } },
+                  required: ['max'],
+                },
                 baseUrl: { type: 'string' },
+                permissionMode: {
+                  type: 'string',
+                  enum: ['acceptEdits', 'bypassPermissions', 'default', 'manual', 'dontAsk', 'plan', 'auto'],
+                  description:
+                    "Per-agent permission mode (same values as session_start). Passed through to that engine's own permission handling; see session_start for per-engine mapping.",
+                },
+                sandboxMode: {
+                  type: 'string',
+                  enum: ['read-only', 'workspace-write', 'danger-full-access'],
+                  description:
+                    'Same values and per-engine behavior as session_start. Use read-only for workers that must not write.',
+                },
+                acpAgent: ACP_AGENT_ID_SCHEMA,
               },
               required: ['name'],
             },
@@ -1344,6 +1447,10 @@ const plugin = {
             type: 'string',
             enum: ENGINE_TYPES,
             description: 'Engine for the synthesis pass (default claude).',
+          },
+          synthesisAcpAgent: {
+            ...ACP_AGENT_ID_SCHEMA,
+            description: 'With synthesisEngine "acp": the ACP agent preset the synthesis pass starts.',
           },
           agentTimeoutMs: { type: 'number', description: 'Per-agent timeout in ms (default 600000).' },
           maxTurnsPerAgent: { type: 'number', description: 'Max agent loop turns (default 30).' },
@@ -1359,16 +1466,12 @@ const plugin = {
           synthesize: args.synthesize as boolean | undefined,
           synthesisModel: args.synthesisModel as string | undefined,
           synthesisEngine: args.synthesisEngine as FanoutConfig['synthesisEngine'],
+          synthesisAcpAgent: args.synthesisAcpAgent as string | undefined,
           agentTimeoutMs: args.agentTimeoutMs as number | undefined,
           maxTurnsPerAgent: args.maxTurnsPerAgent as number | undefined,
           maxBudgetUsd: args.maxBudgetUsd as number | undefined,
         });
-        return {
-          ok: true,
-          ...session,
-          orchestrationRunId: session.id,
-          note: 'Fan-out running in background. Poll with fanout_status.',
-        };
+        return { ok: true, ...session, note: 'Fan-out running in background. Poll with fanout_status.' };
       },
     });
 
@@ -1402,7 +1505,7 @@ const plugin = {
     registerTool({
       name: 'workflow_start',
       description:
-        "Start a durable workflow run. Nodes: agent | fanout | council | verifier | human_gate | router | subflow. Every state transition is checkpointed to disk, so a run survives a process restart and can be resumed. When a contract is supplied the run cannot reach `completed` unless the runtime's own checks pass — without one it completes as `unverified`, which means nothing checked it. Runs in background; poll with workflow_status.",
+        "Start a durable workflow run. Nodes: agent | fanout | council | goal | verifier | human_gate | router | subflow. Every state transition is checkpointed to disk, so a run survives a process restart and can be resumed. When a contract is supplied the run cannot reach `completed` unless the runtime's own checks pass — without one it completes as `unverified`, which means nothing checked it. Runs in background; poll with workflow_status.",
       parameters: {
         type: 'object',
         properties: {
@@ -1413,15 +1516,15 @@ const plugin = {
           },
           template: {
             type: 'string',
-            enum: ['solve', 'council', 'fanout'],
+            enum: ['solve', 'council', 'fanout', 'goal'],
             description:
-              'Build a built-in workflow instead of supplying `spec`. `solve` = triage → implement → verify → repair-until-green → review.',
+              'Build a built-in workflow instead of supplying `spec`. `solve` = triage → implement → review → verify → repair-until-green. `goal` = a /goal on one Codex thread or Claude Code session (`task` is the objective) → verify → repair on the same thread.',
           },
           task: { type: 'string', description: 'Task text, when using `template`.' },
           agents: {
             type: 'array',
             maxItems: 16,
-            description: 'Agents for the template: { name, engine?, model?, effort?, persona? }.',
+            description: 'Agents for the template: { name, engine?, model?, effort?, persona?, acpAgent? }.',
             items: {
               type: 'object',
               properties: {
@@ -1430,6 +1533,7 @@ const plugin = {
                 model: { type: 'string' },
                 effort: { type: 'string', enum: EFFORT_LEVELS },
                 persona: { type: 'string' },
+                acpAgent: ACP_AGENT_ID_SCHEMA,
               },
               required: ['name'],
             },
@@ -1446,12 +1550,40 @@ const plugin = {
                 model: { type: 'string' },
                 effort: { type: 'string', enum: EFFORT_LEVELS },
                 persona: { type: 'string' },
+                acpAgent: ACP_AGENT_ID_SCHEMA,
               },
               required: ['name'],
             },
           },
+          implementer: {
+            type: 'object',
+            description:
+              '`solve` only: engine/model that writes the change. Defaults to the configured default engine, whatever engines the scouts use.',
+            properties: {
+              engine: { type: 'string', enum: ENGINE_TYPES },
+              model: { type: 'string' },
+              acpAgent: ACP_AGENT_ID_SCHEMA,
+            },
+          },
           humanGate: { type: 'boolean', description: '`solve` only: park for approval before writing anything.' },
-          maxRepairs: { type: 'number', description: '`solve` only: repair attempts allowed (default 3).' },
+          maxRounds: { type: 'number', description: '`council` only: max collaboration rounds (default 15).' },
+          maxRepairs: {
+            type: 'number',
+            description: '`solve` / `goal`: repair attempts allowed (default 3 for solve, 1 for goal).',
+          },
+          engine: {
+            type: 'string',
+            enum: ['codex', 'claude'],
+            description: '`goal` only: who runs the goal (default codex).',
+          },
+          model: { type: 'string', description: "`goal` only: model (default: the engine's own)." },
+          tokenBudget: { type: 'number', description: '`goal` only: tokens the goal may spend.' },
+          launcher: {
+            type: 'array',
+            items: { type: 'string' },
+            description:
+              '`goal` only: argv prefix the engine runs under, e.g. a sandbox wrapper. It runs with your authority, like a contract command check.',
+          },
           cwd: { type: 'string', description: 'Working directory for the run.' },
           runId: { type: 'string', description: 'Explicit run id (defaults to a generated one).' },
           contract: {
@@ -1537,14 +1669,26 @@ const plugin = {
           if (!task) throw new Error('workflow_start needs `spec`, or `template` with `task`');
           const agents = (args.agents as SolveArgs['scouts']) ?? [{ name: 'agent' }];
           if (template === 'council') {
-            spec = councilWorkflow({ task, cwd, agents });
+            spec = councilWorkflow({ task, cwd, agents, maxRounds: args.maxRounds as number | undefined });
           } else if (template === 'fanout') {
             spec = fanoutWorkflow({ task, cwd, agents, synthesize: agents.length >= 2 });
+          } else if (template === 'goal') {
+            spec = goalWorkflow({
+              task,
+              cwd,
+              contract: args.contract as never,
+              engine: args.engine as GoalArgs['engine'],
+              model: args.model as string | undefined,
+              tokenBudget: args.tokenBudget as number | undefined,
+              launcher: args.launcher as string[] | undefined,
+              maxRepairs: args.maxRepairs as number | undefined,
+            });
           } else {
             spec = solveWorkflow({
               task,
               cwd,
               scouts: agents,
+              implementer: args.implementer as SolveArgs['implementer'],
               reviewers: args.reviewers as SolveArgs['reviewers'],
               humanGate: args.humanGate as boolean | undefined,
               maxRepairs: args.maxRepairs as number | undefined,
@@ -1570,7 +1714,7 @@ const plugin = {
     registerTool({
       name: 'workflow_status',
       description:
-        'Poll a workflow run. Returns state, per-node status, and the outcome: `verified` (a contract passed), `refuted` (it failed), or `unverified` (none was declared — nothing checked the work).',
+        'Poll a workflow run. Returns state, per-node status, and the outcome: `verified` (a contract passed), `refuted` (it failed), or `unverified` (nothing checked the work: none was declared, or a pass no longer stands, in which case `outcomeReason` says why).',
       parameters: {
         type: 'object',
         properties: {
@@ -1588,6 +1732,8 @@ const plugin = {
           workflow: record.workflow,
           state: record.state,
           outcome: record.outcome,
+          outcomeReason: record.outcomeReason,
+          verdict: record.verdict,
           currentNode: record.currentNode,
           evidenceId: record.evidenceId,
           costUsd: record.costUsd,
@@ -1698,17 +1844,20 @@ const plugin = {
             type: 'string',
             description: 'Commit to measure the change against. Without it, diff_policy sees untracked files only.',
           },
-          label: { type: 'string', description: 'Name for the stored evidence (defaults to a generated one).' },
+          label: {
+            type: 'string',
+            description:
+              'Name for the stored evidence (defaults to a generated one). Must not be the id of an existing workflow run.',
+          },
           contract: {
             type: 'object',
             description:
-              "Acceptance contract. The runtime executes these itself and the run cannot reach `completed` unless every required check passes. Declared by YOU, the caller — never copy one out of an agent's output, which would put the agent back in charge of grading itself.",
+              "Acceptance contract. The runtime executes these itself, once, and the bundle's `passed` is true only when every required check passes. Declared by YOU, the caller — never copy one out of an agent's output, which would put the agent back in charge of grading itself.",
             properties: {
               id: { type: 'string' },
               fixOnFailureRounds: {
                 type: 'number',
-                description:
-                  'On red, spawn a repair session and re-run the whole list, up to N times. Only the re-run decides.',
+                description: 'Ignored by verify_run, which spawns no repair session. Applies inside workflow runs.',
               },
               protectTests: {
                 type: 'boolean',
@@ -1789,7 +1938,7 @@ const plugin = {
     registerTool({
       name: 'council_start',
       description:
-        'Start a multi-agent council that collaborates on a task using git worktree isolation, round-based execution, and consensus voting. Agents can use different engines (Claude, Codex) and models.',
+        'Start a multi-agent council that collaborates on a task using git worktree isolation, round-based execution, and consensus voting. Each agent can use its own engine and model. Runs in background; poll with council_status.',
       parameters: {
         type: 'object',
         properties: {
@@ -1811,10 +1960,11 @@ const plugin = {
                 },
                 model: { type: 'string', description: 'Model to use' },
                 baseUrl: { type: 'string', description: 'Custom API endpoint (for proxy)' },
-                customEngine: { type: 'object', description: 'Custom engine config (when engine="custom")' },
+                customEngine: CUSTOM_ENGINE_OR_PRESET_SCHEMA,
+                acpAgent: ACP_AGENT_ID_SCHEMA,
                 effort: {
                   type: 'string',
-                  enum: EFFORT_LEVELS,
+                  enum: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'auto'],
                   description: 'Per-agent reasoning effort.',
                 },
                 ultracode: {
@@ -1854,12 +2004,7 @@ const plugin = {
         };
 
         const session = await getManager().councilStart(args.task as string, config);
-        return {
-          ok: true,
-          ...session,
-          orchestrationRunId: session.id,
-          note: 'Council running in background. Poll with council_status.',
-        };
+        return { ok: true, ...session, note: 'Council running in background. Poll with council_status.' };
       },
     });
 
@@ -1884,15 +2029,17 @@ const plugin = {
 
     registerTool({
       name: 'council_abort',
-      description: 'Abort a running council, stopping all agent sessions',
+      description:
+        'Abort a council running in this process, stopping all agent sessions and removing the worktrees it created. A council that is not running here is left alone and the call returns ok: false.',
       parameters: {
         type: 'object',
         properties: { id: { type: 'string', description: 'Council session ID' } },
         required: ['id'],
       },
       execute: async (_id, args) => {
-        getManager().councilAbort(args.id as string);
-        return { ok: true };
+        const result = getManager().councilAbort(args.id as string);
+        if (!result.aborted) return { ok: false, aborted: false, state: result.state, error: result.reason };
+        return { ok: true, aborted: true };
       },
     });
 
@@ -1901,7 +2048,7 @@ const plugin = {
     registerTool({
       name: 'council_inject',
       description:
-        'Inject a user message into the next round of a running council. The message will be appended to all agent prompts in the next round.',
+        'Inject a user message into the next round of a running council. The message will be appended to all agent prompts in the next round; a second inject before that round replaces the first. The council must be running in this process.',
       parameters: {
         type: 'object',
         properties: {
@@ -2038,11 +2185,17 @@ const plugin = {
     registerTool({
       name: 'session_deliver_inbox',
       description:
-        'Deliver all queued inbox messages to an idle session. Call this when a session finishes a task to process waiting messages.',
+        'Deliver queued inbox messages to an idle session. A registered manual thread with no live session is started from its native id first, then the mail is delivered. Pass engine when the registration has no provider.',
       parameters: {
         type: 'object',
         properties: {
           name: { type: 'string', description: 'Session name' },
+          cwd: { type: 'string', description: 'Working directory used when starting a registered manual thread' },
+          engine: {
+            type: 'string',
+            enum: ENGINE_TYPES,
+            description: 'Engine used when starting a registered manual thread that has no provider',
+          },
           ...REMOTE_CALL_PROPERTIES,
         },
         required: ['name'],
@@ -2058,7 +2211,7 @@ const plugin = {
     registerTool({
       name: 'thread_register',
       description:
-        'Register a manually opened native thread on the execution-host broker. Does not resume, spawn, or attach a second process to that thread.',
+        'Register a manually opened native thread on the execution-host broker. session_start of the same name later takes over that thread. Registration itself does not spawn a process.',
       parameters: {
         type: 'object',
         properties: {
@@ -2082,7 +2235,7 @@ const plugin = {
     registerTool({
       name: 'thread_mailbox_send',
       description:
-        'Queue a durable message for a registered manual thread. Acceptance is not model delivery, and the thread is not resumed.',
+        'Queue a durable message for a registered manual thread, or deliver it when that thread has a live managed owner.',
       parameters: {
         type: 'object',
         properties: {
@@ -2146,7 +2299,7 @@ const plugin = {
     registerTool({
       name: 'thread_mailbox_wait',
       description:
-        'Wait on the broker socket until a registered manual thread has a queued message or the wait expires. Does not poll and does not resume the thread.',
+        'Wait on the broker socket until a registered manual thread has a queued message or the wait expires.',
       parameters: {
         type: 'object',
         properties: {
@@ -2221,11 +2374,11 @@ const plugin = {
           engines: {
             type: 'array',
             // Excluded: 'custom', because ultrareview spawns reviewers without a
-            // customEngine config; and 'grok', because reviewers run read-only
-            // and grok refuses a read-only session rather than approximate one.
-            items: { type: 'string', enum: ENGINE_TYPES.filter((e) => e !== 'custom' && e !== 'grok') },
+            // customEngine config, and 'acp', because an ACP agent cannot be held
+            // to the read-only sandbox every reviewer runs in.
+            items: { type: 'string', enum: ENGINE_TYPES.filter((e) => e !== 'custom' && e !== 'acp') },
             description:
-              'Engines to round-robin reviewers across (default ["claude"]). Every reviewer runs read-only (sandboxMode read-only), so grok and custom are not accepted. Reviewers fan out in parallel; per-agent failures are isolated.',
+              'Engines to round-robin reviewers across (default ["claude"]). Every reviewer runs read-only (sandboxMode read-only), so custom and acp are not accepted. Reviewers fan out in parallel; per-agent failures are isolated.',
           },
         },
         required: ['cwd'],
@@ -2277,14 +2430,19 @@ const plugin = {
             description: 'Stable run identifier (used to address subsequent chat / status calls)',
           },
           workspace: { type: 'string', description: 'Path to the git workspace where the run lives' },
-          planner_engine: { type: 'string', enum: ENGINE_TYPES, description: 'Planner engine (default: claude)' },
+          // No 'acp': a role is configured by engine name alone and cannot name the ACP agent.
+          planner_engine: { type: 'string', enum: AUTOLOOP_ENGINES, description: 'Planner engine (default: claude)' },
           planner_model: {
             type: 'string',
             description: 'Planner model (default: opus for Claude; engine default otherwise)',
           },
           planner_effort: { type: 'string', enum: EFFORT_LEVELS, description: 'Fixed Planner reasoning effort' },
           planner_custom_engine: CUSTOM_ENGINE_SCHEMA,
-          coder_engine: { type: 'string', enum: ENGINE_TYPES, description: 'Default Coder engine (default: claude)' },
+          coder_engine: {
+            type: 'string',
+            enum: AUTOLOOP_ENGINES,
+            description: 'Default Coder engine (default: claude)',
+          },
           coder_model: {
             type: 'string',
             description: 'Default Coder model (default: sonnet for Claude; engine default otherwise)',
@@ -2293,7 +2451,7 @@ const plugin = {
           coder_custom_engine: CUSTOM_ENGINE_SCHEMA,
           reviewer_engine: {
             type: 'string',
-            enum: ENGINE_TYPES,
+            enum: AUTOLOOP_ENGINES,
             description: 'Default Reviewer engine (default: claude)',
           },
           reviewer_model: {
@@ -2392,12 +2550,9 @@ const plugin = {
 
     registerTool({
       name: 'autoloop_list',
-      description: 'List all v2 autoloop runs in this manager process.',
+      description: 'List the v2 autoloop runs recorded on this machine, running and finished, newest first.',
       parameters: { type: 'object', properties: {} },
-      execute: async () => {
-        if (!manager) return { ok: true, runs: [] };
-        return { ok: true, runs: getManager().autoloopList() };
-      },
+      execute: async () => ({ ok: true, runs: getManager().autoloopList() }),
     });
 
     // ─── Tool: autoloop_reset_agent ──────────────────────────────
@@ -2453,12 +2608,135 @@ const plugin = {
       },
     });
 
+    // ─── Tool: autoloop_resume ────────────────────────────────────
+    //
+    // Thin native facade over SessionManager.autoloopResume. Caller options are
+    // mapped once; omission stays omission. Live/cold validation and audit stay
+    // in the manager. A tiny local screen rejects malformed caller strings with
+    // fixed field errors before any resolver/manager effect; valid-input errors
+    // propagate unchanged. normalizeToolResult only wraps successful results.
+
+    const AUTOLOOP_RESUME_CALLER_ID_FIELDS = [
+      'pending_dispatch_id',
+      'plannerCustomEngineRef',
+      'coderCustomEngineRef',
+      'reviewerCustomEngineRef',
+    ] as const;
+    const autoloopResumeCallerIdError = (field: string): Error =>
+      new Error(`${field} must be a valid identifier of 1-128 ASCII letters, digits, underscore, dot, colon or dash`);
+    const assertAutoloopResumeCallerId = (field: string, value: unknown): void => {
+      if (typeof value !== 'string' || value.length < 1 || value.length > 128) {
+        throw autoloopResumeCallerIdError(field);
+      }
+      for (let i = 0; i < value.length; i++) {
+        const code = value.charCodeAt(i);
+        const ok =
+          (code >= 0x30 && code <= 0x39) || // 0-9
+          (code >= 0x41 && code <= 0x5a) || // A-Z
+          (code >= 0x61 && code <= 0x7a) || // a-z
+          code === 0x5f || // _
+          code === 0x2e || // .
+          code === 0x3a || // :
+          code === 0x2d; // -
+        if (!ok) throw autoloopResumeCallerIdError(field);
+      }
+    };
+
+    registerTool({
+      name: 'autoloop_resume',
+      description:
+        'Resume a v2 autoloop run. Ordinary and activity-lease pauses resume with no timeout fields. Live send-timeout pending: omitting timeout fields is a no-op (pending is not cleared); advancing it needs an explicit send_timeout_ms increase and the matching pending_dispatch_id. Cold resume: omission still follows manager reconstruction even when a pending dispatch was stored; pending_dispatch_id is required only when an increase and pending coexist; a cold timeout-only increase without pending remains supported. Optional *CustomEngineRef names resolve against CLAWO_CUSTOM_ENGINE_<REF> on the orchestrator host for cold custom-engine runs. run_id and optional pending/ref strings must be finite ASCII identifiers (see parameter schemas); invalid shapes fail before resume. Returns { ok, state }; a paused or terminated state is not completed project work.',
+      parameters: {
+        type: 'object',
+        properties: {
+          run_id: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 128,
+            pattern: '^[A-Za-z0-9_][A-Za-z0-9._-]{0,127}$',
+            description:
+              'Run id from autoloop_start (1–128 ASCII; first letter/digit/underscore, then letter/digit/underscore/dot/dash).',
+          },
+          send_timeout_ms: {
+            type: 'number',
+            minimum: 5_000,
+            maximum: 7_200_000,
+            description:
+              'Optional send-timeout increase in ms (inclusive 5000–7200000). Omission preserves the historical resume path; when supplied it must be a strict increase over the run’s effective value (manager-enforced).',
+          },
+          pending_dispatch_id: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 128,
+            pattern: '^[A-Za-z0-9_.:-]{1,128}$',
+            description:
+              'Optional exact pending dispatch id (1–128 ASCII letters/digits/underscore/dot/colon/dash). Required by the manager only when increasing the timeout while a pending dispatch exists (live or cold); omit for ordinary resume and for cold timeout-only increase without pending.',
+          },
+          plannerCustomEngineRef: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 128,
+            pattern: '^[A-Za-z0-9_.:-]{1,128}$',
+            description:
+              'Secret reference name for the Planner custom engine (CLAWO_CUSTOM_ENGINE_<REF>; 1–128 ASCII letters/digits/underscore/dot/colon/dash). Supply only when the stored run used engine "custom" for that role.',
+          },
+          coderCustomEngineRef: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 128,
+            pattern: '^[A-Za-z0-9_.:-]{1,128}$',
+            description:
+              'Secret reference name for the Coder custom engine (CLAWO_CUSTOM_ENGINE_<REF>; 1–128 ASCII letters/digits/underscore/dot/colon/dash). Supply only when the stored run used engine "custom" for that role.',
+          },
+          reviewerCustomEngineRef: {
+            type: 'string',
+            minLength: 1,
+            maxLength: 128,
+            pattern: '^[A-Za-z0-9_.:-]{1,128}$',
+            description:
+              'Secret reference name for the Reviewer custom engine (CLAWO_CUSTOM_ENGINE_<REF>; 1–128 ASCII letters/digits/underscore/dot/colon/dash). Supply only when the stored run used engine "custom" for that role.',
+          },
+        },
+        required: ['run_id'],
+      },
+      execute: async (_id, args) => {
+        const runId = args.run_id;
+        if (typeof runId !== 'string' || !isValidRunId(runId)) {
+          throw new Error('run_id must be a valid run identifier');
+        }
+        for (const key of AUTOLOOP_RESUME_CALLER_ID_FIELDS) {
+          if (!Object.prototype.hasOwnProperty.call(args, key)) continue;
+          assertAutoloopResumeCallerId(key, args[key]);
+        }
+
+        const resumeOptions: NonNullable<Parameters<SessionManager['autoloopResume']>[1]> = {
+          ...(resolveSecretRefs({
+            plannerCustomEngine: args.plannerCustomEngineRef as string | undefined,
+            coderCustomEngine: args.coderCustomEngineRef as string | undefined,
+            reviewerCustomEngine: args.reviewerCustomEngineRef as string | undefined,
+          }) as Pick<
+            NonNullable<Parameters<SessionManager['autoloopResume']>[1]>,
+            'plannerCustomEngine' | 'coderCustomEngine' | 'reviewerCustomEngine'
+          >),
+        };
+        if (Object.prototype.hasOwnProperty.call(args, 'send_timeout_ms')) {
+          resumeOptions.sendTimeoutMs = args.send_timeout_ms as number;
+        }
+        if (Object.prototype.hasOwnProperty.call(args, 'pending_dispatch_id')) {
+          resumeOptions.pendingDispatchId = args.pending_dispatch_id as string;
+        }
+
+        const state = await getManager().autoloopResume(runId, resumeOptions);
+        return { ok: true, state };
+      },
+    });
+
     // ─── ultraapp (read-only) ─────────────────────────────────────────────
 
     registerTool({
       name: 'ultraapp_list',
       description:
-        'List all ultraapp runs (interview/build/done) with title, mode, and timestamps. Read-only — to start a new run, open the Forge dashboard tab.',
+        'List all ultraapp runs with title, mode (interview, queued, building, build-complete, deploying, done, failed, cancelled), and timestamps. Read-only — to start a new run, call ultraapp_new or open the Forge dashboard tab.',
       parameters: { type: 'object', properties: {} },
       execute: async () => {
         const ua = getManager().getUltraappManager();
@@ -2603,7 +2881,7 @@ const plugin = {
     registerTool({
       name: 'ultraapp_build_cancel',
       description:
-        'Cancel a queued or in-flight build. Best-effort for in-flight; the worker is expected to honour its own cancellation signal (v0.2 only emits the event).',
+        "Cancel a queued or in-flight build. A queued build leaves the queue; an in-flight build's workflow run is cancelled, and the build stops at its next cancellation check.",
       parameters: {
         type: 'object',
         properties: { runId: { type: 'string' } },
@@ -2619,7 +2897,7 @@ const plugin = {
     registerTool({
       name: 'ultraapp_feedback',
       description:
-        'Submit a done-mode feedback message (after the run reaches `done`). The text is classified by Haiku into cosmetic / spec-delta / structural and routed: cosmetic runs the patcher (Opus diff + validate + auto-revert + version snapshot); spec-delta flips the run back to `interview` with a focused bootstrap; structural posts a "start fresh" suggestion.',
+        'Submit a done-mode feedback message (after the run reaches `done`). The text is classified by Haiku into cosmetic / spec-delta / structural and routed: cosmetic runs the patcher (Opus diff + validate + auto-revert + version snapshot); spec-delta flips the run back to `interview` with a focused bootstrap; structural posts a "start fresh" suggestion. Before the run reaches `done`, the text is sent to the interview as a free-form answer instead.',
       parameters: {
         type: 'object',
         properties: {
@@ -2638,7 +2916,7 @@ const plugin = {
     registerTool({
       name: 'ultraapp_promote_version',
       description:
-        "Atomically swap which previously-built version is currently deployed. Stops the old container, starts the target version's container, updates the router map. Requires a router to be wired (see clawo serve).",
+        'Make a version the one serving the app. A version deployed before is swapped in (the live one is stopped, the target restarted, the router map updated); one never deployed, such as a patched version, is built and deployed first. Requires a router to be wired (see clawo serve).',
       parameters: {
         type: 'object',
         properties: {

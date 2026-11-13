@@ -1,92 +1,98 @@
 # Tools Reference
 
-All 85 tools are registered as OpenClaw plugin tools and exposed over MCP by `clawo-mcp` (see [mcp.md](./mcp.md)). The embedded HTTP server covers a subset of them. Remote execution is documented in [remote-sessions.md](./remote-sessions.md).
+All 79 tools are registered as OpenClaw plugin tools and exposed over MCP by `clawo-mcp` (see [mcp.md](./mcp.md)). The embedded HTTP server covers a subset of them.
 
 ## Session Lifecycle (6)
 
 ### `session_start`
 
-Start a persistent coding session with full CLI flag support.
+Start a persistent coding session with full CLI flag support. Most rows below are Claude Code CLI
+flags and are ignored by engines without an equivalent; a row that names other engines says where
+else the value applies.
 
-| Parameter                            | Type                                                                                          | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| ------------------------------------ | --------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `name`                               | string                                                                                        | Session name (auto-generated if omitted)                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `cwd`                                | string                                                                                        | Working directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `engine`                             | `'claude'` \| `'codex'` \| `'codex-app'` \| `'agy'` \| `'grok'` \| `'opencode'` \| `'custom'` | Engine to use (default: `claude`). `agy` wraps Google Antigravity CLI. `grok` wraps xAI Grok Build and reports its own per-turn cost. `opencode` wraps sst/opencode (pass model as `provider/model`). Use `custom` with `customEngine` for any CLI. (`'gemini'` and `'cursor'` are still accepted. `'cursor'` is not version-tracked; use `cursor_goal_set` for a durable goal on that engine. Use `agy` for Google and `grok` when a Cursor session is not required.)                                                                      |
-| `model`                              | string                                                                                        | Model alias or full name                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `permissionMode`                     | string                                                                                        | `acceptEdits`, `bypassPermissions`, `plan`, `auto`, `manual`, `dontAsk` (`default` = legacy alias for `manual`)                                                                                                                                                                                                                                                                                                                                                                        |
-| `sandboxMode`                        | `'read-only'` \| `'workspace-write'` \| `'danger-full-access'`                                | Sandbox policy. Codex supports all values. `read-only` is enforced on every other built-in engine too: Claude → plan mode; Antigravity → its plan mode; OpenCode → a generated `clawo-readonly` agent denying `edit`/`bash`. **`grok` refuses a read-only session** rather than approximate one — its enforcement has not been adversarially verified. A `custom` engine must map it via `permissionModes`, or the session refuses to start. Persisted across session resume.          |
-| `allowedTools`                       | string[]                                                                                      | Tools to auto-approve                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `disallowedTools`                    | string[]                                                                                      | Tools to deny                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `maxTurns`                           | number                                                                                        | Max agent loop turns                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `maxBudgetUsd`                       | number                                                                                        | Max API spend (USD). Enforced by the runtime on every engine: once the session's cumulative cost reaches the cap, further sends are refused before the engine is spawned. See [observability.md](observability.md) for the accuracy caveat on engines that estimate token counts.                                                                                                                                                                                                      |
-| `systemPrompt`                       | string                                                                                        | Replace system prompt                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
-| `appendSystemPrompt`                 | string                                                                                        | Append custom instructions to the system prompt. Claude Code and Grok take it natively; Codex, Antigravity and OpenCode have no such flag and receive it at the top of the first message of a conversation                                                                                                                                                                                                                                                                             |
-| `agents`                             | object                                                                                        | Custom sub-agents JSON                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `agent`                              | string                                                                                        | Default agent to use                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `bare`                               | boolean                                                                                       | Skip hooks, LSP, auto-memory, CLAUDE.md                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `worktree`                           | string \| boolean                                                                             | Run in git worktree                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `fallbackModel`                      | string \| string[]                                                                            | Fallback model(s) when the primary is overloaded; an array is tried in order                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `resumeSessionId`                    | string                                                                                        | Resume existing session by ID                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `jsonSchema`                         | string                                                                                        | JSON Schema for structured output. Claude: `--json-schema` (inline). Codex: `--output-schema` (written to a temp file, requires Codex 0.132+). Other engines ignore it.                                                                                                                                                                                                                                                                                                                |
-| `mcpConfig`                          | string \| string[]                                                                            | MCP server config file(s)                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
-| `settings`                           | string                                                                                        | Settings.json path or inline JSON                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `ultracode`                          | boolean                                                                                       | Claude only. Enable "ultracode" / dynamic workflows — Claude plans a JS orchestration script per substantive task and fans out to subagents. Injected as the `ultracode:true` settings key (merged into `settings`). The workflow runs in the background: `session_send` returns at launch, and the completion turn is not returned by a later send (see sessions.md).                                                                                                                 |
-| `noSessionPersistence`               | boolean                                                                                       | Do not save session to disk — both the engine's own transcript and this orchestrator's resume registry, so a later start under the same name does not reattach                                                                                                                                                                                                                                                                                                                         |
-| `ignoreUserConfig`                   | boolean                                                                                       | Codex engines (`codex`, `codex-app`). Start without the user's Codex MCP servers. `codex` also runs without loading `$CODEX_HOME/config.toml` (`--ignore-user-config`), so a run is decided by what the caller passed rather than by a `model = …` line in that file. `codex-app` has no such flag: each configured MCP server is disabled with `-c` and an inert same-type transport stub, using `transport.type` from `codex mcp list --json`; the rest of the file still loads. Auth still resolves from `CODEX_HOME`. Keep chosen servers with `codexMcpServers`. |
-| `codexMcpServers`                    | string[]                                                                                      | Codex engines, with `ignoreUserConfig: true` only. Names (`[A-Za-z0-9_-]`, max 64) of MCP servers to keep from the user's Codex config; every other configured server is disabled with a type-matching inert stub. Omitted or `[]` = none. Unknown or config-disabled names fail the start and list the available names; these caller/config errors (including an unsupported transport type or a failed `codex mcp list --json`) do not count toward the engine circuit breaker. Rejected on other engines or without `ignoreUserConfig`. With a selection `codex` cannot use `--ignore-user-config` (it would drop the selected definitions), so the rest of `config.toml` loads too; explicit model/sandbox/effort win. The resolver uses only names, enabled state, and transport type; configured commands, URLs, headers, tokens and env are never retained, logged or put on a command line. |
-| `codexProfile`                       | string                                                                                        | Codex only. Named profile from `~/.codex/config.toml`, passed as `codex exec --profile`                                                                                                                                                                                                                                                                                                                                                                                                |
-| `restricted`                         | boolean                                                                                       | Claude Code only. Restricted mode (`--restricted`): the CLI removes the built-in tools that run commands or code — Bash, PowerShell, the REPL — plus `WebFetch` unless `tools` names them, and ignores user, project and local settings files. Separate from `sandboxMode: 'read-only'`: that maps to plan mode, which holds on its own, while this makes the shell absent rather than refused. It also drops the caller's CLAUDE.md and hooks, so it is never switched on implicitly. |
-| `betas`                              | string \| string[]                                                                            | Custom beta headers                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `enableAgentTeams`                   | boolean                                                                                       | Enable experimental agent teams                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `enableAutoMode`                     | boolean                                                                                       | Enable auto permission mode                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `customEngine`                       | object                                                                                        | Custom engine config (required when `engine='custom'`). See [Multi-Engine: Custom Engine](./multi-engine.md#custom-engine-engine-custom).                                                                                                                                                                                                                                                                                                                                              |
-| `crossSessionInbound`                | string                                                                                        | `accept` / `hold` / `refuse` — policy for peer messages from other Claude Code sessions on this machine (Claude engine). Delivered as a settings key; there is no CLI flag. Without it the CLI holds messages whose two sides run different permission modes, which is the usual orchestrated-session-to-human-terminal case                                                                                                                                                           |
-| `includeHookEvents`                  | boolean                                                                                       | Stream hook lifecycle events (PreToolUse/PostToolUse) as `system` events                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `forwardSubagentText`                | boolean                                                                                       | Forward subagent text and thinking into the output stream (Claude engine, CLI 2.1.211+). Without it the parent stream stays quiet while a subagent works                                                                                                                                                                                                                                                                                                                               |
-| `permissionPromptTool`               | string                                                                                        | MCP tool name to delegate permission prompts to (non-interactive use). When omitted, the session runs with `--permission-prompts none`: a prompt nobody could answer is denied rather than left waiting until the turn timeout.                                                                                                                                                                                                                                                        |
-| `excludeDynamicSystemPromptSections` | boolean                                                                                       | Move cwd/env/git context from system prompt to user message for better prompt cache hits; auto-enabled with `bare: true`                                                                                                                                                                                                                                                                                                                                                               |
-| `enablePromptCaching1H`              | boolean                                                                                       | Enable 1-hour prompt cache TTL (vs default 5-min); auto-enabled with `bare: true`                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `debug`                              | string \| string[]                                                                            | Debug categories to enable (e.g. `"api,mcp"` or `["api", "mcp"]`)                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `debugFile`                          | string                                                                                        | File path to write debug output to                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `fromPr`                             | string                                                                                        | Resume a session linked to a GitHub PR number or URL                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `channels`                           | string \| string[]                                                                            | MCP channel subscription spec (research preview)                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `dangerouslyLoadDevelopmentChannels` | string \| string[]                                                                            | Development MCP channel subscriptions (research preview)                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `forkSubagent`                       | boolean                                                                                       | Fork subagent for non-interactive sessions (sets `CLAUDE_CODE_FORK_SUBAGENT=1`)                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `enableToolSearch`                   | boolean                                                                                       | Enable Vertex AI tool search (sets `ENABLE_TOOL_SEARCH=1`)                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `otelLogUserPrompts`                 | boolean                                                                                       | OpenTelemetry: log user prompts (sets `OTEL_LOG_USER_PROMPTS=1`)                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `otelLogRawApiBodies`                | boolean                                                                                       | OpenTelemetry: log raw API request/response bodies (sets `OTEL_LOG_RAW_API_BODIES=1`); debug only                                                                                                                                                                                                                                                                                                                                                                                      |
-| `bedrockServiceTier`                 | `'default'` \| `'flex'` \| `'priority'`                                                       | AWS Bedrock service tier (sets `ANTHROPIC_BEDROCK_SERVICE_TIER`); only effective when routing through Bedrock                                                                                                                                                                                                                                                                                                                                                                          |
-| `effort`                             | `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'` \| `'ultra'` \| `'auto'`            | Reasoning effort level. Engines do not share one ladder: Claude Code takes up to `max`, Codex adds `ultra`, Grok stops at `xhigh`, Antigravity at `high`, and OpenCode forwards the level to its provider unvalidated. A level above an engine's ceiling clamps rather than being dropped. `high` and above trigger the `ultrathink` prefix on Claude user messages.                                                                                                                   |
-| `host`                               | string                                                                                        | Configured execution-host alias. Omit for this machine. Unknown aliases error and are never run locally. See [remote-sessions.md](./remote-sessions.md).                                                                                                                                                                                                                                                                                                                             |
-| `operationId`                        | string                                                                                        | Stable client operation id. The same id and payload rejoin; a changed payload is rejected.                                                                                                                                                                                                                                                                                                                                                                                             |
-| `waitTimeout`                        | number                                                                                        | Controller wait in milliseconds after the broker accepts. Distinct from `timeout`.                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `parentMachineId`                    | string                                                                                        | Origin Memento machine UUID. Configured, not inferred.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `parentSessionId`                    | string                                                                                        | Exact parent native thread id. A first-line `MEMENTO-DELEGATE-FROM` marker can fill this later.                                                                                                                                                                                                                                                                                                                                                                                        |
-| `parentToolId`                       | `'codex'` \| `'claude_code'` \| `'cursor'` \| `'opencode'`                                    | Parent transcript provider.                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `originHost`                         | string                                                                                        | Source host display name from administrator config.                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| Parameter                            | Type                                                                                                     | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`                               | string                                                                                                   | Session name (auto-generated if omitted)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `cwd`                                | string                                                                                                   | Working directory                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `engine`                             | `'claude'` \| `'codex'` \| `'codex-app'` \| `'agy'` \| `'grok'` \| `'opencode'` \| `'acp'` \| `'custom'` | Engine to use (default: `claude`). `agy` wraps Google Antigravity CLI. `grok` wraps xAI Grok Build and reports its own per-turn cost. `opencode` wraps sst/opencode (pass model as `provider/model`). `acp` drives any Agent Client Protocol agent named by `acpAgent`. Use `custom` with `customEngine` for any CLI. (`'gemini'` and `'cursor'` are still accepted for existing callers but are legacy — not version-tracked; use `agy` for Google and `grok` in place of Cursor.)                                                                                                                                                                                          |
+| `model`                              | string                                                                                                   | Model alias or full name                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `claudeAccount`                      | string                                                                                                   | Claude engine only. The Claude account to run under, by name from the server's `claude-accounts.json`, or `auto` for the first available account in its rotation. A session on an account in the rotation moves to the next one when it reaches its usage limit and continues the same conversation. Omit for the file's `default`, else the CLI's own login. See [multi-engine.md](./multi-engine.md#claude-accounts-and-rotation)                                                                                                                                                                                                                                          |
+| `permissionMode`                     | string                                                                                                   | `acceptEdits`, `bypassPermissions`, `plan`, `auto`, `manual`, `dontAsk` (`default` = legacy alias for `manual`). Defaults to the plugin's `defaultPermissionMode` (`acceptEdits`). On `acp`, `bypassPermissions`, `acceptEdits`, `auto` and `dontAsk` allow the agent's permission requests and the others reject them                                                                                                                                                                                                                                                                                                                                                       |
+| `sandboxMode`                        | `'read-only'` \| `'workspace-write'` \| `'danger-full-access'`                                           | Sandbox policy. Codex supports all values (default `workspace-write`). `read-only` is also enforced on Claude → plan mode; Antigravity → its plan mode; OpenCode → a generated `clawo-readonly` agent denying `edit`/`bash`; Grok → its OS-enforced `--sandbox read-only` profile (refused for a project under the temp directory, on platforms without Seatbelt or Landlock, and when grok cannot apply it). A `custom` engine must map it via `permissionModes`, or the session refuses to start. The `acp` engine refuses `read-only`, because the agent runs its own tools; its permission requests are answered from `permissionMode`. Persisted across session resume. |
+| `allowedTools`                       | string[]                                                                                                 | Tools to auto-approve                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `disallowedTools`                    | string[]                                                                                                 | Tools to deny                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `tools`                              | string \| string[]                                                                                       | Claude only. The built-in tool set (`--tools`): names such as `["Bash", "Edit", "Read"]`, `""` for none, or `"default"`. Under `restricted`, the command-running tools and `WebFetch` it names are kept                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `addDir`                             | string[]                                                                                                 | Directories the session may use besides `cwd` (`--add-dir`). Claude and Codex; a resumed Codex thread keeps the directories its first turn opened                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `maxTurns`                           | number                                                                                                   | Max agent loop turns                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `maxBudgetUsd`                       | number                                                                                                   | Max API spend (USD). Enforced by the runtime on every engine: once the session's cumulative cost reaches the cap, further sends are refused before the engine is spawned. See [observability.md](observability.md) for the accuracy caveat on engines that estimate token counts.                                                                                                                                                                                                                                                                                                                                                                                            |
+| `autoCompactPercent`                 | number                                                                                                   | Compact the conversation before a send once `contextPercent` reaches this value (1–99). Off by default. For long-lived sessions, where cost grows with context size; survives a server restart. A failed compaction does not block the send.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `systemPrompt`                       | string                                                                                                   | Replace system prompt                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `appendSystemPrompt`                 | string                                                                                                   | Append custom instructions to the system prompt. Claude Code and Grok take it natively; Codex, Antigravity and OpenCode have no such flag and receive it at the top of the first message of a conversation. ACP has no system-prompt channel: an `acp` session puts `systemPrompt` and `appendSystemPrompt` at the top of the first message of a new session                                                                                                                                                                                                                                                                                                                 |
+| `agents`                             | object                                                                                                   | Custom sub-agents JSON                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `agent`                              | string                                                                                                   | Default agent to use                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `bare`                               | boolean                                                                                                  | Skip hooks, LSP, auto-memory, CLAUDE.md                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `worktree`                           | string \| boolean                                                                                        | Run in git worktree                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `fallbackModel`                      | string \| string[]                                                                                       | Fallback model(s) when the primary is overloaded; an array is tried in order                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `resumeSessionId`                    | string                                                                                                   | Resume an earlier conversation by the engine's own id: a Claude Code session id, a Codex or `codex-app` thread id, an Antigravity conversation id, a Grok or OpenCode session id, an ACP agent's session id, or a custom engine's id when its config maps a resume flag                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `jsonSchema`                         | string                                                                                                   | JSON Schema for structured output. Claude and Grok: `--json-schema` (inline). Codex: `--output-schema` (written to a temp file, requires Codex 0.132+). Other engines ignore it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `mcpConfig`                          | string \| string[]                                                                                       | MCP server config file(s)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `settings`                           | string                                                                                                   | Settings.json path or inline JSON, for this session only. Claude Code and Antigravity (`agy --settings`, which validates its keys) take it                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `pluginUrl`                          | string \| string[]                                                                                       | Claude only. Plugin `.zip` URL(s) fetched for this session only (`--plugin-url`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `ultracode`                          | boolean                                                                                                  | Claude only. Enable "ultracode" / dynamic workflows — Claude plans a JS orchestration script per substantive task and fans out to subagents. Injected as the `ultracode:true` settings key (merged into `settings`). The workflow runs in the background: `session_send` returns at launch, and the completion turn is not returned by a later send (see [sessions.md](./sessions.md#ultracode-claude-dynamic-workflows)).                                                                                                                                                                                                                                                   |
+| `noSessionPersistence`               | boolean                                                                                                  | Do not save session to disk — both the engine's own transcript and this orchestrator's resume registry, so a later start under the same name does not reattach                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `launcher`                           | string[]                                                                                                 | Argv prefix every engine process of the session runs under, e.g. a sandbox wrapper: `["/opt/sandbox.sh", "task"]`. Any engine; it runs with your authority, like a contract command check. See [Multi-Engine: Running an engine under a launcher](./multi-engine.md#running-an-engine-under-a-launcher)                                                                                                                                                                                                                                                                                                                                                                      |
+| `ignoreUserConfig`                   | boolean                                                                                                  | Codex only. Run without loading `$CODEX_HOME/config.toml`, so an orchestrated run is decided by what the caller passed rather than by the machine's own Codex config — notably a `model = …` line in that file, which otherwise picks the model while the ledger records this engine's default. Auth still resolves from `CODEX_HOME`.                                                                                                                                                                                                                                                                                                                                       |
+| `codexProfile`                       | string                                                                                                   | Codex only. Named profile from `~/.codex/config.toml`, passed as `codex exec --profile`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `restricted`                         | boolean                                                                                                  | Claude Code only. Restricted mode (`--restricted`): the CLI removes the built-in tools that run commands or code — Bash, PowerShell, the REPL — plus `WebFetch` unless `tools` names them, and ignores user, project and local settings files. Separate from `sandboxMode: 'read-only'`: that maps to plan mode, which holds on its own, while this makes the shell absent rather than refused. It also drops the caller's CLAUDE.md and hooks, so it is never switched on implicitly.                                                                                                                                                                                       |
+| `betas`                              | string \| string[]                                                                                       | Custom beta headers                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `enableAgentTeams`                   | boolean                                                                                                  | Enable experimental agent teams                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `enableAutoMode`                     | boolean                                                                                                  | Enable auto permission mode                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `customEngine`                       | object \| string                                                                                         | Custom engine config (required when `engine='custom'`), or the id of a bundled preset (`clawo engines` lists them). See [Multi-Engine: Custom Engine](./multi-engine.md#custom-engine-engine-custom).                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `acpAgent`                           | string \| object                                                                                         | The ACP agent (required when `engine='acp'`): a bundled preset id (`kimi-code`, `dsh`), or, from a local caller only, `{ name, command, commandEnv?, args?, env?, contextWindow?, pricing? }`. Fan-out, council and workflow agent specs take a preset id in the same field, and `session_handoff` takes either form. Autoloop and ultrareview refuse `acp`. See [Multi-Engine: ACP agents](./multi-engine.md#acp-agents-engine-acp).                                                                                                                                                                                                                                        |
+| `crossSessionInbound`                | string                                                                                                   | `accept` / `hold` / `refuse` — policy for peer messages from other Claude Code sessions on this machine (Claude engine). Delivered as a settings key; there is no CLI flag. Without it the CLI holds messages whose two sides run different permission modes, which is the usual orchestrated-session-to-human-terminal case                                                                                                                                                                                                                                                                                                                                                 |
+| `includeHookEvents`                  | boolean                                                                                                  | Stream hook lifecycle events (PreToolUse/PostToolUse) as `system` events                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `forwardSubagentText`                | boolean                                                                                                  | Forward subagent text and thinking into the output stream (Claude engine, CLI 2.1.211+). Without it the parent stream stays quiet while a subagent works                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `chrome`                             | boolean                                                                                                  | Let the session use the user's Chrome through the Claude in Chrome extension, acting with that browser's sign-ins (Claude engine, `--chrome`). Off by default. Needs Chrome running with the extension and a claude.ai login; survives a server restart                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `permissionPromptTool`               | string                                                                                                   | MCP tool name to delegate permission prompts to (non-interactive use). When omitted, the session runs with `--permission-prompts none`: a prompt nobody could answer is denied rather than left waiting until the turn timeout.                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `excludeDynamicSystemPromptSections` | boolean                                                                                                  | Move cwd/env/git context from system prompt to user message for better prompt cache hits; auto-enabled with `bare: true`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `enablePromptCaching1H`              | boolean                                                                                                  | Enable 1-hour prompt cache TTL (vs default 5-min); auto-enabled with `bare: true`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `debug`                              | string \| string[]                                                                                       | Debug categories to enable (e.g. `"api,mcp"` or `["api", "mcp"]`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `debugFile`                          | string                                                                                                   | File path to write debug output to                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `fromPr`                             | string                                                                                                   | Resume a session linked to a GitHub PR number or URL                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `channels`                           | string \| string[]                                                                                       | MCP channel subscription spec (research preview)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `dangerouslyLoadDevelopmentChannels` | string \| string[]                                                                                       | Development MCP channel subscriptions (research preview)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `forkSubagent`                       | boolean                                                                                                  | Fork subagent for non-interactive sessions (sets `CLAUDE_CODE_FORK_SUBAGENT=1`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `enableToolSearch`                   | boolean                                                                                                  | Enable Vertex AI tool search (sets `ENABLE_TOOL_SEARCH=1`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `otelLogUserPrompts`                 | boolean                                                                                                  | OpenTelemetry: log user prompts (sets `OTEL_LOG_USER_PROMPTS=1`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `otelLogRawApiBodies`                | boolean                                                                                                  | OpenTelemetry: log raw API request/response bodies (sets `OTEL_LOG_RAW_API_BODIES=1`); debug only                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `bedrockServiceTier`                 | `'default'` \| `'flex'` \| `'priority'`                                                                  | AWS Bedrock service tier (sets `ANTHROPIC_BEDROCK_SERVICE_TIER`); only effective when routing through Bedrock                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `effort`                             | `'low'` \| `'medium'` \| `'high'` \| `'xhigh'` \| `'max'` \| `'ultra'` \| `'auto'`                       | Reasoning effort level. Engines do not share one ladder: Claude Code takes up to `max` (`--effort`; `ultra` is sent as `max`), Codex (`codex`, `codex-app`) adds `ultra`, Grok stops at `xhigh`, Antigravity at `high`, and OpenCode forwards the level to its provider unvalidated. A level above an engine's ceiling clamps rather than being dropped. `auto` leaves the level to the engine. `acp` does not pass it to the engine.                                                                                                                                                                                                                                        |
 
 ### `session_send`
 
 Send a message and get the response.
 
-| Parameter | Type    | Required | Description                        |
-| --------- | ------- | -------- | ---------------------------------- |
-| `name`    | string  | yes      | Session name                       |
-| `message` | string  | yes      | Message to send                    |
-| `effort`  | string  |          | Override effort for this message   |
-| `plan`    | boolean |          | Enable plan mode                   |
-| `timeout` | number  |          | Native execution timeout in ms (default 300000). Distinct from `waitTimeout`. |
-| `stream`  | boolean |          | Collect streaming chunks in result. Local sessions only; a remote send returns the final result. |
-| `host`    | string  |          | Configured execution-host alias. See [remote-sessions.md](./remote-sessions.md). |
-| `operationId` | string |       | Stable client operation id. |
-| `waitTimeout` | number |       | Controller wait in ms after the broker accepts. |
+| Parameter | Type    | Required | Description                                                                                                                                                                                                                                                                                      |
+| --------- | ------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `name`    | string  | yes      | Session name                                                                                                                                                                                                                                                                                     |
+| `message` | string  | yes      | Message to send                                                                                                                                                                                                                                                                                  |
+| `effort`  | string  |          | Effort for this message: `low` … `ultra` (no `auto`). Antigravity, Grok, OpenCode and `codex-app` pass it to the engine for this turn; on Claude, `high` and above prefix the message with `ultrathink` (a persistent custom engine does the same for `high` and `max`). Other engines ignore it |
+| `plan`    | boolean |          | Ask for a plan only. Claude and persistent custom engines prefix the message with a plan-only instruction; the permission mode is unchanged, and other engines ignore it. To enforce read-only, start the session with `sandboxMode: 'read-only'`                                                |
+| `timeout` | number  |          | Timeout in ms (default 300000)                                                                                                                                                                                                                                                                   |
+| `stream`  | boolean |          | Collect the text chunks into `chunks[]` on the result (returned with the final result, not streamed to the caller)                                                                                                                                                                               |
 
-Returns `{ ok, output, sessionId, error?, permissionDenials? }`. `permissionDenials` lists the tool
+Returns `{ ok, output, sessionId, error?, usage, permissionDenials?, images?, chunks? }`. A turn that failed
+has `ok: false` and `error` set: the engine reported an error result, or its process exited before the turn
+finished (`the claude process exited with code 1 before the turn finished`), in which case `output` keeps
+whatever it had streamed. `usage` is
+`{ tokensIn, tokensOut, costUsd }` for this turn alone — what it added to the session's running totals, which
+`coding_session_status` reports. `permissionDenials` lists the tool
 calls the engine refused during the turn — `[{ toolName, toolUseId?, input? }]` — and is present only
 when there was at least one. Check it even when `error` is absent: a turn whose tool calls were all
 denied still ends as a success. See [sessions.md](./sessions.md) on what "succeeded" does and does
-not mean.
+not mean. `images` lists the images the engine generated in this turn as `{ path, revisedPrompt? }`,
+with `path` a file on the machine running the orchestrator; Codex (`codex` and `codex-app`) generates
+them when asked for an image.
 
 ### `session_handoff`
 
@@ -94,15 +100,16 @@ Continue a session's conversation on another engine — or the same engine with 
 a new session in the source's working directory and carries the conversation into it; the source
 keeps running untouched.
 
-| Parameter      | Type   | Required | Description                                                                        |
-| -------------- | ------ | -------- | ---------------------------------------------------------------------------------- |
-| `name`         | string | yes      | The session to hand off from                                                       |
-| `engine`       | string | yes      | Engine for the new session                                                         |
-| `model`        | string |          | Model for the new session (default: the engine's default)                          |
-| `newName`      | string |          | Name for the new session (default `<name>-<engine>`)                               |
-| `message`      | string |          | Send this now and return the reply; otherwise the history waits for `session_send` |
-| `maxChars`     | number |          | Cap on the carried history, in characters (default 240000, minimum 4000)           |
-| `customEngine` | object |          | As in `session_start`, when `engine` is `custom`                                   |
+| Parameter      | Type             | Required | Description                                                                        |
+| -------------- | ---------------- | -------- | ---------------------------------------------------------------------------------- |
+| `name`         | string           | yes      | The session to hand off from                                                       |
+| `engine`       | string           | yes      | Engine for the new session. May be the same engine with a different model          |
+| `model`        | string           |          | Model for the new session (default: the engine's default)                          |
+| `newName`      | string           |          | Name for the new session (default `<name>-<engine>`)                               |
+| `message`      | string           |          | Send this now and return the reply; otherwise the history waits for `session_send` |
+| `maxChars`     | number           |          | Cap on the carried history, in characters (default 240000, minimum 4000)           |
+| `acpAgent`     | string \| object |          | With `engine: 'acp'`: the agent to start, as in `session_start`                    |
+| `customEngine` | object \| string |          | As in `session_start`, when `engine` is `custom`                                   |
 
 Returns `{ ok, name, engine, from: { name, engine }, carried: { turns, omitted, chars }, result? }`.
 `result` is the send result of `message`, when one was given. See [sessions.md](./sessions.md) for
@@ -110,7 +117,9 @@ what carries across, what does not, and what is kept when the conversation is to
 
 ### `session_stop`
 
-Graceful shutdown (SIGTERM, then SIGKILL after 3s).
+Graceful shutdown (SIGTERM, then SIGKILL after 3s). The session is also removed from the resume
+registry and its inbox is cleared, so a later `session_start` under the same name begins a new
+conversation with no messages left over from the old one.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
@@ -130,24 +139,23 @@ Dashboard view: all sessions with ready/busy/paused state, cost, context %, last
 
 ### `coding_session_status`
 
-Detailed status: tokens, cost, context %, tool calls, uptime. (Prefixed to avoid clashing with OpenClaw's built-in `session_status`.)
+Detailed status: the `session_list` entry (`costUsd`, `budgetUsd`, `budgetExhausted`, …) plus the engine's `stats` — turns, tokens, cost, context %, tool calls, start time, last activity. (Prefixed to avoid clashing with OpenClaw's built-in `session_status`.)
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
 | `name`    | string | yes      |
 
-**Engine errors (`health`).** Every session has an `error` listener from before `start()`, and every child process the sessions spawn has `error` listeners on the process and on its stdin, stdout and stderr (an engine binary that cannot be spawned, or one that closes stdin before a write lands, is an error on that session — `ENOENT`, `EACCES`, `EPIPE`). Engine error events and child-process error events therefore do not end the process hosting other sessions. This covers errors Claw knows how to raise; it is not a catch-all, and a genuine bug elsewhere still surfaces as an uncaught exception (a process-level handler that swallowed them would leave broker state undefined, so there is none; the service manager restarts the broker). Once an engine has reported an error, the status, `session_list` entries and `sessions_overview` details carry `health: { state, errorCount, lastError, lastErrorAt }` (absent = no errors so far; `lastError` is secret-redacted and capped at 500 chars). `state` is `degraded` while the engine is still ready (Codex reports survivable conditions such as an unreachable MCP server this way — the session is not killed for them, and the next clean turn returns it to `ok`), and `failed` once the engine is no longer ready (stays failed until the session is restarted). In-flight turns are settled by the engine session as before: `turn/completed` or process exit for `codex-app`, the session's own `error` handling for `claude`/`custom`.
-
 **Returned stats fields** (selected):
 
-| Field            | Type                | Description                                             |
-| ---------------- | ------------------- | ------------------------------------------------------- |
-| `retries`        | number              | Number of API retries that occurred during this session |
-| `lastRetryError` | string \| undefined | Error message from the most recent retry (if any)       |
+| Field            | Type                | Description                                                                                                        |
+| ---------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `retries`        | number              | API retries during this session, from Claude Code's `system/api_retry` events (always 0 on other engines)          |
+| `lastRetryError` | string \| undefined | Category of the most recent retry (e.g. `overloaded`, `rate_limit`), or its HTTP status when no category was given |
 
 ### `session_grep`
 
-Regex search over session event history.
+Case-insensitive regex search over the session's in-memory event history, which keeps the 100 most
+recent events.
 
 | Parameter | Type   | Required | Description              |
 | --------- | ------ | -------- | ------------------------ |
@@ -166,19 +174,20 @@ Reclaim context window via `/compact`.
 
 ### `session_update_tools`
 
-Update tool permissions at runtime. Restarts session with `--resume`.
+Update tool permissions at runtime. Restarts session with `--resume`; refused while a turn is in
+flight.
 
-| Parameter         | Type     | Description                            |
-| ----------------- | -------- | -------------------------------------- |
-| `name`            | string   | Session name                           |
-| `allowedTools`    | string[] | New allowed tools (replaces or merges) |
-| `disallowedTools` | string[] | New disallowed tools                   |
-| `removeTools`     | string[] | Tools to remove from lists             |
-| `merge`           | boolean  | Merge with existing (default: replace) |
+| Parameter         | Type     | Description                                                                        |
+| ----------------- | -------- | ---------------------------------------------------------------------------------- |
+| `name`            | string   | Session name                                                                       |
+| `allowedTools`    | string[] | New allowed tools (replaces or merges)                                             |
+| `disallowedTools` | string[] | New disallowed tools                                                               |
+| `removeTools`     | string[] | Tools to remove from lists                                                         |
+| `merge`           | boolean  | Merge with existing (default: replace — both lists, so a list you omit is cleared) |
 
 ### `session_switch_model`
 
-Hot-swap model mid-conversation. Restarts with `--resume`.
+Hot-swap model mid-conversation. Restarts with `--resume`; refused while a turn is in flight.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
@@ -266,27 +275,9 @@ Returns `{ ok, agents }`.
 
 ---
 
-## Cursor (1)
+## Codex (13)
 
-`cursor_goal_set` requires a session started with `engine: "cursor"`. Cursor's TUI command submits the user message `/goal <objective>`; headless `cursor-agent -p` sends that same text. The process then keeps working while the goal is active, because Claw does not pass `--single-turn`. There is no Cursor slash command for clear, pause, or status.
-
-### `cursor_goal_set`
-
-Set a durable objective. Sends `/goal <objective>`. **Requires `engine: "cursor"`.**
-
-| Parameter   | Type   | Required | Description                                                                                          |
-| ----------- | ------ | -------- | ---------------------------------------------------------------------------------------------------- |
-| `name`      | string | yes      | Session name.                                                                                        |
-| `objective` | string | yes      | What Cursor should pursue. A blank objective is rejected.                                            |
-| `timeout`   | number |          | Timeout in ms for the whole pursuit, not one model turn (default 300000). Raise it for a long goal. |
-
-Returns the regular `session_send` turn result. The assistant text is the only goal surface Cursor emits on this path. The session's existing permission mode still applies, including a read-only deny config.
-
----
-
-## Codex (14)
-
-Tools targeting OpenAI's `codex` CLI. The `codex_resume` and `codex_review` tools are one-shot wrappers and work without a managed session. The `codex_goal_*` and `codex_side` tools require a session started with `engine: "codex-app"` (see [multi-engine.md](./multi-engine.md)) — the legacy `engine: "codex"` (which uses `codex exec`) has no goal or side surface.
+Tools targeting OpenAI's `codex` CLI. The `codex_resume` and `codex_review` tools are one-shot wrappers and work without a managed session. The `codex_goal_*` tools require a session started with `engine: "codex-app"` (see [multi-engine.md](./multi-engine.md#openai-codex-app-server-engine-codex-app)) — `engine: "codex"` runs `codex exec` once per send and has no goal surface.
 
 ### `codex_resume`
 
@@ -307,7 +298,9 @@ Returns `{ ok, text, threadId?, usage?, events }`.
 
 ### `codex_review`
 
-Run a non-interactive Codex code review (`codex review`). Pick exactly one diff scope.
+Run a non-interactive Codex code review (`codex review`). Pick at most one diff scope
+(`uncommitted`, `base` or `commit`); passing two is an error. `base` and `commit` must be plain git
+refs.
 
 | Parameter     | Type    | Description                                    |
 | ------------- | ------- | ---------------------------------------------- |
@@ -324,50 +317,37 @@ Returns `{ ok, stdout, stderr }`.
 
 ### `codex_goal_set`
 
-Set a long-horizon objective with `thread/goal/set` (`status: "active"`, `origin: "user"`). **Requires `engine: "codex-app"`.** The call returns when Codex stores the goal. It does not wait while Codex pursues it.
+Set a long-horizon objective (`thread/goal/set`). Codex then works turn after turn on its own until the goal leaves `active`. **Requires `engine: "codex-app"`.**
 
-| Parameter   | Type   | Required |
-| ----------- | ------ | -------- |
-| `name`      | string | yes      |
-| `objective` | string | yes      |
-| `timeout`   | number |          |
+| Parameter     | Type   | Required | Notes                                                            |
+| ------------- | ------ | -------- | ---------------------------------------------------------------- |
+| `name`        | string | yes      |                                                                  |
+| `objective`   | string | yes      |                                                                  |
+| `tokenBudget` | number |          | Tokens the goal may spend; it stops as `budgetLimited` past this |
 
-Returns `{ ok, text, goal }` where `goal` is `{ objective, status: "active"|"paused"|"blocked"|"usageLimited"|"budgetLimited"|"complete", tokensUsed, timeUsedSeconds, tokenBudget?, ... }` or `null`.
+Returns `{ ok, goal }` where `goal` is `{ objective, status, tokenBudget, tokensUsed, timeUsedSeconds, ... }`. `status` is one of `active`, `paused`, `blocked`, `usageLimited`, `budgetLimited`, `complete`.
 
 ### `codex_goal_get`
 
-Read the goal with `thread/goal/get`. Does not start a turn.
+Ask the app-server for the goal (`thread/goal/get`). Sends no turn.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
 | `name`    | string | yes      |
 
-Returns `{ ok, goal }` (`null` if no goal is set).
+Returns `{ ok, goal }` (`null` if the thread has no goal).
 
 ### `codex_goal_pause` / `codex_goal_resume` / `codex_goal_clear`
 
-`thread/goal/set` with `status: "paused"` or `status: "active"`, or `thread/goal/clear`. Every call sends `origin: "user"`. Requires `engine: "codex-app"`.
+Pause (`status: "paused"`), resume (`status: "active"`, also for a goal stopped by a usage limit) or remove (`thread/goal/clear`) the goal. Requires `engine: "codex-app"`.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
 | `name`    | string | yes      |
-| `timeout` | number |          |
 
-Returns `{ ok, text, goal }`.
+Returns `{ ok, goal }` (`null` after `clear`).
 
-### `codex_side`
-
-Ask one question on an ephemeral fork of the current thread (`thread/fork` with Codex's side-conversation instructions, then a hidden boundary item, then one turn). The parent thread id does not change, and the side answer does not complete a parent turn that is already running. Codex refuses this until the parent conversation has had a turn. Requires `engine: "codex-app"`.
-
-| Parameter | Type   | Required | Description                                      |
-| --------- | ------ | -------- | ------------------------------------------------ |
-| `name`    | string | yes      | Session name.                                    |
-| `prompt`  | string | yes      | The question to ask on the fork.                 |
-| `timeout` | number |          | Timeout in ms for the side answer (default 120000). |
-
-Returns `{ ok, text, sideThreadId, parentThreadId }`.
-
-> **Stability note:** Codex's `goals` feature is experimental upstream. Claw calls the `thread/goal/*` RPCs from Codex 0.165 and passes `--enable goals`. An older app-server that only understood `/goal` as user text will reject these calls.
+For a goal that has to run unattended for hours, judged by checks the agent did not write, use the `goal` workflow (`workflow_start` with `template: "goal"`, or `clawo goal`) instead of these tools; see [workflow.md](./workflow.md#goal).
 
 ### Codex app-server RPCs
 
@@ -384,13 +364,7 @@ Returns `{ ok, text, sideThreadId, parentThreadId }`.
 
 To **resume** a codex-app thread, start a session with `engine: "codex-app"` and
 `resumeSessionId: "<threadId>"` — it loads the existing thread via `thread/resume` instead of
-opening a fresh one. Record `stats.codexThreadId` from `session_start` or session status;
-`codex-app` also returns this full native ID as `stats.sessionId` and `session_send.sessionId`.
-Check that a resumed session returns the requested `stats.codexThreadId` before sending work.
-A failed resume or different returned thread ID is an error; Claw never substitutes a new
-conversation. Legacy `codex-app-<prefix>-<timestamp>` wrapper IDs are not resumable and cannot
-be expanded safely. Recover the original full native ID from the prior session's stats or
-Codex thread list. To intentionally start fresh, use a new session name without a resume ID.
+opening a fresh one.
 
 ---
 
@@ -400,22 +374,30 @@ Run one task across N engine/model agents **in parallel** and collect their answ
 
 ### `fanout_start`
 
-| Parameter                            | Type    | Required | Description                                                                            |
-| ------------------------------------ | ------- | -------- | -------------------------------------------------------------------------------------- |
-| `task`                               | string  | yes      | Shared task sent to every agent, optionally after its `persona`.                       |
-| `projectDir`                         | string  | yes      | Working directory all agents run in.                                                   |
-| `agents`                             | array   | yes      | Specs: `{ name, engine?, model?, effort?, prompt?, persona?, baseUrl?, permissionMode?, customEngine? }`. |
-| `synthesize`                         | boolean |          | Run a final synthesis pass over the successful results (needs ≥2).                     |
-| `synthesisModel` / `synthesisEngine` | string  |          | Model/engine for the synthesis pass (default engine `claude`).                         |
-| `agentTimeoutMs`                     | number  |          | Per-agent timeout (default 600000).                                                    |
-| `maxTurnsPerAgent`                   | number  |          | Max agent loop turns (default 30).                                                     |
-| `maxBudgetUsd`                       | number  |          | Per-agent spend cap.                                                                   |
+| Parameter                            | Type    | Required | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| ------------------------------------ | ------- | -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `task`                               | string  | yes      | Shared task sent to every agent, optionally after its `persona`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `projectDir`                         | string  | yes      | Working directory the agents run in, unless an agent names its own cwd.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `agents`                             | array   | yes      | Up to 16 specs: `{ name, engine?, model?, effort?, prompt?, persona?, cwd?, objective?, baseUrl?, permissionMode?, sandboxMode?, customEngine?, acpAgent? }`. Names must be unique (each forms a session name); `permissionMode` defaults to `bypassPermissions`. `cwd` gives the agent its own working directory, absolute or relative to `projectDir` (the default); each result in `fanout_status` records the `cwd` it ran in. `objective` runs the agent as a goal (engine `claude` or `codex`, required) with optional `tokenBudget`, `timeoutMs`, `stallMs`, `capacityRetry`; its result adds `goal: { runId, status, tokensUsed, threadId }`. Not with `synthesize`. |
+| `synthesize`                         | boolean |          | Run a final synthesis pass over the successful results (needs ≥2).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `synthesisModel` / `synthesisEngine` | string  |          | Model/engine for the synthesis pass (default engine `claude`).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `synthesisAcpAgent`                  | string  |          | With `synthesisEngine: 'acp'`: the ACP agent preset the synthesis pass starts.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `agentTimeoutMs`                     | number  |          | Per-agent timeout (default 600000).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `maxTurnsPerAgent`                   | number  |          | Max agent loop turns (default 30).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `maxBudgetUsd`                       | number  |          | Per-agent spend cap.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 
 Runs in the background; returns `{ ok, id, status, ... }`. Poll with `fanout_status`.
 Each agent's optional `effort` accepts `low`, `medium`, `high`, `xhigh`, `max`,
-`ultra`, or `auto`. Omit it to keep the session default. The selected adapter
-applies or clamps the value as documented for `session_start`; legacy adapters
-that do not map effort retain their existing behavior.
+`ultra`, or `auto`. Omit it to keep the session default. The engine applies or
+clamps the value as documented for `session_start`.
+
+Per-agent `permissionMode` uses the same enum and each engine's own permission
+handling as `session_start`. Workers that must not write should set
+`sandboxMode` to `read-only`. Per-agent `sandboxMode` (`read-only` \|
+`workspace-write` \| `danger-full-access`) uses the same values and per-engine
+behavior as `session_start` (omit to keep the session default). These worker
+fields do not constrain optional synthesis, and `fanout_start` does not expose a
+synthesis permission override.
 
 Per-agent `persona` provides role instructions without replacing the shared
 task. Fan-out sends `<persona>\n\n## Shared task\n\n<task>`. A non-empty
@@ -426,15 +408,22 @@ resume/recovery repeats the same message construction.
 
 ### `fanout_status`
 
-Poll a fan-out by `id`. Returns `{ ok, id, status, results: [{ agent, engine, model, ok, output, error?, durationMs }], synthesis? }`.
+Poll a fan-out by `id`. Returns `{ ok, id, status, results: [{ agent, engine, model, ok, output, error?, durationMs }], synthesis?, synthesisError?, error? }`.
+`status` is `running`, `done`, `error` or `aborted`. `synthesisError` is set when synthesis was requested
+and failed; without it, a missing `synthesis` means none was requested or fewer than two agents succeeded.
 
 ### `fanout_abort`
 
-Abort a running fan-out by `id` (already-started agents finish; synthesis is skipped).
+Abort a running fan-out by `id`. Agents already running finish, agents still waiting for a session
+slot never start, and synthesis is skipped.
 
 ---
 
 ## Agent Teams (3)
+
+`team_list` and `team_send` work on every engine and do not need `enableAgentTeams`: a session's
+"team" is every other active session in this orchestrator. See
+[Multi-Engine: Team Tools Across Engines](./multi-engine.md#team-tools-across-engines).
 
 ### `coding_agents_list`
 
@@ -446,7 +435,8 @@ List agent definitions from `.claude/agents/` (project + global). (Prefixed to a
 
 ### `team_list`
 
-List teammates in an agent team session.
+List the other active sessions, each with its engine, idle/busy/paused state and turn count. Returns
+`{ ok, response }`, where `response` is that list as text.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
@@ -454,7 +444,8 @@ List teammates in an agent team session.
 
 ### `team_send`
 
-Send message to a specific teammate.
+Send a message to another active session through the cross-session inbox: delivered now if the
+teammate is idle, queued if it is busy.
 
 | Parameter  | Type   | Required |
 | ---------- | ------ | -------- |
@@ -470,16 +461,16 @@ Send message to a specific teammate.
 
 Start a multi-agent council. Runs in background, returns session ID immediately.
 
-| Parameter               | Type           | Required | Description                                                                                                                                             |
-| ----------------------- | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `task`                  | string         | yes      | Task description                                                                                                                                        |
-| `projectDir`            | string         | yes      | Working directory                                                                                                                                       |
-| `agents`                | AgentPersona[] |          | Agent list (defaults to 3-agent team)                                                                                                                   |
-| `maxRounds`             | number         |          | Max rounds (default 15)                                                                                                                                 |
-| `agentTimeoutMs`        | number         |          | Per-agent timeout (default 1800000)                                                                                                                     |
-| `maxTurnsPerAgent`      | number         |          | Max tool turns per agent (default 30)                                                                                                                   |
-| `maxBudgetUsd`          | number         |          | Max API spend per agent                                                                                                                                 |
-| `defaultPermissionMode` | string         |          | Default permission mode for agents (`acceptEdits`, `bypassPermissions`, etc.). Overridden by agent-level `permissionMode`. Default: `bypassPermissions` |
+| Parameter               | Type           | Required | Description                                                                                                                                                               |
+| ----------------------- | -------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `task`                  | string         | yes      | Task description                                                                                                                                                          |
+| `projectDir`            | string         | yes      | Working directory                                                                                                                                                         |
+| `agents`                | AgentPersona[] |          | `{ name, emoji, persona, engine?, model?, effort?, ultracode?, baseUrl?, permissionMode?, customEngine?, acpAgent? }`. Defaults to a Planner / Generator / Evaluator team |
+| `maxRounds`             | number         |          | Max rounds (default 15)                                                                                                                                                   |
+| `agentTimeoutMs`        | number         |          | Per-agent timeout (default 1800000)                                                                                                                                       |
+| `maxTurnsPerAgent`      | number         |          | Max tool turns per agent per round (default 50)                                                                                                                           |
+| `maxBudgetUsd`          | number         |          | Max API spend per agent                                                                                                                                                   |
+| `defaultPermissionMode` | string         |          | Default permission mode for agents (`acceptEdits`, `bypassPermissions`, etc.). Overridden by agent-level `permissionMode`. Default: `bypassPermissions`                   |
 
 ### `council_status`
 
@@ -491,15 +482,20 @@ Get status of a running or recently completed council.
 
 ### `council_abort`
 
-Abort a running council, stopping all agent sessions.
+Abort a council running in this process, stopping all agent sessions and removing the worktrees it created.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
 | `id`      | string | yes      |
 
+**Returns**: `{ ok: true, aborted: true }`. A council that is not running in this process — finished, or
+running in another one — is left alone: `{ ok: false, aborted: false, state, error }`, with the run's state.
+
 ### `council_inject`
 
-Inject a user message into the next round of a running council.
+Inject a user message into the next round of a running council; it is appended to every agent's
+prompt for that round. A second inject before the round starts replaces the first. The council
+must be running in this process.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
@@ -518,7 +514,7 @@ Review a completed council session. Returns a structured report of all changed f
 
 ### `council_accept`
 
-Accept and finalize council work. Cleans up all council scaffolding: removes worktrees, deletes `council/*` branches, removes `plan.md` and `reviews/` directory.
+Accept and finalize council work. Cleans up all council scaffolding: removes worktrees, deletes `council/*` branches, removes `plan.md` and `reviews/` directory. The status `accepted` is recorded on the run, so `council_status` reports it, after a restart too.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
@@ -528,7 +524,7 @@ Accept and finalize council work. Cleans up all council scaffolding: removes wor
 
 ### `council_reject`
 
-Reject council work and provide feedback. Rewrites `plan.md` with rejection feedback and commits it. Does NOT delete any worktrees or branches — the council can be restarted to retry.
+Reject council work and provide feedback. Rewrites `plan.md` with rejection feedback and commits it. Does NOT delete any worktrees or branches — the council can be restarted to retry. The status `rejected` is recorded on the run, as for `council_accept`.
 
 | Parameter  | Type   | Required | Description                                 |
 | ---------- | ------ | -------- | ------------------------------------------- |
@@ -539,9 +535,7 @@ Reject council work and provide feedback. Rewrites `plan.md` with rejection feed
 
 ---
 
-## Inbox (8)
-
-`session_send_to`, `session_inbox`, and `session_deliver_inbox` accept optional `host`, `operationId`, and `waitTimeout` when remote sockets are enabled. `thread_register`, `thread_mailbox_send`, `thread_mailbox_read`, `thread_mailbox_ack`, and `thread_mailbox_wait` are broker-only. They register, read, ack, and wait on a manual native thread and do not resume it. Parameters are in [remote-sessions.md](./remote-sessions.md).
+## Inbox (3)
 
 ### `session_send_to`
 
@@ -602,14 +596,14 @@ Get status and plan text when completed.
 
 Start 1–20 reviewer agents that review the code in parallel, each from a different angle. Runs in background.
 
-| Parameter            | Type     | Required | Description                                                                                                                      |
-| -------------------- | -------- | -------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `cwd`                | string   | yes      | Project directory                                                                                                                |
-| `agentCount`         | number   |          | Agents (1-20, default 5)                                                                                                         |
-| `maxDurationMinutes` | number   |          | Duration (5-25 min, default 10)                                                                                                  |
-| `model`              | string   |          | Model for reviewers                                                                                                              |
-| `focus`              | string   |          | Review focus area                                                                                                                |
-| `engines`            | string[] |          | Engines to spread reviewers across (default `["claude"]`). Every reviewer runs read-only, so `grok` and `custom` are not allowed |
+| Parameter            | Type     | Required | Description                                                                                                          |
+| -------------------- | -------- | -------- | -------------------------------------------------------------------------------------------------------------------- |
+| `cwd`                | string   | yes      | Project directory                                                                                                    |
+| `agentCount`         | number   |          | Agents (1-20, default 5)                                                                                             |
+| `maxDurationMinutes` | number   |          | Duration (5-25 min, default 10)                                                                                      |
+| `model`              | string   |          | Model for reviewers                                                                                                  |
+| `focus`              | string   |          | Review focus area                                                                                                    |
+| `engines`            | string[] |          | Engines to spread reviewers across (default `["claude"]`). Every reviewer runs read-only, so `custom` is not allowed |
 
 ### `ultrareview_status`
 
@@ -621,7 +615,7 @@ Get status and findings when completed.
 
 ---
 
-## Autoloop (6)
+## Autoloop (7)
 
 Three-agent autonomous iteration loop (Planner / Coder / Reviewer) over a git workspace. See [`autoloop.md`](./autoloop.md) for the operator reference (push policy, ledger layout, smoke test).
 
@@ -629,43 +623,45 @@ Three-agent autonomous iteration loop (Planner / Coder / Reviewer) over a git wo
 
 Start a chat-mode autoloop. Planner starts immediately; Coder + Reviewer start only after the Planner receives plan approval and emits `spawn_subagents`.
 
-| Parameter                  | Type       | Required | Description                                                                                      |
-| -------------------------- | ---------- | -------- | ------------------------------------------------------------------------------------------------ |
-| `run_id`                   | string     | yes      | Stable run identifier                                                                            |
-| `workspace`                | string     | yes      | Git workspace path                                                                               |
-| `planner_engine`           | EngineType |          | Planner engine (default `claude`)                                                                |
-| `planner_model`            | string     |          | Planner model (Claude default `opus`; other engines use their own default when omitted)          |
+| Parameter                  | Type        | Required | Description                                                                                      |
+| -------------------------- | ----------- | -------- | ------------------------------------------------------------------------------------------------ |
+| `run_id`                   | string      | yes      | Stable run identifier                                                                            |
+| `workspace`                | string      | yes      | Git workspace path                                                                               |
+| `planner_engine`           | EngineType  |          | Planner engine (default `claude`)                                                                |
+| `planner_model`            | string      |          | Planner model (Claude default `opus`; other engines use their own default when omitted)          |
 | `planner_effort`           | EffortLevel |          | Fixed Planner reasoning effort; omission keeps the session default                               |
-| `planner_custom_engine`    | object     |          | Trusted `CustomEngineConfig` when Planner engine is `custom`. **Local callers only** — see below |
-| `coder_engine`             | EngineType |          | Default Coder engine (default `claude`)                                                          |
-| `coder_model`              | string     |          | Default Coder model (Claude default `sonnet`)                                                    |
+| `planner_custom_engine`    | object      |          | Trusted `CustomEngineConfig` when Planner engine is `custom`. **Local callers only** — see below |
+| `coder_engine`             | EngineType  |          | Default Coder engine (default `claude`)                                                          |
+| `coder_model`              | string      |          | Default Coder model (Claude default `sonnet`)                                                    |
 | `coder_effort`             | EffortLevel |          | Fixed Coder reasoning effort; omission keeps the session default                                 |
-| `coder_custom_engine`      | object     |          | Trusted config when Coder may use `custom`. **Local callers only**                               |
-| `reviewer_engine`          | EngineType |          | Default Reviewer engine (default `claude`)                                                       |
-| `reviewer_model`           | string     |          | Default Reviewer model (Claude default `sonnet`)                                                 |
+| `coder_custom_engine`      | object      |          | Trusted config when Coder may use `custom`. **Local callers only**                               |
+| `reviewer_engine`          | EngineType  |          | Default Reviewer engine (default `claude`)                                                       |
+| `reviewer_model`           | string      |          | Default Reviewer model (Claude default `sonnet`)                                                 |
 | `reviewer_effort`          | EffortLevel |          | Fixed Reviewer reasoning effort; omission keeps the session default                              |
-| `reviewer_custom_engine`   | object     |          | Trusted config when Reviewer may use `custom`. **Local callers only**                            |
-| `send_timeout_ms`          | number     |          | Per-agent send cap in ms (default 600000; inclusive 5000–7200000)                                |
-| `activity_lease_ms`        | number     |          | Inactivity lease in ms (default 1800000; inclusive 60000–7200000)                                |
-| `autoloop_hard_timeout_ms` | number     |          | Absolute run cap in ms (default 86400000; inclusive 600000–259200000)                            |
+| `reviewer_custom_engine`   | object      |          | Trusted config when Reviewer may use `custom`. **Local callers only**                            |
+| `send_timeout_ms`          | number      |          | Per-agent send cap in ms (default 600000; inclusive 5000–7200000)                                |
+| `activity_lease_ms`        | number      |          | Inactivity lease in ms (default 1800000; inclusive 60000–7200000)                                |
+| `autoloop_hard_timeout_ms` | number      |          | Absolute run cap in ms (default 86400000; inclusive 600000–259200000)                            |
 
 > **Custom engines are local-only.** A `CustomEngineConfig` names an executable to
 > spawn plus its argv and env, so it may only be supplied by a caller that already
 > runs on the host (this MCP tool, or the `SessionManager` API). **Every** HTTP
-> request body is checked, on every route, and one carrying a custom-engine
-> object at any depth — `customEngine`, `*_custom_engine`, `agentCustomEngines` —
-> is rejected with a 400 naming the offending key path. The embedded server is
-> often reverse-tunnelled and its token is a monitoring credential, not
-> permission to choose what binary runs. Built-in engines stay fully selectable
-> over HTTP.
+> request body is checked, on every route, and one carrying an inline engine
+> config at any depth — `customEngine`, `*_custom_engine`, `agentCustomEngines`,
+> `acpAgent` — is rejected with a 400 naming the offending key path. A bundled
+> preset id (a string) is accepted, since it cannot name a binary of its own. This keeps
+> credential-bearing engine configs out of request bodies and run specs; it is not a security
+> boundary, because the server's token already permits running commands (see
+> [Security model](./getting-started.md#security-model)). Built-in engines stay fully
+> selectable over HTTP.
 >
-> **Resuming by reference.** A remote resume names the credential instead of
-> carrying it — `plannerCustomEngineRef` and friends on `POST /autoloop/<id>/resume`,
-> `agentCustomEngineRefs` on `workflow_resume` — and the orchestrator resolves the
-> name against its own `CLAWO_CUSTOM_ENGINE_<NAME>` environment.
-> `GET /autoloop/<id>/resume-requirements` lists which roles need one. The name is
-> not sensitive, the value never leaves the host, and an unknown name fails rather
-> than starting without credentials.
+> **Resuming by reference.** A remote or MCP resume names the credential instead of
+> carrying it — `plannerCustomEngineRef` and friends on `autoloop_resume` and
+> `POST /autoloop/<id>/resume`, `agentCustomEngineRefs` on `workflow_resume` — and
+> the orchestrator resolves the name against its own `CLAWO_CUSTOM_ENGINE_<NAME>`
+> environment. `GET /autoloop/<id>/resume-requirements` lists which roles need one.
+> The name is not sensitive, the value never leaves the host, and an unknown name
+> fails rather than starting without credentials.
 
 Custom configs are not persisted or accepted from Planner output. See [`multi-engine.md`](./multi-engine.md) for their shape.
 
@@ -683,16 +679,46 @@ agent progress, never by timer checks or runner bookkeeping.
 `autoloop_hard_timeout_ms` is anchored to run start and never renews; it wins
 when it coincides with lease expiry.
 
-Recovery is exposed by `POST /autoloop/<id>/resume`, not by an MCP resume tool.
-Its timeout body is limited to `send_timeout_ms` plus
+Recovery is exposed by `autoloop_resume` and by `POST /autoloop/<id>/resume`.
+Both forward caller options once to `SessionManager.autoloopResume`; omission
+stays omission. The timeout body is limited to `send_timeout_ms` plus
 `pending_dispatch_id`. The send timeout must be finite, in range, and strictly
 larger than the run's latest effective value (600000 for runs that predate this setting). Equal
 or smaller values are rejected, and there is deliberately no
 `allow_decrease`. Lease and hard-cap overrides are not accepted on resume.
 Each successful increase appends one migration row to `decisions.jsonl`; the
-original run spec, history, and prior audit bytes are not rewritten. The
-matching live awaiting-resume condition is advanced without replaying the
-timed-out logical dispatch.
+original run spec, history, and prior audit bytes are not rewritten. Live
+semantics: a live ordinary or activity-lease pause (`pending_dispatch` null)
+resumes with no timeout fields (active again, lease re-armed, hard deadline
+unchanged, parked Planner chat delivered once); a live send-timeout pending
+pause is a no-op when timeout fields are omitted (pending is not cleared), and
+advancing it needs the matching live awaiting-resume increase plus
+`pending_dispatch_id` without replaying the timed-out logical dispatch. Cold
+semantics: omission still follows manager reconstruction even when a pending
+dispatch was stored; `pending_dispatch_id` is required only when an increase
+and pending coexist; a cold timeout-only increase without pending remains
+supported.
+
+### `autoloop_resume`
+
+Resume a v2 autoloop run through the same manager path as the HTTP resume route.
+Returns `{ ok, state }` (normalized by the plugin result wrapper). A paused or
+terminated state is not completed project work. Live pending omission is a
+no-op; cold omission follows reconstruction; pending ID is conditional on
+increase+pending; cold timeout-only increase without pending is supported.
+
+| Parameter                 | Type   | Required | Description                                                                                                   |
+| ------------------------- | ------ | -------- | ------------------------------------------------------------------------------------------------------------- |
+| `run_id`                  | string | yes      | Run id from `autoloop_start` (store grammar: 1–128 ASCII; first letter/digit/underscore)                      |
+| `send_timeout_ms`         | number |          | Optional strict increase (schema range 5000–7200000; no default)                                              |
+| `pending_dispatch_id`     | string |          | Exact pending id when increasing while a pending dispatch exists (1–128 ASCII letters/digits/`_`/`.`/`:`/`-`) |
+| `plannerCustomEngineRef`  | string |          | Host secret name for Planner custom engine (`CLAWO_CUSTOM_ENGINE_<REF>`; same 1–128 ASCII grammar)            |
+| `coderCustomEngineRef`    | string |          | Host secret name for Coder custom engine (same grammar)                                                       |
+| `reviewerCustomEngineRef` | string |          | Host secret name for Reviewer custom engine (same grammar)                                                    |
+
+Invalid `run_id` / pending / ref shapes fail at the facade with fixed field errors
+before any secret resolve or manager call. Valid-input manager and resolver errors
+propagate unchanged (no blanket catch).
 
 ### `autoloop_chat`
 
@@ -703,9 +729,20 @@ Send a message into the Planner conversation.
 | `run_id`  | string | yes      |
 | `text`    | string | yes      |
 
+The message is accepted only once it is stored in the run checkpoint; otherwise
+the call fails with `autoloop chat could not be persisted` (or a stopping,
+restoring or limit error) and nothing is sent. Accepted chat survives
+`autoloop_stop` and owner loss and is delivered once, in order, after a resume.
+A message that was mid-delivery when the run stopped is not resent; it is
+reported through `unconfirmed_chat` in `autoloop_status` and one notice in chat
+history. A rejected control shows a diagnostic in the chat reply and adds a
+best-effort `planner_control_error` row to `decisions.jsonl`; nothing is
+retried automatically.
+
 ### `autoloop_status`
 
-Get the current state and push log.
+Get the current state: `status`, `iter`, `push_log_count`, `subagents_spawned`, `status_reason`,
+`pending_dispatch`, `unconfirmed_chat` and the recent phase errors and metrics. Returns `{ ok, state }`.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
@@ -713,7 +750,7 @@ Get the current state and push log.
 
 ### `autoloop_list`
 
-List active Autoloop runs in this manager process.
+List the Autoloop runs recorded on this machine, running and finished, newest first.
 
 (no params)
 
@@ -743,9 +780,14 @@ Terminate the run and stop all role sessions.
 
 Forge tab — turn a structured Q&A interview into a deployed web app reachable at `localhost:19000/forge/<slug>/`. See [`ultraapp.md`](./ultraapp.md) for the operator reference (lifecycle, conventions §1–§7, runtime modes, file layout, HTTP routes).
 
+Deploying needs the Forge router, which `clawo serve` starts. Without it a build stops at
+`build-complete`, and `ultraapp_promote_version`, `ultraapp_start_container` and
+`ultraapp_stop_container` return `{ ok: false, error: 'router not configured' }`.
+
 ### `ultraapp_list`
 
-List all ultraapp runs.
+List all ultraapp runs with title, mode and timestamps. Modes: `interview`, `queued`, `building`,
+`build-complete`, `deploying`, `done`, `failed`, `cancelled`. Start a new run with `ultraapp_new`.
 
 (no params)
 
@@ -759,7 +801,7 @@ Full snapshot of a run: spec + chat + state.
 
 ### `ultraapp_status`
 
-Lightweight status (mode + timestamps).
+Lightweight status: mode, timestamps, and the failure reason if any.
 
 | Parameter | Type   | Required |
 | --------- | ------ | -------- |
@@ -817,7 +859,7 @@ Abort an active build. Council sessions are stopped and the worktrees are left a
 
 ### `ultraapp_feedback`
 
-Done-mode feedback. Haiku classifier routes into `cosmetic` (Opus patcher), `spec-delta` (focused interview + auto-rerun), or `structural` (suggest fresh run).
+Done-mode feedback. Haiku classifier routes into `cosmetic` (Opus patcher), `spec-delta` (focused interview + auto-rerun), or `structural` (suggest fresh run). Before the run reaches `done`, the text goes to the interview as a free-form answer instead.
 
 | Parameter | Type   | Required | Description             |
 | --------- | ------ | -------- | ----------------------- |
@@ -826,7 +868,7 @@ Done-mode feedback. Haiku classifier routes into `cosmetic` (Opus patcher), `spe
 
 ### `ultraapp_promote_version`
 
-Atomically swap the deployed version. Stops the current container/process, starts the target's, updates the router map.
+Make a version the one serving the app. A version deployed before is swapped in: the live container/process is stopped, the target's is started, and the router map is updated; if the target does not start, the previous version is put back. A version never deployed (a patched one, typically) is built and deployed first, which replaces the live version.
 
 | Parameter | Type   | Required | Description                          |
 | --------- | ------ | -------- | ------------------------------------ |
@@ -869,38 +911,52 @@ Full semantics in [`workflow.md`](./workflow.md) and
 Start a durable run. Every state transition is checkpointed to disk, so a run
 survives a process restart and can be resumed.
 
-| Param        | Type                             | Notes                                                                |
-| ------------ | -------------------------------- | -------------------------------------------------------------------- |
-| `spec`       | object                           | `WorkflowSpec`: `{ name, nodes[], cwd?, contract?, maxNodeVisits? }` |
-| `template`   | `solve` \| `council` \| `fanout` | Build a built-in instead of supplying `spec`                         |
-| `task`       | string                           | Required with `template`                                             |
-| `agents`     | array                            | `{ name, engine?, model?, effort?, persona? }`                       |
-| `reviewers`  | array                            | `solve` only — same agent binding for final reviewers                |
-| `humanGate`  | boolean                          | `solve` only — park for approval before anything is written          |
-| `maxRepairs` | number                           | `solve` only, default 3                                              |
-| `cwd`        | string                           | Working directory                                                    |
-| `runId`      | string                           | Explicit id                                                          |
-| `contract`   | object                           | Acceptance contract — see below                                      |
+| Param         | Type                                       | Notes                                                                                                         |
+| ------------- | ------------------------------------------ | ------------------------------------------------------------------------------------------------------------- |
+| `spec`        | object                                     | `WorkflowSpec`: `{ name, nodes[], cwd?, contract?, maxNodeVisits? }`                                          |
+| `template`    | `solve` \| `council` \| `fanout` \| `goal` | Build a built-in instead of supplying `spec` (default `solve` when `spec` is omitted)                         |
+| `task`        | string                                     | Required with `template`; for `goal` it is the objective                                                      |
+| `agents`      | array                                      | Up to 16 `{ name, engine?, model?, effort?, persona? }` (default one agent named `agent`); not used by `goal` |
+| `reviewers`   | array                                      | `solve` only — up to 8, same agent binding, for final reviewers                                               |
+| `implementer` | object                                     | `solve` only — `{ engine?, model?, acpAgent? }` for the agent that writes the change                          |
+| `humanGate`   | boolean                                    | `solve` only — park for approval before anything is written                                                   |
+| `maxRounds`   | number                                     | `council` only — max collaboration rounds, default 15                                                         |
+| `maxRepairs`  | number                                     | `solve` / `goal` — repair attempts, default 3 for `solve`, 1 for `goal`                                       |
+| `model`       | string                                     | `goal` only — Codex model (default: Codex's own)                                                              |
+| `tokenBudget` | number                                     | `goal` only — tokens the goal may spend                                                                       |
+| `launcher`    | string[]                                   | `goal` only — argv prefix Codex runs under (e.g. a sandbox wrapper); it runs with your authority              |
+| `cwd`         | string                                     | Working directory                                                                                             |
+| `runId`       | string                                     | Explicit id                                                                                                   |
+| `contract`    | object                                     | Acceptance contract — see below                                                                               |
 
-Returns `{ runId, workflow, state, nodes }` and runs in the background.
+Returns `{ runId, workflow, state, nodes }` and runs in the background. The `goal` template runs a
+Codex `/goal` on one `codex-app` thread, then the contract, then repairs on the same thread; see
+[workflow.md](./workflow.md#goal).
 
 ### `workflow_status`
 
-`{ runId, events? }` → run state, per-node status, `outcome`, `evidenceId`,
-`costUsd`, `consensusVotes`, and the last N events when `events` is given.
+`{ runId, events? }` → run state, per-node status, `outcome`, `outcomeReason`,
+`verdict`, `evidenceId`, `costUsd`, `consensusVotes`, and the last N events when
+`events` is given.
 
 `outcome` is `verified` (a contract passed), `refuted` (it failed), or
-`unverified` (**none was declared — nothing checked the work**, which is not the
-same as a failure).
+`unverified` (**nothing checked the work**, which is not the same as a failure):
+either no contract was declared, or a pass no longer stands because the tree
+changed after it or an abandoned attempt was still running, in which case
+`outcomeReason` says why. `verdict` is the most recent verifier result: its node,
+`evidenceId` and the tree digest it was taken at.
 
 ### `workflow_list` / `workflow_resume` / `workflow_cancel` / `workflow_steer` / `workflow_approve`
 
-- `workflow_list({ workflow?, state?, limit? })` — newest first, survives restarts.
-- `workflow_resume({ runId })` — nodes already succeeded are not re-run; the node
-  that was in flight is retried, because a half-finished node left no result to
-  trust.
-- `workflow_cancel({ runId })`.
-- `workflow_steer({ runId, text })` — the text is **prepended** to the next agent
+- `workflow_list({ workflow?, state?, limit? })` — newest first (`limit` default 25), survives
+  restarts. `state` is one of `pending`, `running`, `awaiting_human`, `verifying`, `completed`,
+  `failed`, `cancelled`.
+- `workflow_resume({ runId, agentCustomEngineRefs? })` — nodes already succeeded are not re-run;
+  the node that was in flight is retried, because a half-finished node left no result to trust.
+  A run whose agents used a custom engine needs `agentCustomEngineRefs`
+  (`{ "<agent>": "<REF>" }`, resolved from `CLAWO_CUSTOM_ENGINE_<REF>` on the orchestrator's host).
+- `workflow_cancel({ runId })` → `{ cancelled }`.
+- `workflow_steer({ runId, text })` → `{ steered }` — the text is **prepended** to the next agent
   node's prompt. Steers not yet consumed are delivered after a restart too.
 - `workflow_approve({ runId, approved })` — answers a `human_gate` node. A run
   parked before the server restarted is resumed with the answer attached, so it
@@ -911,10 +967,12 @@ same as a failure).
 
 Run an acceptance contract against a directory outside any workflow — for a plain
 `session_send` that edited a repo, say. `{ cwd, contract, baseSha?, label? }` →
-the evidence bundle.
+the evidence bundle, stored under `~/.claw-orchestrator/wf/<label>/evidence/`. A
+`label` that is the id of an existing workflow run is refused.
 
 Without `baseSha`, `diff_policy` sees untracked files only. `verify_run` has no record of
-the tree before the work, so `protectTests` does not apply to it.
+the tree before the work, so `protectTests` does not apply to it. It runs the checks once and
+spawns no repair session, so `fixOnFailureRounds` does not apply either.
 
 ### The `contract` parameter
 
@@ -947,8 +1005,3 @@ evidence bundle without refuting the run.
 
 `screenshot` captures and stores images. It does not compare pixels and is not
 visual regression testing.
-
-
-### Memento fork effort values
-
-Effort parameters accept `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `ultra`, `default`, and `auto`. Availability is model/engine-specific: the schema is the union, not a claim that every model supports every level. `default` is an explicit OpenCode provider variant; `auto` selects engine defaults. Cursor requires an advertised model/effort pair. See `multi-engine.md` and `memento-effort-validation.md` for native and gateway delivery evidence.

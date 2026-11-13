@@ -15,25 +15,45 @@ SessionManager
 ├── engine: 'agy'       → PersistentAgySession
 │   └── Wraps: agy -p (Google Antigravity CLI, per-message spawning, stream-json output)
 ├── engine: 'grok'      → PersistentGrokSession
-│   └── Wraps: grok -p --output-format json (xAI Grok Build, per-message spawning)
-├── engine: 'cursor'    → PersistentCursorSession (legacy)
-│   └── Wraps: cursor-agent -p --trust --output-format stream-json (per-message spawning)
+│   └── Wraps: grok -p --output-format streaming-json (xAI Grok Build, per-message spawning)
 ├── engine: 'opencode'  → PersistentOpencodeSession
-│   └── Wraps: opencode run --format json (per-message spawning)
+│   └── Wraps: opencode run --format json, message on stdin (per-message spawning)
+├── engine: 'acp'       → PersistentAcpSession
+│   └── Wraps: any Agent Client Protocol agent on stdio (long-running, one ACP session)
 └── engine: 'custom'    → PersistentCustomSession
     └── Wraps: any CLI via user-provided CustomEngineConfig
 ```
+
+The `gemini` and `cursor` engines are legacy: still wired for existing callers, not documented
+as options (see the notes under [Antigravity](#google-antigravity-engine-agy) and
+[Grok Build](#grok-build-engine-grok)).
+
+### At a glance
+
+| Engine      | Process                             | How the conversation carries over                                       | Where cost comes from                                                  |
+| ----------- | ----------------------------------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| `claude`    | one long-running `claude -p`        | the live process; `--resume <id>` when a session is restarted           | the CLI's own `total_cost_usd` (registry estimate in proxy mode)       |
+| `codex`     | one `codex exec` per send           | `codex exec resume <thread_id>`                                         | registry price × reported tokens                                       |
+| `codex-app` | one long-running `codex app-server` | the live thread; `thread/resume` when a session is restarted            | registry price × reported tokens                                       |
+| `agy`       | one `agy -p` per send               | `--conversation <id>`                                                   | registry price × reported tokens                                       |
+| `grok`      | one `grok -p` per send              | `--resume <sessionId>`                                                  | grok's own `total_cost_usd`                                            |
+| `opencode`  | one `opencode run` per send         | `--session <id>`                                                        | opencode's own `step_finish` cost (registry estimate when none)        |
+| `acp`       | one long-running agent process      | one ACP session; `session/resume` or `session/load` on restart          | what the agent reports (estimated from `pricing` when it reports none) |
+| `custom`    | persistent, or one process per send | persistent: the live process (`args.resume` on restart); one-shot: none | registry price × reported tokens (see `pricing` below)                 |
 
 ## Supported Engines
 
 ### Claude Code (`engine: 'claude'`)
 
-Default engine. Long-running subprocess with streaming JSON I/O. Tested with Claude Code CLI **2.1.284**.
+Default engine. Long-running subprocess with streaming JSON I/O. Tested with Claude Code CLI **2.1.322**.
 
 - Persistent multi-turn conversations
 - Real-time streaming (text, tool_use, tool_result, system events)
 - Session resume via `--resume`
-- Full cost tracking from API usage data
+- Cost is the CLI's own `total_cost_usd`, which prices cache writes. It is a running total for the
+  process, so spend advances by the difference between reports. The registry estimate is used
+  instead in proxy mode (the CLI is told it runs `opus`) and for the first turn of a process started
+  with `--resume`, whose first report includes the spend of the turns it resumed
 - Cross-session peer messaging (`crossSessionInbound`): this session's policy for messages from
   other Claude Code sessions on the same machine — `accept` delivers them, `hold` waits for approval
   in that session's terminal, `refuse` rejects them. It is a settings key, passed through
@@ -60,27 +80,84 @@ await manager.startSession({
 });
 ```
 
+#### Claude accounts and rotation
+
+One server can run Claude sessions under several Claude accounts, and move a session to another
+account when one reaches its usage limit. Every account keeps the one Claude Code configuration
+directory, so skills, hooks, settings and conversation transcripts are shared, and a conversation
+continues under another account by its own session id. Accounts are listed in
+`~/.claw-orchestrator/claude-accounts.json` (`CLAWO_CLAUDE_ACCOUNTS` relocates it):
+
+```json
+{
+  "accounts": {
+    "team": { "kind": "oauth" },
+    "max": { "kind": "oauth", "tokenCommand": ["security", "find-generic-password", "-s", "claude-max", "-w"] },
+    "payg": { "kind": "apiKey", "tokenEnv": "ANTHROPIC_BACKUP_KEY" },
+    "gateway": { "kind": "gateway", "baseUrl": "http://127.0.0.1:8080" }
+  },
+  "rotation": ["team", "max", "payg", "gateway"],
+  "default": "auto",
+  "switchAt": 0.95
+}
+```
+
+- **Kinds.** `oauth` is a subscription token from `claude setup-token`; `apiKey` an Anthropic API key,
+  billed per use; `gateway` an Anthropic-compatible endpoint (`baseUrl`) with its own auth token, plus
+  any environment it needs (`env`). A gateway on another host must use https; plain http is accepted
+  only on this machine (`localhost`, `127.0.0.0/8`, `::1`).
+- **The file is trusted like your Claude Code settings.** It names commands the server runs and
+  endpoints it sends credentials to, so the server reads it only when it belongs to the server's user
+  and neither group nor others can write it (`chmod 600`); otherwise sessions that need it fail to
+  start, naming the file.
+- **Credentials** come from the server's own environment, `tokenEnv` (default
+  `CLAWO_CLAUDE_TOKEN_<NAME>`), or from the stdout of `tokenCommand`, an argv run without a shell. A
+  session is never started on another login when an account's credential is missing; the start fails
+  and names the source. The credential reaches the CLI in a `--settings` file with mode 0600 in a
+  private directory, removed when the process ends, when the server exits, or, after a crash, by the
+  next server: a `--settings` value outranks the `env` of the user's settings file, which in turn
+  outranks the process environment. The other kinds' variables are set to neutral values in the same
+  file, so a gateway or token configured in the user settings does not win over the account.
+- **Choosing.** `claudeAccount` on `session_start` names an account, or `auto` for the first available
+  account in `rotation`; `default` applies the same to sessions that name none, and without it they
+  use the CLI's own login. An account runs a Claude model against the account's own endpoint, so it
+  cannot be combined with `baseUrl`, a non-Claude model (served through the built-in proxy) or
+  `CLAWO_CLAUDE_GATEWAY`; the default simply does not apply to such sessions. The session's status
+  reports the account it runs under (`claudeAccount`).
+- **Rotation.** A session on an account in `rotation` moves to the next available one, in rotation
+  order, when the account refuses a turn (`usage_limit_reached`), and the turn is sent again on the
+  same conversation, at most once per account. It also moves before a turn once any of the account's
+  usage windows has reached `switchAt`, as reported by the CLI after every turn. A refused account is
+  skipped until its window resets, and the server shares this across its sessions. An account outside
+  `rotation` never moves. A session started with `noSessionPersistence` keeps no transcript to
+  resume, so it does not move either: its turn fails with the limit.
+
 ### OpenAI Codex (`engine: 'codex'`)
 
-Wraps the `codex exec` subcommand. Each `send()` spawns a new process. Tested with `codex` CLI **0.159.0**.
+Wraps the `codex exec` subcommand. Each `send()` spawns a new process. Tested with `codex` CLI **0.167.0**.
 
 - Non-interactive execution via `codex exec --sandbox workspace-write --skip-git-repo-check --json`
 - Real `usage` from the `turn.completed` JSON event (input, output, cached, reasoning tokens). **These are cumulative over the thread, not per turn**, so they replace the session totals rather than being added to them; subtracting consecutive values gives one turn's prompt
 - `contextPercent` is the per-turn prompt measured against **codex's own context limit** (`model_context_window`, read from the thread's rollout file), not the model's published window in the registry. Resuming a thread also seeds the token baseline from the rollout, so the first send does not count the whole thread history as one prompt. This is best-effort: an unreadable or `--ephemeral` thread falls back to the registry window
 - `item.completed` parsing distinguishes `reasoning` / `todo_list` (logged, not counted) from real tool items (`command_execution`, `file_change`, `mcp_tool_call`, `web_search`, which increment `toolCalls`; a non-zero `command_execution.exit_code` increments `toolErrors`)
-- Reasoning effort: the engine-agnostic `effort` maps to `-c model_reasoning_effort=<level>` for `low|medium|high|xhigh|max|ultra`; `auto` and `ultracode` pass nothing. `-c` values are not validated at spawn, so an unknown level fails at the API rather than at the command line
+- Reasoning effort: the engine-agnostic `effort` maps to `-c model_reasoning_effort=<level>` for `low|medium|high|xhigh|max|ultra`; `auto` passes nothing. Only those levels are passed, because codex does not validate `-c` values at spawn: an unlisted one would fail at the API rather than at the command line
 - `appendSystemPrompt`: codex has no system-prompt flag, so it is placed at the top of the first message of each new conversation (a resumed thread already carries it)
 - `jsonSchema` → `--output-schema <file>` (written to a temp file, accepted by `exec` and `exec resume`)
-- `noSessionPersistence` → `--ephemeral` (accepted by `exec` and `exec resume`); `ignoreUserConfig` → `--ignore-user-config`, which stops `$CODEX_HOME/config.toml` from choosing the model for an orchestrated run (auth still resolves from `CODEX_HOME`); `codexMcpServers` (with `ignoreUserConfig`) keeps named MCP servers instead: `--ignore-user-config` would drop their definitions, so every other configured server is disabled with `-c` plus a same-type inert transport stub (`command="false"` for stdio or loopback port 9 URL for streamable HTTP), using names, enabled state, and `transport.type` from `codex mcp list --json`, re-listed before each turn; the rest of the config loads; `addDir` → `--add-dir` on the first turn only, since `exec resume` rejects it and the resumed thread keeps the roots it opened with
+- `noSessionPersistence` → `--ephemeral` (accepted by `exec` and `exec resume`); `ignoreUserConfig` → `--ignore-user-config`, which stops `$CODEX_HOME/config.toml` from choosing the model for an orchestrated run (auth still resolves from `CODEX_HOME`); `addDir` → `--add-dir` on the first turn only, since `exec resume` rejects it and the resumed thread keeps the roots it opened with
 - `codexProfile` → `--profile <name>` (named config profile from `~/.codex/config.toml`), first turn only
 - `--worktree` is not passed. With it, codex writes the turn's edits to `~/.codex/worktrees/<hash>/<repo>` instead of the session's `cwd`, while acceptance contracts, evidence diffs and the baseline change set all read the session's `cwd`. Council's per-agent git worktrees cover the isolation use case
-- Per-session continuity: the `thread_id` from the first turn's `thread.started` event is captured and reused via `codex exec resume <id>` for subsequent sends, so the model sees prior turns
-- `sandboxMode` maps to `--sandbox <mode>` on the first turn. A resumed thread does not keep it, and `codex exec resume` rejects `--sandbox`, so the policy is restated as `-c sandbox_mode="<mode>"` on every resumed turn
-- One-shot execution per message (no persistent subprocess between sends)
-- Captures the real Codex thread ID and persists it, so later sends and process-level session resume use `codex exec resume <thread_id>`
+- Continuity: the `thread_id` from the first turn's `thread.started` event is captured and reused via `codex exec resume <id>` for later sends, so the model sees prior turns. The id is persisted too, so a restarted session (and `resumeSessionId`) resumes the same thread
+- `sandboxMode` maps to `--sandbox <mode>` on the first turn (default `workspace-write`). A resumed thread does not keep it, and `codex exec resume` rejects `--sandbox`, so the policy is restated as `-c sandbox_mode="<mode>"` on every resumed turn
 - Working directory passed via `-C` on the first turn
-- Default model: `gpt-5.5`
+- Model: with no `model`, codex runs its own default — the `model` in `~/.codex/config.toml` if set. Cost is then priced as the model codex reports it ran (the rollout's `turn_context`; `thread/start` on `codex-app`), and as `gpt-5.5` only when that cannot be read. Cached reads are inside codex's `input_tokens`, so they are taken out and priced at the cached rate
 - Requires `codex` CLI >= 0.119 (for `exec resume`): `npm install -g @openai/codex`
+- The prompt is sent on stdin (`codex exec … -`), never on the command line.
+- **Windows:** the npm `.cmd` shim launches through `src/engine-spawn.ts` (cross-spawn), which escapes the remaining arguments for `cmd.exe`. Because the prompt is on stdin it arrives unchanged, newlines and quotes included. A timed-out turn ends the whole process tree (`taskkill /T /F`), not only `cmd.exe`.
+- **Image generation**: ask for an image and Codex generates it with its built-in tool and saves it under
+  `$CODEX_HOME/generated_images/<thread_id>/`. `codex exec --json` reports no event for it, so the
+  adapter lists the files the turn added there and returns them as `images` on the send result
+  (`codex-app` reads them from the `imageGeneration` item, with the revised prompt). It uses the
+  account's image-generation allowance.
 - **Does not support `/goal`** — for that, use `engine: 'codex-app'` below
 
 ```typescript
@@ -95,23 +172,21 @@ await manager.startSession({
 
 ### OpenAI Codex App-Server (`engine: 'codex-app'`)
 
-Wraps `codex app-server --listen stdio:// --enable goals` as a long-running JSON-RPC subprocess. **Required for `/goal` long-horizon objective support** — Codex's exec subcommand has no slash-command surface.
+Wraps `codex app-server --listen stdio:// --enable goals` as a long-running JSON-RPC subprocess. **Required for `/goal` long-horizon objective support** — Codex's exec subcommand has no goal surface. Tested with `codex` CLI **0.167.0**.
 
 - Long-running subprocess; one `codex app-server` per session
 - JSON-RPC 2.0 over stdio with v2 protocol method names (`initialize`, `thread/start`, `turn/start`, ...)
 - Real-time streaming via `item/agentMessage/delta` notifications
 - Cumulative token tracking from `thread/tokenUsage/updated` notifications. The same notification's `last` breakdown and `modelContextWindow` drive `contextPercent`, so it reports live occupancy against the window the server enforces rather than a running total over the model's published window
 - `appendSystemPrompt` is placed at the top of the first message of a new thread (app-server has no system-prompt flag); a resumed thread already carries it
-- Goal lifecycle observation via `thread/goal/updated` and `thread/goal/cleared` notifications
-- Goal control via the `codex_goal_*` tools, which call `thread/goal/set`, `thread/goal/get`, and `thread/goal/clear` with `origin: "user"` (see [tools.md](./tools.md#codex-14)). Pause and resume are status updates. The RPC returns when the goal is stored; the app-server pursues an active goal on its own.
-- `codex_side` forks an ephemeral thread, injects Codex's side-conversation boundary, asks one question there, and unsubscribes. The parent thread id does not change.
-- v2 RPC tools (Codex 0.137): `codex_interrupt` (`turn/interrupt`), `codex_steer` (`turn/steer`), `codex_fork` (`thread/fork`), `codex_rollback` (`thread/rollback`), `codex_models` (`model/list`), `codex_thread_list` (`thread/list`). A `turn/completed` with `status: 'failed'` rejects the turn and increments `toolErrors`.
-- Thread resume: starting with `resumeSessionId` loads the existing thread via `thread/resume` instead of `thread/start`.
-- `error` notifications (v2 `ErrorNotification`: `error.message`, `willRetry`, `turnId`) are reported to the session manager as errors carrying that message and recorded in session `health`; they never settle or kill the turn or the app-server (`turn/completed` / process exit do). `willRetry: true` is only logged. With no listener the session logs instead of emitting, so an `error` event cannot become an uncaught exception.
-- `ignoreUserConfig` / `codexMcpServers`: `codex app-server` has no `--ignore-user-config`, and `-c mcp_servers={}` does not clear anything (config tables merge), so the app-server is spawned with `-c mcp_servers.<name>.enabled=false` and a same-type inert transport stub for every server that is not selected. Codex 0.161.0 validates each override layer as a transport, so the stub is required. Only names, enabled state, and `transport.type` are used; configured commands, URLs, headers and env are not retained or emitted. If the listing fails, a selected name is unknown, or an excluded server uses an unsupported transport type, the start fails before the app-server spawns. These failures are caller or configuration errors (`CodexMcpConfigError`) and do not count toward the engine's circuit breaker.
-  - `codex mcp list --json` is Codex's own enumeration and it contacts the URL of every streamable-HTTP server it lists, including ones this session is about to exclude: unauthenticated GETs to the server's `/mcp` and its `.well-known/oauth-*` / `openid-configuration` discovery paths (nothing is sent when `bearer_token_env_var` is configured), bounded by Claw's 30 s listing timeout. No credentials are sent. "Excluded" therefore means "not started by the session", not "never contacted"; Codex offers no listing mode that skips this.
-
-> **Feature flag.** `goals` is an experimental Codex feature. The session always passes `--enable goals`; some goal commands may still fail or be ignored by the server.
+- Reasoning effort: the session `effort` opens or resumes the thread with `config: { model_reasoning_effort }`, so the goal loop's own turns use it too, and each `turn/start` carries `effort` (the per-send override, else the session's), so `setEffort` reaches the next turn. The levels are the same as `codex`'s; `auto` passes nothing, and codex keeps the last effort it was sent for the turns after it
+- Goals through the typed RPCs `thread/goal/set` / `get` / `clear`: setting an objective starts the server's own turn loop, which runs until the goal is `complete`, `budgetLimited`, `blocked`, `usageLimited` or `paused`. Each change arrives as `thread/goal/updated`. The `codex_goal_*` tools wrap these; the kernel's `goal` node drives them for unattended runs ([workflow.md](./workflow.md#goal))
+- `error` notifications are read as `{ error: { message, codexErrorInfo }, willRetry }`. The session keeps the last one (`lastError`, with `codexErrorInfo` as a name such as `serverOverloaded`) and emits it as `codex:error`; an error notification never throws when nothing listens for errors
+- v2 RPC tools (Codex 0.137): `codex_interrupt` (`turn/interrupt`), `codex_steer` (`turn/steer`, including into a turn the goal loop started), `codex_fork` (`thread/fork`), `codex_rollback` (`thread/rollback`), `codex_models` (`model/list`), `codex_thread_list` (`thread/list`). A `turn/completed` with `status: 'failed'` rejects the turn and increments `toolErrors`.
+- Threads are opened and resumed with `approvalPolicy: "never"`, and a server request the session cannot handle (an approval, a request for user input) gets an error reply at once: nothing here can answer one, and an unanswered request blocks its turn. The sandbox mode is the boundary.
+- Thread resume: starting with `resumeSessionId` loads the existing thread via `thread/resume` instead of `thread/start`. The id the session manager stores and replays (model switch, restart) is the app-server's own thread id. A thread resumed with an active goal continues it on its own. An id that `thread/resume` rejects falls back to a new thread (logged); the `goal` node refuses that case rather than start the goal over.
+- `compact` asks the app-server to compact the thread (`thread/compact/start`).
+- `clawo goal "<objective>" --check "npm test"` runs the `goal` workflow from the command line: one goal on one thread, then the runtime's own checks, then repair on the same thread ([cli.md](./cli.md#clawo-goal)).
 
 ```typescript
 await manager.startSession({
@@ -120,8 +195,7 @@ await manager.startSession({
   model: 'gpt-5.5',
   cwd: '/project',
 });
-// Then either:
-//   await manager.codexGoalCommand('codex-goal-task', 'build a tic-tac-toe app');
+await manager.codexGoal('codex-goal-task', { action: 'set', objective: 'build a tic-tac-toe app' });
 // or via the codex_goal_set tool:
 //   await tool('codex_goal_set', { name: 'codex-goal-task', objective: 'build a tic-tac-toe app' });
 ```
@@ -130,7 +204,7 @@ await manager.startSession({
 
 Wraps Google's **Antigravity CLI** (`agy`) — the successor to Gemini CLI (consumer
 Gemini CLI tiers stopped serving 2026-06-18). Each `send()` spawns a new process
-in print mode. Tested with `agy` **1.2.13**.
+in print mode, with the message as the `-p` argument. Tested with `agy` **1.5.3**.
 
 - One-shot execution per message (no persistent subprocess)
 - **Structured output and real usage** — `--output-format stream-json` emits an
@@ -166,13 +240,15 @@ in print mode. Tested with `agy` **1.2.13**.
   passes the requested effort through rather than substituting a tier the caller
   did not ask for; run `agy models` to see the tiers a slug actually exposes.
 
-- Permission modes: `bypassPermissions` → `--dangerously-skip-permissions`,
-  `default` and `manual` → `--sandbox` (terminal-restricted), and
+- Permission modes: `bypassPermissions` (or `dangerouslySkipPermissions`) →
+  `--dangerously-skip-permissions`, `default` and `manual` → `--sandbox`
+  (terminal-restricted), and
   `sandboxMode: 'read-only'` → `--mode plan` (takes precedence). Other modes
   run agy's own approval flow, which can block in headless print mode. A caller
   must explicitly choose `bypassPermissions` for a write-enabled session; it is
   not a recovery mechanism. In particular, an Autoloop Planner stays on
   `--mode plan` when its preserved conversation is resumed.
+- `settings` is passed as `--settings`: settings.json keys as inline JSON or a file path, for this run only. agy refuses a key it does not know.
 - The engine always passes `--print-timeout`, set just inside the send timeout
   (10% earlier, at most 10s). Since agy 1.2.9 a headless run whose agent started a
   background task (a dev server, a watcher) stays open until that deadline and
@@ -190,7 +266,8 @@ in print mode. Tested with `agy` **1.2.13**.
   pass through unregistered. The `agy/` prefix forces Antigravity routing for
   provider-like model strings.
 - Consumer auth is a one-time `agy` Google OAuth login (subscription quotas, no
-  per-token billing — registry pricing mirrors Gemini API rates as a value proxy)
+  per-token billing — registry pricing mirrors Gemini API rates as a value proxy).
+  An effort-qualified slug such as `gemini-3.1-pro-high` is priced as its base model
 - Requires `agy` installed: `curl -fsSL https://antigravity.google/cli/install.sh | bash`
 - Binary: `agy` (set `AGY_BIN` env var to override)
 
@@ -206,44 +283,59 @@ await manager.startSession({
 
 > **Legacy: `engine: 'gemini'`.** Google sunset the consumer Gemini CLI (tiers stopped
 > serving 2026-06-18) in favour of Antigravity. The `gemini` engine still exists and
-> still works — existing callers are not broken, and `gemini-*` model strings outside
-> agy's registered slugs still route to it — but it is no longer a documented option,
-> is not version-tracked, and gets no new work. Use `agy` for Google. (Unrelated: the
-> multi-model **proxy** still talks to the Gemini **API**; that is a different
-> subsystem and is unaffected.)
+> still works for existing callers, but it is no longer a documented option, is not
+> version-tracked, and gets no new work. Use `agy` for Google. The OpenAI-compatible
+> endpoint and the ACP agent pick the engine from the model name, and there `gemini-*`
+> strings outside agy's registered slugs (including the `gemini-pro` and `gemini-flash`
+> aliases) still route to the `gemini` engine. (Unrelated: the multi-model **proxy**
+> still talks to the Gemini **API**; that is a different subsystem and is unaffected.)
 
 ### Grok Build (`engine: 'grok'`)
 
-Wraps xAI's **Grok Build** CLI. Each `send()` spawns `grok -p <msg> --output-format json`, which
-prints a single JSON object and exits. Tested with `grok` **1.0.44**.
+Wraps xAI's **Grok Build** CLI. Each `send()` spawns `grok -p <msg> --output-format streaming-json`,
+which prints one JSON object per line and exits: the reply as `text` pieces, a `usage` event per
+request, and an `end` event with the rest. Tested with `grok` **1.0.77**.
 
-- **Cost comes from the engine, not from the price table.** The result object carries
+- **Cost comes from the engine, not from the price table.** The `end` event carries
   `total_cost_usd`, and the wrapper writes it straight into the session's spend, so the run ledger
   and the `maxBudgetUsd` gate both read what xAI charged. Other engines multiply tokens by a rate in
-  `models.ts`. `grok-4.6` is still registered, for its context window and an indicative breakdown.
+  `models.ts`. `grok-4.7` (grok's default since 1.0.67) and `grok-4.6` are still registered, for
+  their context window and an indicative breakdown; with no `model` set, the session is labelled with
+  the model grok reports under `modelUsage`.
 - **Real conversation continuity**: the `sessionId` from turn 1 is replayed as `--resume <id>`.
   `--continue` is not used — it means "the most recent session for this cwd", which collides
   between concurrent sessions.
-- Real token counts from `usage` (`input_tokens`, `output_tokens`, `cache_read_input_tokens`).
-  These are **per-turn**, unlike codex, where the same field is cumulative.
+- Real token counts from the `end` event's `usage` (`input_tokens`, `output_tokens`,
+  `cache_read_input_tokens`, `cache_creation_input_tokens`). These are **per-turn**, unlike codex,
+  where the same field is cumulative, and `input_tokens` excludes the cached reads. They sum every
+  request of the turn, so the context percentage comes from the last request's own `usage` event.
 - Permission modes pass straight through: grok's `--permission-mode` takes the same vocabulary we
   use. The one exception is our `manual`, which grok spells `default`.
 - Reasoning effort maps to `--effort`; grok accepts `low|medium|high|xhigh`, so `max` and `ultra`
   clamp to `xhigh`.
-- Session options that reach grok: `appendSystemPrompt` → `--rules` (appends, unlike
-  `systemPrompt` → `--system-prompt-override`, which replaces), `allowedTools` → `--tools`,
-  `disallowedTools` → `--disallowed-tools`, `jsonSchema` → `--json-schema` (inline, and it implies the
-  JSON output format already asked for), `agent` → `--agent`, `agents` → `--agents`,
-  `dangerouslySkipPermissions` → `--always-approve`, `customSessionId` → `--session-id`, `forkSession`
-  → `--fork-session`. **grok validates neither tool list**: a name that does not exist is ignored
-  rather than rejected, so a typo in a denylist leaves the tool enabled. Prefer an allowlist.
-- **`sandboxMode: 'read-only'` is refused.** A read-only `--tools` allowlist plus
-  `--permission-mode plan` does not stop a delegated subagent from writing, because the subagent
-  does not inherit the parent's tool restriction. A read-only grok session therefore throws at start instead of running
-  writable.
-- **On an exhausted free tier, `grok -p` may hang with no output instead of exiting with an error.**
-  The session's turn timeout is then the only thing that ends the turn. If a grok turn times out with
-  no output, run `grok -p` by hand to check your quota.
+- Session options that reach grok: `cwd` → `--cwd`, `appendSystemPrompt` → `--rules` (appends,
+  unlike `systemPrompt` → `--system-prompt-override`, which replaces), `maxTurns` → `--max-turns`,
+  `allowedTools` → `--tools`, `disallowedTools` → `--disallowed-tools`, `jsonSchema` →
+  `--json-schema` (inline, and it implies the JSON output format already asked for), `agent` →
+  `--agent`, `agents` → `--agents`, `dangerouslySkipPermissions` → `--always-approve`,
+  `forkSession` → `--fork-session` (on a resumed turn), `customSessionId` → `--session-id` (on a
+  first turn, or a forked one). **grok validates neither tool list**: a name that does not exist is
+  ignored rather than rejected, so a typo in a denylist leaves the tool enabled. Prefer an allowlist.
+- **`sandboxMode: 'read-only'` runs inside grok's `--sandbox read-only` profile**, which the OS
+  enforces (Seatbelt on macOS, Landlock on Linux) for the whole process tree: the session reads
+  anywhere and can write only to `~/.grok/` and the temp directory. Measured on 1.0.50 with
+  `bypassPermissions`: a direct write, a shell write, a delegated subagent, a write on a resumed turn
+  and a write outside the project all fail with `Operation not permitted`. A tool allowlist was not
+  enough — a delegated subagent does not inherit it. Three cases are refused rather than claimed:
+  - a project under the temp directory, which the profile leaves writable;
+  - a platform other than macOS or Linux;
+  - a sandbox grok reports it could not apply. grok itself would carry on unsandboxed; the session
+    kills the process on that warning, which grok prints at startup before any model call.
+
+  Child-process network access is not blocked on macOS (grok enforces that part on Linux only).
+
+- **On an exhausted free tier grok answers with an error object** (`{"type":"error","message":...}`),
+  and the session reports that message as the turn's error.
 - Binary: `grok` (set `GROK_BIN` to override). Not `agent`: xAI's installer claims that name too,
   and so did Cursor's.
 - Requires Grok Build: see `x.ai/cli`.
@@ -252,60 +344,88 @@ prints a single JSON object and exits. Tested with `grok` **1.0.44**.
 await manager.startSession({
   name: 'grok-task',
   engine: 'grok',
-  model: 'grok-4.6',
+  model: 'grok-4.7',
   cwd: '/project',
 });
 ```
 
-### Cursor Agent (`engine: 'cursor'`) — legacy
+> **Legacy: `engine: 'cursor'`.** Superseded in this lineup by Grok Build. The `cursor` engine
+> still exists and still works for existing callers — it runs `cursor-agent` (`CURSOR_BIN`
+> overrides it, never the bare `agent` name) and resumes a chat with `--resume <chatId>` — but it
+> is no longer a documented option, is not version-tracked, and gets no new work. It left the
+> tracked set because its stream does not say which model ran, so its cost cannot be attributed
+> to a model. On the OpenAI-compatible endpoint and the ACP agent,
+> `composer-*` and `auto` model names still route to it.
 
-> **Legacy lineup, still the Cursor route.** Grok Build (`engine: 'grok'`) is the default when a
-> Cursor session is not required. `engine: 'cursor'` stays available, including durable goals via
-> `cursor_goal_set`. It is not version-tracked.
->
-> Cursor's `system` init event says `"model": "Auto"`, so costs cannot be attributed to a model.
-> xAI's Grok installer also claims the bare `agent` binary name, which this engine does not use.
+### OpenCode (`engine: 'opencode'`)
 
-Wraps the Cursor Agent CLI with `-p --output-format stream-json`. Write-enabled sessions use `--force`. Each `send()` spawns a new process. `cursor_goal_set` sends the user message `/goal <objective>` (the same text the TUI submits). `--single-turn` is not passed, so that process keeps working while the goal is active. The timeout covers the whole pursuit.
+Wraps the [OpenCode](https://github.com/anomalyco/opencode) CLI with `run --format json`. Each `send()` spawns a new process. Tested with `opencode` **1.19.5**.
 
-- Conversation continuity: the chat id from the first turn's `system` event is captured and passed back as `--resume <chatId>` on later sends, so the model sees prior turns. `--continue` is deliberately not used: it resumes "the latest chat", which collides between concurrent sessions.
-- One-shot execution per message (no persistent subprocess)
-- Working directory via `--workspace` flag
-- Real token counts from stream-json `result` events (camelCase: `inputTokens`, `outputTokens`, `cacheReadTokens`)
-- `--force` enables auto-approval of file changes. `sandboxMode: 'read-only'` does **not** use `--force`:
-  - read-only is enforced by a `.cursor/cli.json` deny config (`Write`/`Edit`/`Shell` denied), written into an isolated temp dir used as the process cwd, with `--workspace` pointing at the real project (the repo tree is never modified)
-  - `--mode plan` is passed as well, but it only steers the model; the deny config is the boundary
-  - `--sandbox` is not added, since it does not restrict in-workspace writes and overrides the mode
-  - read/grep/search remain available
-- `--trust` auto-trusts the workspace without prompting
-- Cursor uses its own model routing (e.g., `sonnet-4`, `gpt-5`, `auto`)
-- Requires Cursor Agent CLI: `curl https://cursor.com/install -fsSL | bash`
-- Binary: `cursor-agent` (set `CURSOR_BIN` env var to override). The generic `agent` name is
-  deliberately not used: xAI's Grok installer symlinks `agent` to its own binary, which rejects
-  `--force`/`--trust`/`--workspace` and fails the turn with "unexpected argument"
-- Windows: Cursor's installer provides `cursor-agent.cmd` / `agent.cmd` (and `.ps1`) under
-  `%LOCALAPPDATA%\cursor-agent`, which start Windows PowerShell 5.1 on a script that runs
-  `versions\<ver>\node.exe versions\<ver>\index.js`. Claw never runs Windows PowerShell 5.1 or a shell: it
-  resolves the wrapper itself, on every launch (so a Cursor self-update is picked up), to the newest
-  `versions\<YYYY.MM.DD[-HH-MM-SS]-<hash>>` directory by date (same-day builds: later build time wins) that has both
-  `node.exe` and `index.js`, and sets `CURSOR_INVOKED_AS` / `NODE_COMPILE_CACHE` as the script does. A `node.exe` +
-  `index.js` beside the wrapper wins first. A bare `cursor-agent` is looked up on PATH (`.exe`, then `.cmd`). Other
-  `.cmd`/`.ps1` wrappers are refused unless they are npm shims (`codex`) — no shell is ever used.
+- Conversation continuity: the session id from the event envelope is captured and passed back as `--session <id>` on later sends, so the model sees prior turns. `--continue` is deliberately not used: it means "the last session on this machine", which collides between concurrent sessions.
+- NDJSON event stream with envelope `{ type, timestamp, sessionID, ... }`
+- Event types: `text`, `reasoning`, `tool_use`, `step_start`, `step_finish`, `error`
+- `text` and `tool_use` are **cumulative snapshots** keyed by `part.id` / `part.callID`; the wrapper diffs them to produce streaming deltas for `onText` callbacks and counts each tool invocation once
+- Real token counts from `step_finish.part.tokens.{input,output,cache.{read,write}}`. **`input` is the uncached remainder only** — opencode's own `total` is `input + output + cache.read + cache.write` — so the cached part is billed on top of it, not carved out of it, and `contextPercent` is measured against the whole input side. On a resumed turn the uncached remainder is usually a small fraction of the cached part
+- Cost is what opencode reports on each `step_finish` (`part.cost`), so a free model costs $0; the registry estimate applies only when no cost is reported. `opencode run --format json` does not name the model it ran
+- Reasoning effort maps to `--variant`, opencode's provider-specific effort knob. opencode does not validate the value: a level the provider does not offer runs the turn at its default rather than failing
+- `appendSystemPrompt`: opencode has no system-prompt flag, so it is placed at the top of the first message of each new conversation
+- The message is written to the subprocess's stdin, which is then closed: opencode waits for EOF before it starts
+- Provider-agnostic: opencode's `--model` expects `provider/model` form (e.g. `anthropic/claude-sonnet-4`). The wrapper passes `--model` through only when the value contains a `/`; otherwise opencode's own default applies
+- `sandboxMode: 'read-only'` runs a generated `clawo-readonly` agent (`--agent clawo-readonly` plus an `OPENCODE_CONFIG_CONTENT` env var defining it):
+  - it denies `edit`, `bash`, `external_directory`, `webfetch` and `task` at the permission level, and also removes those tools via the agent's `tools` map
+  - denying `task` matters: otherwise the agent can hand a write to a subagent that runs under the default writable agent
+  - OpenCode's built-in `plan` agent is not used, because it permits both `bash` and `edit`
+  - if the `clawo-readonly` agent fails to load, the turn is refused rather than run with write access
+  - to test a change to this config, use adversarial prompts that include asking the agent to delegate; `opencode agent list` shows compiled rules that look the same for a safe and an unsafe agent
+- Requires OpenCode 1.x: `npm install -g opencode-ai` or `brew install anomalyco/tap/opencode`. Auth via `opencode auth login` **or** any provider env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, etc.) — opencode picks up either path
+- **OpenCode 2 is refused at session start.** Its `run --format json` keeps the event envelope but drops `step_finish` (no tokens or cost) and the `--variant` flag, and the read-only agent could not be verified on it (measured on the `0.0.0-beta-17823` build). The session reads `opencode --version` once and refuses a 2.x or `0.0.0-beta` build with that reason; if the version cannot be read, it starts as before. OpenCode 2 is what `opencode upgrade --major`, the `@opencode/cli` npm package and the `opencode-v2` Homebrew formula install.
+- Binary: `opencode` (set `OPENCODE_BIN` env var to override). **Windows:** the npm `.cmd` shim launches through `src/engine-spawn.ts` (cross-spawn), as for codex above.
 
 ```typescript
 await manager.startSession({
-  name: 'cursor-task',
-  engine: 'cursor',
-  model: 'sonnet-4',
+  name: 'opencode-task',
+  engine: 'opencode',
+  model: 'anthropic/claude-sonnet-4',
   cwd: '/project',
 });
+```
+
+> **Schema stability:** opencode releases nearly daily and the JSON event schema is not formally documented. The parser tolerates unknown event types and missing fields — but pin a tested `opencode` version in CI if you depend on field names.
+
+### ACP agents (`engine: 'acp'`)
+
+Drives any agent that serves the [Agent Client Protocol](https://agentclientprotocol.com) on stdio, with no per-agent code. Run through it so far: Kimi Code 2.3.1 (`kimi acp`), DeepSeek's dsh 0.2.1-rc.2 (`dsh --profile acp`) and OpenCode 1.19.4 (`opencode acp`). This is the client side of the protocol; [acp.md](./acp.md) is the other side, where the orchestrator is the agent.
+
+- `acpAgent` names the agent: a bundled preset id (`kimi-code`, `dsh`; `clawo engines` lists them), or, from a local caller only, an inline `{ name, command, commandEnv?, args?, env?, contextWindow?, pricing? }`. Over HTTP, which includes the `clawo` CLI, only a preset id is accepted, as for `customEngine`.
+- One agent process per session; each send is one `session/prompt` on one ACP session, so the conversation carries over between sends. `initialize` advertises no `fs` or `terminal` capability: the agent reads, writes and runs commands with its own tools.
+- A turn succeeds when the agent ends it with `stopReason: "end_turn"`; any other stop reason (`refusal`, `max_tokens`, `cancelled`, …) fails it. A turn that runs past its timeout is cancelled with `session/cancel`. An agent that exits mid-turn fails the turn and the session.
+- `session/request_permission` is answered at once from `permissionMode`: `bypassPermissions`, `acceptEdits`, `auto` and `dontAsk` pick an allow option, the others a reject option. Nothing waits on a person.
+- Resume: the agent's session id is the resume id (`stats.acpSessionId`). A resumed session reattaches it with `session/resume`, or `session/load` when that is all the agent offers; an agent with neither fails the start rather than opening a new conversation.
+- Usage and cost are whatever the agent reports (`PromptResponse.usage`, `usage_update`). With `pricing` set and no reported cost, the cost is estimated from the reported tokens. Kimi Code 2.3.1 and dsh 0.2.1-rc.2 report neither, so their sessions show 0 tokens and $0. OpenCode reports tokens.
+- `sandboxMode: 'read-only'` is refused at start. The agent's tools run inside the agent process and this client sees only the permission requests the agent chooses to send, so nothing here can stop a write. `permissionMode: 'plan'` rejects every permission request the agent does send.
+- The model and credentials are the agent's own configuration, set in its environment; the session's `model` and `effort` are not sent to the agent, and `compact` is left to it:
+  - Kimi Code: `KIMI_MODEL_NAME`, `KIMI_MODEL_API_KEY`, `KIMI_MODEL_BASE_URL`, `KIMI_MODEL_MAX_CONTEXT_SIZE`, `KIMI_MODEL_CAPABILITIES`, or a `kimi` login. `KIMI_BIN` overrides the command.
+  - dsh: `DEEPSEEK_API_KEY` (and `DEEPSEEK_BASE_URL`); its profile chooses the model. `DSH_BIN` overrides the command.
+- ACP has no system-prompt channel, so `systemPrompt` and `appendSystemPrompt` go at the top of the first message of a new session (a council seat's charter travels this way); a resumed session already holds them.
+- `launcher` applies as for every engine.
+- Where an ACP agent runs besides `session_start`: each fan-out and council agent, a workflow `agent` node, `solve`'s implementer and scouts, and a fan-out's synthesis pass (`synthesisAcpAgent`) name it by preset id in `acpAgent`; `session_handoff` takes `acpAgent` as `session_start` does. On the CLI an agent in a list is written `acp:<preset>`. Autoloop roles and ultrareview reviewers refuse `acp`: a role cannot name the agent, and a reviewer must be read-only.
+
+```bash
+clawo fanout "How would you cut this test suite's run time?" -e claude,acp:kimi-code,acp:dsh --synthesize --wait
+clawo session-start kimi -e acp --acp-agent kimi-code --permission-mode bypassPermissions -d ./project
+clawo session-send kimi "Fix the failing test in tests/test_io.py"
 ```
 
 ### Community engine presets
 
 `customEngine` accepts either an inline `CustomEngineConfig` or the id of a preset
-bundled in `configs/engines/`. The preset form exists so a third-party CLI is
-described once and shipped, rather than retyped by every caller.
+bundled in `configs/engines/`, and `acpAgent` does the same for the `acp` engine. The
+preset form exists so a third-party CLI is described once and shipped, rather than
+retyped by every caller. A preset carries exactly one of an `engine` block (started
+with `engine: 'custom'`) or an `acp` block (started with `engine: 'acp'`); naming one
+with the other engine fails with a message that says which to use. Bundled today:
+`zcode` (custom), `kimi-code` and `dsh` (ACP). The format is in
+[configs/engines/README.md](../../configs/engines/README.md).
 
 Engines fall into three tiers, decided by how they are verified. Bundled presets
 are always `community`:
@@ -318,58 +438,40 @@ are always `community`:
 
 A community preset must name its maintainer and the engine version and date it
 was verified against (`provenance.maintainer`, `provenance.verifiedAgainst`,
-`provenance.verifiedOn`), with a link to the captured smoke-test transcript.
+`provenance.verifiedOn`); a link to the captured smoke-test transcript
+(`provenance.smokeUrl`) is expected in review but not enforced by the schema check.
 
 A preset never carries protocol translation. A CLI speaking its own wire format
 needs an adapter binary in its author's package, with the preset pointing `bin`
-at it — as `@enderfga/dsh-clawo` does.
+at it — as the `zcode` preset does with `zcode-claw-adapter`. An agent that serves
+ACP needs no adapter: its preset names the command.
 
-Over HTTP — which includes the `clawo` CLI — a custom engine may be given **only**
-as a preset id. An inline config names a binary and its arguments and is refused
-there; a preset id cannot introduce either, so it is the same class as naming a
-built-in engine, and `engine: 'codex'` already spawns an executable over that
-surface. Presets are therefore the supported way to reach a custom engine from
-the CLI: `clawo engines` lists what is bundled, and
-`clawo session-start <name> -e custom --custom-engine <id>` starts one.
+Over HTTP — which includes the `clawo` CLI — a custom engine or an ACP agent may be
+given **only** as a preset id. An inline config names a binary and its arguments and
+is refused there; a preset id cannot introduce either, so it is the same class as
+naming a built-in engine, and `engine: 'codex'` already spawns an executable over
+that surface. Presets are therefore the supported way to reach either from the CLI:
+`clawo engines` lists what is bundled, and
+`clawo session-start <name> -e custom --custom-engine <id>` (or
+`-e acp --acp-agent <id>` for an ACP preset) starts one.
 
 Contribution steps and the smoke script: [CONTRIBUTING.md](../../CONTRIBUTING.md#contributing-an-engine).
 
-### OpenCode (`engine: 'opencode'`)
+### Running an engine under a launcher
 
-Wraps the [sst/opencode](https://github.com/sst/opencode) CLI with `run --format json`. Each `send()` spawns a new process.
-
-- Conversation continuity: the session id from the event envelope is captured and passed back as `--session <id>` on later sends, so the model sees prior turns. `--continue` is deliberately not used: it means "the last session on this machine", which collides between concurrent sessions.
-- One-shot execution per message (no persistent subprocess)
-- NDJSON event stream with envelope `{ type, timestamp, sessionID, ... }`
-- Event types: `text`, `reasoning`, `tool_use`, `step_start`, `step_finish`, `error`
-- `text` and `tool_use` are **cumulative snapshots** keyed by `part.id` / `part.callID`; the wrapper diffs them to produce streaming deltas for `onText` callbacks and counts each tool invocation once
-- Real token counts from `step_finish.part.tokens.{input,output,cache.{read,write}}`. **`input` is the uncached remainder only** — opencode's own `total` is `input + output + cache.read + cache.write` — so the cached part is billed on top of it, not carved out of it, and `contextPercent` is measured against the whole input side. On a resumed turn the uncached remainder is usually a small fraction of the cached part
-- Reasoning effort maps to `--variant`, opencode's provider-specific effort knob. opencode does not validate the value: a level the provider does not offer runs the turn at its default rather than failing
-- `appendSystemPrompt`: opencode has no system-prompt flag, so it is placed at the top of the first message of each new conversation
-- The wrapper closes the subprocess's stdin immediately after spawn (opencode otherwise reads stdin and blocks on EOF, hanging the call)
-- `permissionMode: 'auto'`, `permissionMode: 'bypassPermissions'`, `enableAutoMode: true`, or the legacy `dangerouslySkipPermissions: true` setting passes `--auto` on every turn, including resumed sessions. This approves permission requests while preserving OpenCode's explicit deny rules. Without it, noninteractive OpenCode rejects requests that would require approval. `manual`/`default`, `acceptEdits`, and `dontAsk` do not enable this flag by themselves; `plan` and `sandboxMode: 'read-only'` take precedence over all auto settings. Manager defaults remain unchanged; no shared OpenCode permission configuration is rewritten.
-- Provider-agnostic: opencode's `--model` expects `provider/model` form (e.g. `anthropic/claude-sonnet-4`). The wrapper passes `--model` through only when the value contains a `/`; otherwise opencode's own default applies
-- Reasoning effort: session `effort` and per-turn `session_send` overrides map to `opencode run --variant`. The value is forwarded exactly (`high` → `--variant high`, including `max` and `xhigh` with no remap). `auto` and an omitted effort omit `--variant` so OpenCode keeps the provider default. A per-turn override applies to that spawn only and does not stick. Resume (`--session`) and read-only (`--agent clawo-readonly`) are unchanged. Verified against opencode 1.18.32 (`opencode run --help`). OpenCode only applies a variant when that id exists on the selected model's configured `variants`; `--variant` does not invent reasoning for a model whose variant map is empty.
-- `sandboxMode: 'read-only'` runs a generated `clawo-readonly` agent (`--agent clawo-readonly` plus an `OPENCODE_CONFIG_CONTENT` env var defining it):
-  - it denies `edit`, `bash`, `external_directory`, `webfetch` and `task` at the permission level, and also removes those tools via the agent's `tools` map
-  - denying `task` matters: otherwise the agent can hand a write to a subagent that runs under the default writable agent
-  - OpenCode's built-in `plan` agent is not used, because it permits both `bash` and `edit`
-  - if the `clawo-readonly` agent fails to load, the turn is refused rather than run with write access
-  - to test a change to this config, use adversarial prompts that include asking the agent to delegate; `opencode agent list` shows compiled rules that look the same for a safe and an unsafe agent
-- Requires opencode installed: `brew install sst/tap/opencode` or `npm install -g opencode-ai`. Auth via `opencode auth login` **or** any provider env var (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, etc.) — opencode picks up either path
-- Binary: `opencode` (set `OPENCODE_BIN` env var to override)
-
-```typescript
-await manager.startSession({
-  name: 'opencode-task',
-  engine: 'opencode',
-  model: 'anthropic/claude-sonnet-4',
-  effort: 'high',
-  cwd: '/project',
-});
-```
-
-> **Schema stability:** opencode releases nearly daily and the JSON event schema is not formally documented. The parser tolerates unknown event types and missing fields — but pin a tested `opencode` version in CI if you depend on field names.
+`SessionConfig.launcher` is an argv prefix the engine binary runs under, for every
+engine: `launcher: ['/opt/task/sandbox.sh', 'task', '0 1']` spawns
+`/opt/task/sandbox.sh task '0 1' codex app-server …`. This is how a caller puts
+the agent inside its own sandbox (bubblewrap, a container entry point, `taskset`)
+without a custom engine. The launcher is the caller's own command, at the same
+trust level as a contract's command check, which the HTTP API also accepts: set
+it through the SessionManager API, the `session_start` tool, `/session/start` or a
+workflow spec (the `goal` node's `launcher`, which `workflow_start` and
+`clawo goal --launcher` also take). On Windows, a launcher that runs through
+`cmd.exe` (a `.cmd` or `.bat`) is held to the same argv rule as an engine shim: an
+argument with a newline or an unbalanced double quote is refused before spawning,
+so an engine that takes its prompt on the command line needs a launcher that is a
+real executable.
 
 ## ISession Interface
 
@@ -377,8 +479,11 @@ All engines implement `ISession`, making them interchangeable at the `SessionMan
 
 ```typescript
 interface ISession {
-  // State
+  // Identity
   sessionId?: string;
+  readonly pid?: number;
+
+  // State
   readonly isReady: boolean;
   readonly isPaused: boolean;
   readonly isBusy: boolean;
@@ -407,26 +512,19 @@ interface ISession {
 
   // Events (EventEmitter)
   on(event, listener): this;
+  once(event, listener): this;
   emit(event, ...args): boolean;
+  removeListener(event, listener): this;
 }
 ```
 
 `SessionStats` requires `turnsSucceeded` as well as `turns`, so an engine that
 implements this interface has to say which of its turns succeeded — the exit code
-is not the answer on every engine. See "Stats & Monitoring" in `sessions.md`.
+is not the answer on every engine. See [Stats & Monitoring](./sessions.md#stats--monitoring).
 
 ## Team Tools Across Engines
 
-Team tools (`team_list`, `team_send`) operate on the same virtual-team layer for **every** engine: the "team" is the set of all active sessions managed by SessionManager.
-
-| Engine              | `team_list`                                | `team_send`                    |
-| ------------------- | ------------------------------------------ | ------------------------------ |
-| Claude              | Lists other active SessionManager sessions | Routes via cross-session inbox |
-| Codex / `codex-app` | Lists other active SessionManager sessions | Routes via cross-session inbox |
-| Antigravity         | Lists other active SessionManager sessions | Routes via cross-session inbox |
-| Grok                | Lists other active SessionManager sessions | Routes via cross-session inbox |
-| OpenCode            | Lists other active SessionManager sessions | Routes via cross-session inbox |
-| Custom              | Lists other active SessionManager sessions | Routes via cross-session inbox |
+Team tools (`team_list`, `team_send`) operate on the same virtual-team layer for **every** engine: the "team" is the set of all active sessions managed by SessionManager, whatever engine each one runs. `team_list` lists the other active sessions with their engine and status; `team_send` routes a message through the cross-session inbox.
 
 Messages are delivered via the inbox system — idle sessions receive immediately, busy sessions queue for later delivery.
 
@@ -452,20 +550,41 @@ await manager.startSession({
 
 What happens behind the scenes:
 
-1. Plugin reads `~/.openclaw/openclaw.json` for gateway port + auth
-2. Starts a local proxy server (random port, auto-managed)
+1. The session manager reads `~/.openclaw/openclaw.json` for the gateway port + auth (in plugin and `clawo serve` mode alike)
+2. Starts a local proxy server on `127.0.0.1` (random port, auto-managed) the first time a Claude session names a non-Claude model, provided a gateway URL was found
 3. Claude Code CLI sends Anthropic-format requests → proxy converts to OpenAI → gateway → any model
+
+The proxy forwards with the gateway key and any provider keys in the environment, so it serves only the
+sessions it started. Each process draws a random secret, and a session's base URL carries it as the first path
+segment (`http://127.0.0.1:<port>/<secret>`). A request without it gets 401 before its body is read, so a process
+that only knows the port cannot spend those credentials. The secret is in the Claude child's environment, so the
+processes that session runs, and other processes of the same user that can read it, still reach the proxy. It is
+not persisted, and a restarted process uses a new one. Under the secret, `POST` must be `application/json` (415
+otherwise), bodies are capped at 32 MB (413), and methods other than `POST`, `GET` and `HEAD` get 405.
+
+### Your own Anthropic-compatible gateway
+
+A gateway that speaks the Anthropic API and serves other models under their own names (an internal model
+gateway, for instance) needs none of this. Set `CLAWO_CLAUDE_GATEWAY=1` in the environment clawo runs in,
+with the gateway in `ANTHROPIC_BASE_URL` (and its token in `ANTHROPIC_AUTH_TOKEN`) or in a session's
+`baseUrl`. A `claude` session then passes any model name to the CLI as given (`--model gw-model-1`), starts no
+proxy, and does not rewrite the base URL. Because it is read from the environment, it applies to every
+`claude` session the process starts, including those of workflow, fan-out and council nodes.
+
+Such a model is priced only from `pricingOverrides` (or the registry, if it knows the name). The CLI's own
+cost figure is ignored, since it prices tokens from Anthropic's table, and without an override the cost is
+recorded as 0, with a single warning per model name.
 
 ### Manual Config (optional)
 
 Override with environment variables if needed:
 
-| Variable         | Default                          | Description                                         |
-| ---------------- | -------------------------------- | --------------------------------------------------- |
-| `GATEWAY_URL`    | Auto-detected from openclaw.json | Gateway endpoint (e.g. `http://127.0.0.1:18789/v1`) |
-| `GATEWAY_KEY`    | Auto-detected from openclaw.json | Gateway auth password/token                         |
-| `GEMINI_API_KEY` | -                                | Direct Gemini API access (bypasses gateway)         |
-| `OPENAI_API_KEY` | -                                | Direct OpenAI API access (bypasses gateway)         |
+| Variable         | Default                          | Description                                               |
+| ---------------- | -------------------------------- | --------------------------------------------------------- |
+| `GATEWAY_URL`    | Auto-detected from openclaw.json | Gateway endpoint (e.g. `http://127.0.0.1:18789/v1`)       |
+| `GATEWAY_KEY`    | Auto-detected from openclaw.json | Gateway auth password/token                               |
+| `GEMINI_API_KEY` | -                                | Direct Gemini API access, used when no gateway key is set |
+| `OPENAI_API_KEY` | -                                | Direct OpenAI API access, used when no gateway key is set |
 
 ### Architecture
 
@@ -482,8 +601,12 @@ Integrate **any** coding agent CLI without writing engine-specific code. You pro
 
 Two protocol modes:
 
-- **Persistent** (`persistent: true`) — long-running subprocess with stream-json I/O over stdin/stdout (like Claude Code)
-- **One-shot** (`persistent: false`, default) — new process spawned per `send()` (like Codex/Antigravity)
+- **Persistent** (`persistent: true`) — long-running subprocess with stream-json I/O over stdin/stdout (like Claude Code). It keeps the conversation; `args.resume` passes `resumeSessionId` when a session is restarted
+- **One-shot** (`persistent: false`, default) — new process spawned per `send()`, with the message on the command line right after `args.print`. Nothing carries over between sends. On Windows, a CLI that runs through `cmd.exe` (an npm `.cmd` shim) cannot take a message containing a newline or an unbalanced double quote this way; use persistent mode
+
+`appendSystemPrompt` goes through `args.appendSystemPrompt` when the config maps it. Without that flag it is put at the top of the first message of a conversation: every message in one-shot mode, the first one in persistent mode unless the session resumed through `args.resume`.
+
+`sandboxMode: 'read-only'` needs both `args.permissionMode` and a `permissionModes` entry for the session's permission mode that maps to the CLI's read-only or plan value. Without them the CLI is never run writable: a persistent session refuses to start, and a one-shot session refuses every send.
 
 ### CustomEngineConfig
 
@@ -495,10 +618,16 @@ Two protocol modes:
 | `persistent`       | boolean  |          | `true` = persistent subprocess, `false` = one-shot (default) |
 | `args`             | object   | yes      | CLI flag mappings (see below)                                |
 | `permissionModes`  | object   |          | Maps OpenClaw mode names to CLI-specific values              |
-| `pricing`          | object   |          | `{ input, output, cached? }` per 1M tokens                   |
+| `pricing`          | object   |          | `{ input, output, cached? }` per 1M tokens (see below)       |
 | `contextWindow`    | number   |          | Context window size (default: 200,000)                       |
 | `env`              | object   |          | Extra environment variables for the CLI process              |
 | `sanitizePatterns` | string[] |          | Regex patterns to redact from stderr                         |
+
+Cost is the reported tokens priced at the registry rate for the session's `model`,
+or at its `pricingOverrides` entry when it has one. An unregistered model, or no
+model, is priced at `pricing`, and at the `claude-sonnet-4-6` rate when the engine
+sets none. With no model, a `pricingOverrides` entry for `claude-sonnet-4-6` still
+takes precedence over `pricing`.
 
 ### args field
 
@@ -509,14 +638,14 @@ Two protocol modes:
 | `outputFormatValue`      | `"stream-json"`                | Value for stream-json output               |
 | `inputFormat`            | `"--input-format"`             | Input format flag (persistent only)        |
 | `inputFormatValue`       | `"stream-json"`                | Value for stream-json input                |
-| `skipPermissions`        | `"-y"`                         | Skip all permissions flag                  |
+| `skipPermissions`        | `"-y"`                         | Passed when `dangerouslySkipPermissions`   |
 | `permissionMode`         | `"--permission-mode"`          | Permission mode flag                       |
 | `model`                  | `"--model"`                    | Model selection flag                       |
 | `systemPrompt`           | `"--system-prompt"`            | System prompt override flag                |
 | `appendSystemPrompt`     | `"--append-system-prompt"`     | Append system prompt flag                  |
 | `maxTurns`               | `"--max-turns"`                | Max agent turns flag                       |
 | `resume`                 | `"--resume"`                   | Session resume flag (persistent only)      |
-| `verbose`                | `"--verbose"`                  | Verbose output flag                        |
+| `verbose`                | `"--verbose"`                  | Verbose output flag (persistent only)      |
 | `replayUserMessages`     | `"--replay-user-messages"`     | Replay user messages (persistent only)     |
 | `includePartialMessages` | `"--include-partial-messages"` | Include partial messages (persistent only) |
 | `effort`                 | `"--effort"`                   | Effort level flag                          |
@@ -588,10 +717,6 @@ await manager.startSession({
 });
 ```
 
-### Example: Google Antigravity CLI (`agy`)
-
-Use the built-in [`engine: 'agy'`](#google-antigravity-engine-agy) instead of a custom config.
-
 ### Custom Engine in Council
 
 Custom engines work in council by setting `engine: 'custom'` and `customEngine` on the agent persona:
@@ -619,27 +744,11 @@ To add a built-in engine (for CLIs that need custom protocol handling beyond wha
 
 1. Create `src/persistent-<engine>-session.ts` implementing `ISession`
 2. Add the engine name to `ENGINE_TYPES` (from which `EngineType` is derived) and its binary to `ENGINE_BINARY_NAMES` in `src/types.ts`
-3. Add a case to `engineHasNativeConversation()` in `src/types.ts` and, if the engine resumes a conversation by id, to `nativeThreadIsLive()` in `src/openai-compat.ts`
+3. Add a case to `engineHasNativeConversation()` in `src/types.ts` and, if the engine resumes a conversation by id, to `nativeThreadIsLive()` in `src/openai-compat.ts` and to `_sessionResumeId()` / `_storedResumeId()` in `src/session-manager.ts`, so a restart replays an id the engine can resume rather than a synthetic wrapper id
 4. Add a case to `SessionManager._createSession()`
 5. Add model pricing to `MODELS[]` in `src/models.ts`
+6. For a core engine: add it to `ENGINES` in `scripts/sweep.ts` and pin its tested version in the engine table of `AGENTS.md`
 
 The `ISession` interface is deliberately minimal — each engine handles its own subprocess bootstrapping, I/O protocol, and cleanup internally.
 
 For most third-party CLIs, the `custom` engine with `CustomEngineConfig` is sufficient and requires zero code changes.
-
-
-## Memento fork effort and gateway configuration
-
-`7.6.0-memento.1` preserves Cursor as a supported engine alongside upstream Grok Build. Exact `nvidia/<gateway-id>` and `nvidia-b/<gateway-id>` model names resolve to OpenCode without dropping the billed provider or changing the model. Registry entries are routes, not proof that an account can use them.
-
-- Codex app-server uses `config.model_reasoning_effort` at thread start/resume and `turn/start.effort` for the effective turn setting. Native none, minimal, low, medium, high, xhigh, max and ultra remain distinct. Model-specific support is enforced by Codex. An auto turn restores the effective initial session effort reported by Codex; null cannot clear a sticky native override.
-- Cursor has no separate effort flag. The wrapper selects an effort-qualified ID from `--list-models` when available. That legacy listing omits some newer models: on a miss, native ACP `cursor/list_available_models` supplies the parameterized catalog without opening a conversation or running inference. Claw uses the advertised effort key (for example `reasoning_effort` for Grok 4.7), validates requested values, and preserves explicit context and speed parameters. Discovery is cached for five minutes, refreshed only on demand, and concurrent requests share the fetch. Model versions and effort levels are never silently substituted. Composer has no advertised effort variants; use auto.
-- OpenCode receives `--variant <effort>`. Auto omits the flag; default is an explicit provider variant (for models that advertise it). Session and per-turn overrides preserve read-only and resume behavior.
-
-`configs/memento-nvidia-effort-variants.json` is a credential-free configuration patch keyed by gateway model ID, checked against the installed OpenCode 1.18.32 Models.dev catalog and live provider hello-world requests. Merge each model patch into both existing provider model tables; preserve credentials, billing provider IDs, limits, costs, MCP configuration and unrelated options. Replace each named variant object rather than deep-merging incompatible old SDK options. Disabled entries suppress unsupported automatically generated effort choices.
-
-Claude gateway models use a per-model `provider.npm` of `@ai-sdk/anthropic` and the gateway's `/v1/messages` endpoint. Adaptive models use `thinking.type=adaptive` with SDK `effort`; older budget-only Claude variants use high=16,384 and max=31,999 thinking tokens. Opus 4.5 combines enabled thinking with its supported effort levels. This avoids the gateway Chat Completions translation that incorrectly sends enabled thinking to Opus 5.5.
-
-OpenAI reasoning models use `@ai-sdk/openai` and `/v1/responses`, which also preserves reasoning-model tool support. Other named effort models retain OpenAI-compatible Chat Completions. Gemini 2.5 uses the gateway's documented budget aliases: low=1,024, medium=2,048, high=4,096; none is exposed only for Flash variants. Toggle-only models and internal previews without verified named effort controls are left unchanged.
-
-Live acceptance details and provider availability exceptions are recorded in `memento-effort-validation.md`. A quota, region restriction, or retired model is not an independent-session limit. `CLAWO_MAX_CONCURRENT_SESSIONS=0` removes Claw's global wrapper ceiling; providers still enforce their own quotas.

@@ -1,11 +1,14 @@
 /**
  * Grok Build (xAI) session wrapper.
  *
- * One-shot per send: `grok -p <msg> --output-format json`, which prints a single
- * JSON object and exits. That object is unusually complete for this engine class
- * — it carries the reply, a terminal `stopReason`, a resumable `sessionId`, real
+ * One-shot per send: `grok -p <msg> --output-format streaming-json`, which prints
+ * one JSON object per line and exits. Its final `end` event is unusually complete
+ * for this engine class — a terminal `stopReason`, a resumable `sessionId`, real
  * token usage, the model that actually answered, and the engine's own
- * `total_cost_usd`.
+ * `total_cost_usd` — and the reply arrives as `text` pieces before it. The
+ * single-object `json` format carries the same, but its usage is only the turn's
+ * sum; the stream also reports each request's own, which is what the context
+ * size has to be read from.
  *
  * Two consequences shape this file:
  *
@@ -26,39 +29,106 @@
  * codex, where the same-looking field is a running total.
  */
 
-import { spawn } from 'node:child_process';
-import { guardChildStreams } from './child-process-guard.js';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
+import { killEngineTree, spawnEngine } from './engine-spawn.js';
 
 import type { SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
 import { sanitizeSecrets } from './sanitize.js';
 import { BaseOneShotSession } from './base-oneshot-session.js';
 import { SESSION_EVENT } from './constants.js';
 
-/** The shape `--output-format json` prints. Only the fields we consume. */
+interface GrokUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+}
+
+/**
+ * The turn's result: the `end` event with the reply joined back onto it, which
+ * is the object `--output-format json` prints. Only the fields we consume.
+ */
 interface GrokJsonResult {
   text?: string;
   stopReason?: string;
   sessionId?: string;
-  usage?: {
-    input_tokens?: number;
-    output_tokens?: number;
-    cache_read_input_tokens?: number;
-    cache_creation_input_tokens?: number;
-  };
+  /** The whole turn's usage: the sum of every request it made. */
+  usage?: GrokUsage;
   total_cost_usd?: number;
   modelUsage?: Record<string, unknown>;
   error?: string;
+  /** `error` when grok refused the turn outright (usage limit, auth), with `message`. */
+  type?: string;
+  message?: string;
+}
+
+/** One line of `--output-format streaming-json`. Only the fields we consume. */
+interface GrokStreamEvent extends GrokJsonResult {
+  /** A piece of the reply, on a `text` event. */
+  data?: unknown;
+}
+
+/**
+ * Fold grok's streaming lines into the turn's result and its last request's usage.
+ *
+ * The `end` event carries what the single `json` object does except the reply,
+ * which arrives as `text` pieces (joined, they equal that object's `text`,
+ * measured on 1.0.77). Each request of the turn reports its own `usage` event,
+ * which the single object does not: there, usage is only the turn's sum.
+ */
+function parseGrokStream(stdout: string): { result?: GrokJsonResult; lastRequest?: GrokUsage } {
+  let text = '';
+  let end: GrokJsonResult | undefined;
+  let error: GrokJsonResult | undefined;
+  let lastRequest: GrokUsage | undefined;
+  for (const line of stdout.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('{')) continue;
+    let evt: GrokStreamEvent;
+    try {
+      evt = JSON.parse(trimmed) as GrokStreamEvent;
+    } catch {
+      continue;
+    }
+    if (evt.type === 'text' && typeof evt.data === 'string') text += evt.data;
+    else if (evt.type === 'usage' && evt.usage) lastRequest = evt.usage;
+    else if (evt.type === 'end') end = evt;
+    else if (evt.type === 'error') error = evt;
+  }
+  return { result: end ? { ...end, text } : error, lastRequest };
+}
+
+/** grok's warning when a sandbox profile could not be applied (1.0.50). */
+const SANDBOX_NOT_APPLIED_RE = /sandbox could not be applied/i;
+
+/** True when `dir` is inside the OS temp directory, which grok's read-only profile leaves writable. */
+function underTempDir(dir: string): boolean {
+  const real = (p: string): string => {
+    try {
+      return fs.realpathSync(p);
+    } catch {
+      return path.resolve(p);
+    }
+  };
+  const target = real(dir);
+  const roots = new Set([real(os.tmpdir()), real('/tmp'), real('/var/tmp')]);
+  if (process.env.TMPDIR) roots.add(real(process.env.TMPDIR));
+  return [...roots].some((root) => target === root || target.startsWith(root + path.sep));
 }
 
 export class PersistentGrokSession extends BaseOneShotSession {
   /** Grok's own session UUID, captured from turn 1 and replayed via `--resume`. */
   private grokSessionId?: string;
+  /** The model grok reports under `modelUsage`; it moves when grok's default does. */
+  private grokModel?: string;
 
   constructor(config: SessionConfig, grokBin?: string) {
     super(config, grokBin || process.env.GROK_BIN || 'grok', {
       enginePrefix: 'grok',
-      defaultModel: 'grok-4.6',
-      defaultModelDisplay: 'grok-4.6',
+      defaultModel: 'grok-4.7',
+      defaultModelDisplay: 'grok-4.7',
       supportsCachedTokens: true,
       // grok reports `total_tokens` as input + output + cache reads + cache
       // writes (30034 = 19393 + 17 + 10624 + 0 on a resumed turn), and its own
@@ -78,8 +148,13 @@ export class PersistentGrokSession extends BaseOneShotSession {
     }
   }
 
+  /** The configured model, else the one grok reported running. */
+  protected override _billedModel(): string | undefined {
+    return this.options.model || this.grokModel;
+  }
+
   private _buildArgs(message: string, options: SessionSendOptions): string[] {
-    const args: string[] = ['-p', message, '--output-format', 'json'];
+    const args: string[] = ['-p', message, '--output-format', 'streaming-json'];
 
     if (this.options.cwd) args.push('--cwd', this.options.cwd);
 
@@ -96,6 +171,10 @@ export class PersistentGrokSession extends BaseOneShotSession {
     // equivalent 'default'.
     const mode = this.options.permissionMode === 'manual' ? 'default' : this.options.permissionMode;
     if (mode) args.push('--permission-mode', mode);
+
+    // The boundary for read-only is grok's own OS sandbox (Seatbelt / Landlock),
+    // not a tool allowlist — see _run for what it was measured against.
+    if (this.options.sandboxMode === 'read-only') args.push('--sandbox', 'read-only');
 
     const effort = options.effort ?? this.options.effort;
     if (effort && effort !== 'auto') {
@@ -121,8 +200,8 @@ export class PersistentGrokSession extends BaseOneShotSession {
     }
 
     // Structured output. grok's `--json-schema` takes the schema inline, the
-    // same shape our engine-agnostic option carries, and implies the JSON
-    // output format we already ask for.
+    // same shape our engine-agnostic option carries; under streaming JSON the
+    // reply's `text` pieces join into the conforming object (1.0.77).
     if (this.options.jsonSchema) args.push('--json-schema', this.options.jsonSchema);
 
     if (this.options.agent) args.push('--agent', this.options.agent);
@@ -145,32 +224,42 @@ export class PersistentGrokSession extends BaseOneShotSession {
   }
 
   protected _run(message: string, options: SessionSendOptions): Promise<TurnResult> {
-    // Read-only is refused rather than approximated, and as of 1.0.13 that is a
-    // measured decision rather than a cautious one.
+    // Read-only is grok's built-in `--sandbox read-only` profile, enforced by
+    // the OS (Seatbelt on macOS, Landlock on Linux): reads anywhere, writes only
+    // to ~/.grok/ and the temp directory.
     //
-    // The obvious construction is a `--tools` allowlist of read-only built-ins
-    // (`read_file,list_dir,grep`) plus `--permission-mode plan`. Run against
-    // 1.0.13 it holds for a direct write and for a shell write — and loses to
-    // the third prompt in the matrix: asked to delegate, the session spawned a
-    // subagent and the file appeared. The subagent does not inherit the parent's
-    // tool restriction, which is the same load-bearing hole found in OpenCode,
-    // where denying the write tools without denying `task` left the delegation
-    // path wide open.
+    // It replaced a refusal. A `--tools` allowlist plus plan mode, measured on
+    // 1.0.13, held for a direct and a shell write and lost to delegation: the
+    // subagent did not inherit the restriction and wrote the file. The sandbox
+    // is inherited by the whole process tree. Measured on 1.0.50 against a repo
+    // outside temp, with `--permission-mode bypassPermissions`: a direct write, a
+    // shell redirect, a delegated subagent, a write on a resumed turn and a write
+    // outside the project all failed with `Operation not permitted`, each one
+    // actually attempted (the agent reported the error, not a refusal or a quota
+    // stop).
     //
-    // grok 1.0.13 also ships `--no-subagents`, which is the obvious next probe.
-    // It is deliberately NOT wired up yet: the run that would have confirmed it
-    // hit this account's free-tier usage limit, and a probe that fails for lack
-    // of quota writes no file either — reading that as a pass is how an unproven
-    // boundary gets shipped. Prove it on an account with quota, with the full
-    // write x shell x subagent x resumed-turn matrix, before changing this.
+    // Two things the profile cannot cover are refused rather than claimed:
+    //   - a project under the temp directory, which the profile leaves writable;
+    //   - a platform without Seatbelt or Landlock.
+    // And a sandbox that fails to apply does not fail closed in grok: it warns
+    // and runs unsandboxed. The warning comes at startup, before any model call
+    // (13 ms, measured), so the turn is killed on sight of it — see the stderr
+    // handler below.
     if (this.options.sandboxMode === 'read-only') {
-      return Promise.reject(
-        new Error(
-          'Grok sessions do not support sandboxMode: read-only yet — a tool allowlist plus plan mode ' +
-            'was measured against 1.0.13 and a delegated subagent still wrote to disk. This engine ' +
-            'will not claim a boundary it has not proven. Use a different engine for read-only work.',
-        ),
-      );
+      if (process.platform !== 'darwin' && process.platform !== 'linux') {
+        return Promise.reject(
+          new Error(
+            `Grok read-only needs grok's OS sandbox (Seatbelt or Landlock), which ${process.platform} does not have. Use a different engine for read-only work.`,
+          ),
+        );
+      }
+      if (this.options.cwd && underTempDir(this.options.cwd)) {
+        return Promise.reject(
+          new Error(
+            "Grok read-only cannot protect a project under the temp directory: grok's read-only sandbox leaves temp writable. Move the project or use a different engine for read-only work.",
+          ),
+        );
+      }
     }
 
     const args = this._buildArgs(message, options);
@@ -181,19 +270,19 @@ export class PersistentGrokSession extends BaseOneShotSession {
       let stderr = '';
       let settled = false;
 
-      const proc = spawn(this.engineBin, args, {
+      const proc = spawnEngine(this.engineBin, args, {
+        launcher: this.options.launcher,
         cwd: this.options.cwd,
         env: { ...process.env },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
-      guardChildStreams(proc);
       proc.stdin?.end();
 
       const timer = setTimeout(() => {
         if (!settled) {
           settled = true;
-          proc.kill('SIGKILL');
+          killEngineTree(proc);
           reject(new Error('Timeout waiting for Grok response'));
         }
       }, timeout);
@@ -206,6 +295,18 @@ export class PersistentGrokSession extends BaseOneShotSession {
         const sanitized = sanitizeSecrets(d.toString());
         stderr += sanitized;
         this.emit(SESSION_EVENT.LOG, `[grok-stderr] ${sanitized}`);
+        // grok carries on unsandboxed when a profile cannot be applied. For a
+        // read-only session that is the one outcome that must not run.
+        if (this.options.sandboxMode === 'read-only' && !settled && SANDBOX_NOT_APPLIED_RE.test(stderr)) {
+          settled = true;
+          clearTimeout(timer);
+          killEngineTree(proc);
+          reject(
+            new Error(
+              `Grok could not apply its read-only sandbox, so the turn was stopped before it ran: ${stderr.trim().split('\n')[0]}`,
+            ),
+          );
+        }
       });
 
       proc.on('error', (err) => {
@@ -223,18 +324,16 @@ export class PersistentGrokSession extends BaseOneShotSession {
         if (settled) return;
         settled = true;
 
-        let parsed: GrokJsonResult | undefined;
-        try {
-          const trimmed = stdout.trim();
-          if (trimmed) parsed = JSON.parse(trimmed) as GrokJsonResult;
-        } catch {
-          parsed = undefined;
-        }
+        const { result: parsed, lastRequest } = parseGrokStream(stdout);
 
         // A turn that produced no parseable result object failed, whatever the
         // exit code says: there is no reply to hand back.
+        // A refused turn (usage limit, auth) is `{"type":"error","message":...}`
+        // rather than a result object; the message is the only reason given.
+        const refusal = parsed?.type === 'error' ? parsed.message?.trim() || 'Grok reported an error' : undefined;
         const turnError =
           parsed?.error?.trim() ||
+          refusal ||
           (!parsed ? stderr.trim() || `Grok exited with code ${code} and no JSON result` : undefined);
 
         if (parsed?.sessionId) {
@@ -256,11 +355,22 @@ export class PersistentGrokSession extends BaseOneShotSession {
           this._stats.tokensOut += usage.output_tokens ?? 0;
           this._stats.cachedTokens += cacheRead;
           this._stats.cacheCreationTokens += cacheWrite;
-          // The prompt is every input-side token, not just the uncached
-          // remainder: on a resumed turn `input_tokens` is the small tail and
-          // the cached reads are most of the context that has to fit.
-          this._reportTurnInputTokens((usage.input_tokens ?? 0) + cacheRead + cacheWrite);
         }
+        // The context is the prompt of the turn's last request — every
+        // input-side token, not just the uncached remainder, since on a resumed
+        // turn `input_tokens` is the small tail and the cached reads are most of
+        // the context that has to fit. The turn's sum stands in only when no
+        // request reported its own usage.
+        const prompt = lastRequest ?? usage;
+        if (prompt) {
+          this._reportTurnInputTokens(
+            (prompt.input_tokens ?? 0) +
+              (prompt.cache_read_input_tokens ?? 0) +
+              (prompt.cache_creation_input_tokens ?? 0),
+          );
+        }
+        const reported = parsed?.modelUsage && Object.keys(parsed.modelUsage)[0];
+        if (reported) this.grokModel = reported;
         // Engine-reported spend, not a registry lookup — see the file header.
         if (typeof parsed?.total_cost_usd === 'number' && Number.isFinite(parsed.total_cost_usd)) {
           this._stats.costUsd += parsed.total_cost_usd;

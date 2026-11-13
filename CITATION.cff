@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: If Claw Orchestrator helps your research, please cite it as below.
+type: software
+title: 'Claw Orchestrator: A Unified Runtime for Coding Agent CLIs'
+authors:
+  - family-names: Fang
+    given-names: Guian
+repository-code: https://github.com/Enderfga/claw-orchestrator
+url: https://github.com/Enderfga/claw-orchestrator
+license: MIT
+keywords:
+  - coding agents
+  - agent orchestration
+  - verification
+  - Claude Code
+  - Codex
+  - Agent Client Protocol
+  - Model Context Protocol
+identifiers:
+  - type: doi
+    value: 10.5281/zenodo.23874036
+    description: The technical report, all versions
+preferred-citation:
+  type: report
+  title: 'Claw Orchestrator: A Unified Runtime for Coding Agent CLIs'
+  authors:
+    - family-names: Fang
+      given-names: Guian
+      affiliation: National University of Singapore
+  year: 2026
+  publisher:
+    name: Zenodo
+  doi: 10.5281/zenodo.23874036
+  url: https://doi.org/10.5281/zenodo.23874036

@@ -17,14 +17,15 @@ import {
   OPENAI_COMPAT_DEFAULT_MODEL,
   OPENAI_COMPAT_AUTO_COMPACT_THRESHOLD,
   OPENAI_COMPAT_SESSION_PREFIX,
+  OPENAI_COMPAT_TURN_TIMEOUT_MS,
 } from './constants.js';
 
 /**
  * Ceiling on the WHOLE emitted block — tags, elision markers and framing included, not just the turn
  * text (charging text alone is not a cap: 8,000 one-word turns rendered 165,008 bytes). Same number
  * and oldest-dropped-first rule as REPLAY_CHAR_BUDGET in the autoloop dispatcher. MAX_BODY_SIZE is
- * not the bound that matters: six of the nine ENGINE_TYPES pass the prompt as one argv element and
- * Linux caps one argument at 128 KiB — going over is a 500 with the turn lost.
+ * not the bound that matters: gemini, agy, cursor, grok and one-shot custom engines pass the prompt
+ * as one argv element and Linux caps one argument at 128 KiB — going over is a 500 with the turn lost.
  */
 const HISTORY_CHAR_BUDGET = 24_000;
 
@@ -144,10 +145,17 @@ export interface OpenAIChatCompletionChunk {
  *   - tools injected into every user message
  *   - session key NOT fingerprinted by tools (same session across tool changes)
  * Default (unset) is the new behavior: tools embedded in session system prompt
- * at create time + session key fingerprinted by tools. The new behavior
- * eliminates periodic latency spikes but does not support mutating the tool
- * list within a single session (a new session is created when tools change).
+ * at create time + the hashed session key fingerprinted by tools. The new
+ * behavior eliminates periodic latency spikes but does not support mutating the
+ * tool list within a single session (without an explicit key, a changed list
+ * resolves to a new session; with one, the session keeps its old tools).
  */
+/** Turn timeout for compat sends: OPENAI_COMPAT_TURN_TIMEOUT_MS (ms) if set to a positive number, else the default. */
+export function compatTurnTimeoutMs(): number {
+  const v = Number(process.env.OPENAI_COMPAT_TURN_TIMEOUT_MS);
+  return Number.isFinite(v) && v > 0 ? v : OPENAI_COMPAT_TURN_TIMEOUT_MS;
+}
+
 export function isToolsPerMessageModeEnabled(): boolean {
   const v = process.env.OPENAI_COMPAT_TOOLS_PER_MESSAGE;
   if (!v) return false;
@@ -263,12 +271,11 @@ export function resolveSessionKey(body: OpenAIChatCompletionRequest, headers: ht
 /**
  * A session key reaches us verbatim from the caller — the `x-session-id` header
  * or the `user` field — and the name derived from it becomes a DIRECTORY name:
- * `handleChatCompletion` builds `os.tmpdir()/openclaw-compat-<name>` and calls
- * `mkdirSync(..., {recursive: true})`, then starts the session there under
- * `permissionMode: 'bypassPermissions'`. A key carrying path separators
- * therefore both creates a directory anywhere the process can write and points
- * a permissionless agent at it — measured: `x-session-id: ../../../../etc/x`
- * resolved outside the temp dir entirely.
+ * `handleChatCompletion` runs the session in `compatSessionDir(<name>)` under
+ * `permissionMode: 'bypassPermissions'`. A key carrying path separators would
+ * both create a directory anywhere the process can write and point a
+ * permissionless agent at it — measured, when the directory still lived in the
+ * temp dir: `x-session-id: ../../../../etc/x` resolved outside it entirely.
  *
  * Keys that are already safe pass through unchanged, so a caller using an
  * ordinary id keeps the session name it has always had. Anything else is
@@ -357,21 +364,30 @@ export interface ParsedToolCalls {
  * Returns both the extracted text content (before/after tags) and any tool calls found.
  */
 export function parseToolCallsFromText(text: string): ParsedToolCalls {
-  // Match ALL <tool_calls> blocks (model may output multiple)
-  const tagRegex = /<tool_calls>\s*([\s\S]*?)\s*<\/tool_calls>/g;
+  // Every <tool_calls> block (the model may output several), found with indexOf
+  // rather than a regular expression: `<tool_calls>\s*([\s\S]*?)\s*<\/tool_calls>`
+  // backtracks cubically on a long run of whitespace with no closing tag, and the
+  // text is model output.
+  const OPEN = '<tool_calls>';
+  const CLOSE = '</tool_calls>';
   const allCalls: OpenAIToolCall[] = [];
   let lastIndex = 0;
   const textParts: string[] = [];
-  let m: RegExpExecArray | null;
 
-  while ((m = tagRegex.exec(text)) !== null) {
+  for (;;) {
+    const start = text.indexOf(OPEN, lastIndex);
+    if (start < 0) break;
+    const close = text.indexOf(CLOSE, start + OPEN.length);
+    if (close < 0) break;
+    const block = text.slice(start, close + CLOSE.length);
+    const inner = text.slice(start + OPEN.length, close);
     // Collect text before this block
-    const before = text.slice(lastIndex, m.index).trim();
+    const before = text.slice(lastIndex, start).trim();
     if (before) textParts.push(before);
-    lastIndex = m.index + m[0].length;
+    lastIndex = close + CLOSE.length;
 
     try {
-      const parsed = JSON.parse(m[1].trim()) as unknown;
+      const parsed = JSON.parse(inner.trim()) as unknown;
       const arr = Array.isArray(parsed) ? parsed : [parsed];
       for (const raw of arr) {
         const call = raw as Record<string, unknown>;
@@ -395,7 +411,7 @@ export function parseToolCallsFromText(text: string): ParsedToolCalls {
       }
     } catch {
       // One block failed — keep its text as content
-      textParts.push(m[0]);
+      textParts.push(block);
     }
   }
 
@@ -642,8 +658,9 @@ function fenceIfHistoryPresent(historyBlock: string, lastUserText: string): stri
  * labeling tools, etc). They use the transcript shape itself as their only
  * "start a new conversation" signal.
  *
- * The env var is read on every call so ops can flip it via launchctl setenv
- * without restarting the server.
+ * The env var is read on every call, so a change to this process's own
+ * environment applies to the next request. `launchctl setenv` does not reach a
+ * process that is already running; the server has to be restarted to see it.
  */
 export function extractUserMessage(
   messages: OpenAIChatMessage[],
@@ -812,7 +829,14 @@ interface SessionManagerLike {
     name: string,
     message: string,
     options?: Record<string, unknown>,
-  ): Promise<{ output: string; sessionId?: string; error?: string; events: unknown[] }>;
+  ): Promise<{
+    output: string;
+    sessionId?: string;
+    error?: string;
+    events: unknown[];
+    // This send's own tokens. getStatus()'s stats are running totals for the session.
+    usage?: { tokensIn: number; tokensOut: number };
+  }>;
   stopSession(name: string): Promise<void>;
   listSessions(): Array<{ name: string }>;
   getStatus(name: string): {
@@ -947,6 +971,32 @@ export function __seededConversationCount(): number {
   return seededConversations.size;
 }
 
+/**
+ * The directory an OpenAI-compat session runs in, under the server's own data
+ * directory: `~/.claw-orchestrator/compat/<session>`, mode 0700. Not the system
+ * temp dir: on a shared host its names are predictable and anyone can create
+ * them first, or put a CLAUDE.md above them, and the session runs there with
+ * bypassPermissions. A directory that is a symlink or belongs to someone else
+ * is refused.
+ */
+export function compatSessionDir(sessionName: string): string {
+  const root = path.join(os.homedir(), '.claw-orchestrator', 'compat');
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  const dir = path.join(root, sessionName);
+  try {
+    fs.mkdirSync(dir, { mode: 0o700 });
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') throw err;
+  }
+  for (const d of [root, dir]) {
+    const st = fs.lstatSync(d);
+    const foreign = typeof process.getuid === 'function' && st.uid !== process.getuid();
+    if (!st.isDirectory() || foreign)
+      throw new Error(`OpenAI-compat session directory ${d} is not this user's own directory`);
+  }
+  return dir;
+}
+
 export async function handleChatCompletion(
   manager: SessionManagerLike,
   body: Record<string, unknown>,
@@ -1039,10 +1089,9 @@ export async function handleChatCompletion(
   const needsCreate = !sessionExists || extracted.isNewConversation;
   if (needsCreate) {
     // OpenAI-compat sessions are API proxies, not coding sessions.
-    // Use a neutral empty temp dir so the CLI doesn't load CLAUDE.md,
+    // Use a neutral empty dir so the CLI doesn't load CLAUDE.md,
     // git state, or project context from wherever `serve` was started.
-    const sessionCwd = path.join(os.tmpdir(), `openclaw-compat-${sessionName}`);
-    if (!fs.existsSync(sessionCwd)) fs.mkdirSync(sessionCwd, { recursive: true });
+    const sessionCwd = compatSessionDir(sessionName);
     const sessionConfig: Record<string, unknown> = {
       name: sessionName,
       cwd: sessionCwd,
@@ -1139,24 +1188,28 @@ export async function handleChatCompletion(
   // back to the legacy behavior of injecting the tool block into each user
   // message. Enables dynamic tool list updates within a single session.
   //
-  // Non-claude engines: the CLI is spawned fresh per turn with no persistent
-  // system prompt, so tools must be injected per message — but WHICH block
+  // Non-claude engines: the session is started without a system prompt (see the
+  // create block), so tools must be injected per message — but WHICH block
   // depends on whether the engine keeps the conversation itself:
   //
-  //   - codex / codex-app / agy resume a thread, so the first turn's schemas are
-  //     still in the transcript. Re-sending them every turn only grows the
-  //     prompt; with ~50 tools that is tens of thousands of tokens per turn and
-  //     the thread overflows the context window mid-loop. Send a reminder that
-  //     restates the calling convention without the schemas.
-  //   - cursor / opencode / gemini / one-shot custom start from nothing every
-  //     send, so the full schemas have to go out every time.
+  //   - codex / codex-app / agy / cursor / opencode / grok resume a conversation
+  //     by id, so the first turn's schemas are still in the transcript.
+  //     Re-sending them every turn only grows the prompt; with ~50 tools that is
+  //     tens of thousands of tokens per turn and the thread overflows the
+  //     context window mid-loop. Send a reminder that restates the calling
+  //     convention without the schemas — once the id has been captured
+  //     (nativeThreadIsLive); until then the full block goes out again.
+  //   - gemini / one-shot custom start from nothing every send, so the full
+  //     schemas have to go out every time.
   //
   // A fresh session always gets the full block regardless of engine, so a thread
   // is never created without the definitions (this also covers the case where a
-  // session was evicted and is being recreated mid-conversation). A caller that
-  // changes its tool list mid-conversation also lands on the full block: the
-  // tool list is part of the session-name hash, so a different list resolves to
-  // a different session, which is a fresh create.
+  // session was evicted and is being recreated mid-conversation). A caller with
+  // no explicit key (no `X-Session-Id`, no `user`) that changes its tool list
+  // mid-conversation also lands on the full block: the tool list is part of the
+  // hashed key, so a different list resolves to a different session, which is a
+  // fresh create. An explicit key names the session by itself, so a changed list
+  // stays on the same session and a resumed thread gets only the reminder.
   //
   // OPENAI_COMPAT_TOOLS_PER_MESSAGE is the exception — its whole purpose is to
   // re-send the full list every turn so the tool set can change within one
@@ -1219,18 +1272,26 @@ function reportStatus(state: string, activity: string, tool?: string): void {
   const url = process.env.OPENAI_COMPAT_STATUS_URL;
   if (!url) return;
   const payload = JSON.stringify({ state, activity, tool: tool || null });
-  const req = http.request(
-    url,
-    {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
-      timeout: 2000,
-    },
-    () => {},
-  );
-  req.on('error', () => {});
-  req.write(payload);
-  req.end();
+  // `http.request` throws synchronously on a URL it cannot use (`https://`, malformed), and the
+  // callers report from inside the send's try block — so that throw would fail the completion.
+  try {
+    const req = http.request(
+      url,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(payload) },
+        timeout: 2000,
+      },
+      () => {},
+    );
+    // `timeout` only emits the event; the request has to be destroyed for it to end anything.
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => {});
+    req.write(payload);
+    req.end();
+  } catch {
+    /* best effort */
+  }
 }
 
 function getToolDescription(toolName: string, toolInput?: Record<string, unknown>): string {
@@ -1289,6 +1350,7 @@ async function handleNonStreaming(
   try {
     reportStatus('thinking', 'Processing request...');
     const result = await manager.sendMessage(sessionName, userMessage, {
+      timeout: compatTurnTimeoutMs(),
       onEvent: (event: { type: string; tool?: { name?: string; input?: Record<string, unknown> } }) => {
         if (event.type === 'tool_use' && event.tool?.name) {
           const desc = getToolDescription(event.tool.name, event.tool.input);
@@ -1305,15 +1367,8 @@ async function handleNonStreaming(
       res.end(JSON.stringify({ error: { message: result.error, type: 'upstream_error' } }));
       return landed;
     }
-    let tokensIn = 0;
-    let tokensOut = 0;
-    try {
-      const status = manager.getStatus(sessionName);
-      tokensIn = status.stats.tokensIn;
-      tokensOut = status.stats.tokensOut;
-    } catch {
-      /* stats unavailable */
-    }
+    let tokensIn = result.usage?.tokensIn ?? 0;
+    let tokensOut = result.usage?.tokensOut ?? 0;
     // Fall back to a length-based estimate rather than reporting usage as 0,
     // which breaks downstream cost accounting for OpenAI-compatible clients.
     if (tokensIn === 0) tokensIn = estimateTokens(userMessage);
@@ -1372,9 +1427,16 @@ async function handleStreaming(
   res.on('close', () => {
     clientDisconnected = true;
   });
+  // A write after end() does not throw: it emits ERR_STREAM_WRITE_AFTER_END
+  // later, which with no listener would end the process. `end()` comes before
+  // `'close'`, and a chunk can still arrive after the turn has been settled.
+  const writable = (): boolean => !clientDisconnected && !res.writableEnded && !res.destroyed;
+  res.on('error', () => {
+    clientDisconnected = true;
+  });
 
   const writeSSE = (data: string) => {
-    if (!clientDisconnected) {
+    if (writable()) {
       try {
         res.write(`data: ${data}\n\n`);
       } catch {
@@ -1388,7 +1450,7 @@ async function handleStreaming(
 
   // SSE keepalive heartbeat
   const heartbeatTimer = setInterval(() => {
-    if (!clientDisconnected) {
+    if (writable()) {
       try {
         res.write(': keepalive\n\n');
       } catch {
@@ -1412,6 +1474,7 @@ async function handleStreaming(
   try {
     reportStatus('thinking', 'Processing request...');
     const result = await manager.sendMessage(sessionName, userMessage, {
+      timeout: compatTurnTimeoutMs(),
       onChunk: (chunk: string) => {
         if (hasTools) {
           bufferedText += chunk;
@@ -1438,21 +1501,16 @@ async function handleStreaming(
       return landed;
     }
 
-    // Get token usage for final chunk
-    let usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | undefined;
-    try {
-      const status = manager.getStatus(sessionName);
-      usage = {
-        prompt_tokens: status.stats.tokensIn,
-        completion_tokens: status.stats.tokensOut,
-        total_tokens: status.stats.tokensIn + status.stats.tokensOut,
-      };
-    } catch {
-      /* best effort */
-    }
+    const usage = result.usage && {
+      prompt_tokens: result.usage.tokensIn,
+      completion_tokens: result.usage.tokensOut,
+      total_tokens: result.usage.tokensIn + result.usage.tokensOut,
+    };
 
-    if (hasTools && bufferedText) {
-      const parsed = parseToolCallsFromText(bufferedText);
+    // An engine with no delta channel left the buffer empty; its reply is the return value.
+    const toolText = bufferedText || result.output;
+    if (hasTools && toolText) {
+      const parsed = parseToolCallsFromText(toolText);
 
       if (parsed.toolCalls.length > 0) {
         // Emit text content if any
@@ -1493,7 +1551,7 @@ async function handleStreaming(
         writeSSE(JSON.stringify(finalChunk));
       } else {
         // No tool calls — emit buffered text as content
-        writeSSE(JSON.stringify(formatCompletionChunk(completionId, model, { content: bufferedText }, null)));
+        writeSSE(JSON.stringify(formatCompletionChunk(completionId, model, { content: toolText }, null)));
         const finalChunk = formatCompletionChunk(completionId, model, {}, 'stop');
         if (usage) finalChunk.usage = usage;
         writeSSE(JSON.stringify(finalChunk));

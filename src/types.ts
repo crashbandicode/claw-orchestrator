@@ -38,18 +38,7 @@ export type PermissionMode = 'acceptEdits' | 'bypassPermissions' | 'default' | '
 // Codex adds `ultra` above `max`, Grok stops at `xhigh`, Antigravity at `high`,
 // and OpenCode forwards the level to its provider without validating it. Each
 // wrapper documents its own clamp; none of them silently drops the field.
-export const EFFORT_LEVELS = [
-  'none',
-  'minimal',
-  'low',
-  'medium',
-  'high',
-  'xhigh',
-  'max',
-  'ultra',
-  'default',
-  'auto',
-] as const;
+export const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'auto'] as const;
 export type EffortLevel = (typeof EFFORT_LEVELS)[number];
 
 // ─── Engine ─────────────────────────────────────────────────────────────────
@@ -64,14 +53,25 @@ export const ENGINE_TYPES = [
   'grok',
   'opencode',
   'custom',
+  'acp',
 ] as const;
 export type EngineType = (typeof ENGINE_TYPES)[number];
+
+/** Native transcript providers a manual thread can be registered under. */
+export const PARENT_TOOL_IDS = ['codex', 'claude_code', 'cursor', 'opencode'] as const;
+export type ParentToolId = (typeof PARENT_TOOL_IDS)[number];
 
 /** Common execution binding shared by every directly configured agent. */
 export interface AgentBinding {
   engine?: EngineType;
   model?: string;
   effort?: EffortLevel;
+  /**
+   * The agent an `acp` engine starts: a bundled preset id (`clawo engines`). Only
+   * the id travels here — a stored workflow spec is written to disk, and an inline
+   * config can carry an environment; `session_start` takes inline configs.
+   */
+  acpAgent?: string;
 }
 
 /**
@@ -125,6 +125,7 @@ export function engineHasNativeConversation(
     case 'opencode':
     case 'cursor':
     case 'grok':
+    case 'acp':
       return true;
     case 'custom':
       // A persistent custom engine is a long-running stdin/stdout process, so it
@@ -239,8 +240,8 @@ export interface CustomEngineConfig {
   permissionModes?: Record<string, string>;
 
   /**
-   * Default pricing per 1M tokens (for cost estimation when model is unknown).
-   * Falls back to { input: 0, output: 0 } if omitted.
+   * Pricing per 1M tokens for a model the registry cannot price: an unregistered
+   * one, or none. Without it such a model is priced at the claude-sonnet-4-6 rate.
    */
   pricing?: { input: number; output: number; cached?: number };
 
@@ -255,6 +256,29 @@ export interface CustomEngineConfig {
    * Applied as global replacements with '***'.
    */
   sanitizePatterns?: string[];
+}
+
+// ─── ACP Agent Config ───────────────────────────────────────────────────────
+//
+// An agent that speaks the Agent Client Protocol on stdio (`kimi acp`,
+// `opencode acp`, a Claude Code ACP adapter, …). The protocol is the same for
+// all of them, so the config only says how to start the process.
+
+export interface AcpAgentConfig {
+  /** Display name (logs, session ids). */
+  name: string;
+  /** Command name or path that serves ACP on stdio, e.g. 'kimi'. */
+  command: string;
+  /** Environment variable that overrides `command` at runtime, e.g. 'KIMI_BIN'. */
+  commandEnv?: string;
+  /** Arguments after the command, e.g. ['acp']. */
+  args?: string[];
+  /** Extra environment for the process. */
+  env?: Record<string, string>;
+  /** Context window in tokens, when the agent does not report one. */
+  contextWindow?: number;
+  /** Price per million tokens, used only when the agent reports no cost. */
+  pricing?: { input: number; output: number; cached?: number };
 }
 
 // ─── Session Config ──────────────────────────────────────────────────────────
@@ -279,20 +303,58 @@ export interface AgentDefinition {
   [field: string]: unknown;
 }
 
+export type OrchestrationRunKind = 'session' | 'fanout' | 'council' | 'autoloop' | 'ultraplan' | 'ultrareview';
+export type OrchestrationRunStatus = 'running' | 'completed' | 'failed' | 'aborted';
+export type OrchestrationAgentStatus = 'declared' | 'idle' | 'running' | 'completed' | 'failed' | 'aborted';
+
+export interface OrchestrationAgentContext {
+  runId: string;
+  runKind: OrchestrationRunKind;
+  agentKey: string;
+  agentName: string;
+  codename?: string;
+  engine: EngineType;
+  model?: string;
+  effort?: EffortLevel;
+  cwd: string;
+  parentMachineId?: string;
+  parentSessionId?: string;
+  parentToolId?: ParentToolId;
+  originHost?: string;
+  executionHost?: string;
+  remoteSessionHandle?: string;
+}
+
 export interface SessionConfig {
   name: string;
   cwd: string;
   engine?: EngineType;
   model?: string;
   baseUrl?: string;
+  /**
+   * Claude engine only. The Claude account to run under, by name from the
+   * server's `claude-accounts.json`, or `auto` for the first available account in
+   * its rotation. A session on an account in the rotation moves to the next one
+   * when it reaches its usage limit and continues the same conversation. Absent:
+   * the file's `default`, else the CLI's own login. The credential is resolved by
+   * the server and never part of a session config (see claude-accounts.ts).
+   */
+  claudeAccount?: string;
   permissionMode: PermissionMode;
   // Tool control
   allowedTools?: string[];
   disallowedTools?: string[];
-  tools?: string[];
+  /** Claude Code's built-in tool set (`--tools`): names, `''` for none, or `'default'`. */
+  tools?: string | string[];
   // Limits
   maxTurns?: number;
   maxBudgetUsd?: number;
+  /**
+   * Compact the conversation before a send once context use reaches this
+   * percentage (1–99). Off when unset. For long-lived sessions, where every
+   * call re-reads the whole context from cache and cost grows with its size.
+   */
+  autoCompactPercent?: number;
   // System prompts
   systemPrompt?: string;
   appendSystemPrompt?: string;
@@ -306,6 +368,18 @@ export interface SessionConfig {
   sessionName?: string;
   claudeResumeId?: string;
   resumeSessionId?: string;
+  /** Origin parent machine UUID. Configured, not inferred from the destination. */
+  parentMachineId?: string;
+  /** Exact parent native thread or session id. */
+  parentSessionId?: string;
+  /** Parent transcript provider when known. */
+  parentToolId?: ParentToolId;
+  /** Source host display name from administrator config. */
+  originHost?: string;
+  /** Execution host alias that owns the live session. */
+  executionHost?: string;
+  /** Qualified `host::name` handle when the caller is on another machine. */
+  remoteSessionHandle?: string;
   forkSession?: boolean;
   // Directories
   addDir?: string[];
@@ -376,6 +450,13 @@ export interface SessionConfig {
    * fan out (ultracode, agent teams) surface no intermediate output.
    */
   forwardSubagentText?: boolean;
+  /**
+   * Give the session the user's Chrome through the Claude in Chrome extension
+   * (`--chrome`, Claude engine). It acts with the browser's own sign-ins, so it
+   * is off unless asked for. Needs Chrome running with the extension installed
+   * and a claude.ai login; the CLI turns it off for API-key logins.
+   */
+  chrome?: boolean;
   /** Delegate permission prompts to an MCP tool for non-interactive use */
   permissionPromptTool?: string;
   /** Move cwd/env/git status from system prompt to user message for better prompt cache hits */
@@ -421,6 +502,12 @@ export interface SessionConfig {
    * Defaults to 'workspace-write' for Codex.
    */
   sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
+  /**
+   * Argv prefix the engine binary runs under, e.g. a sandbox wrapper:
+   * `['/opt/task/sandbox.sh', 'task', '0 1']`. Set by the caller that owns the
+   * session; never taken from an agent.
+   */
+  launcher?: string[];
   /**
    * Codex only. Named config profile from `~/.codex/config.toml`, passed as
    * `codex exec --profile <name>`. Bundles model + reasoning effort + approval +
@@ -475,47 +562,17 @@ export interface SessionConfig {
    */
   customEngine?: CustomEngineConfig | string;
   /**
+   * The agent to run — required when engine is 'acp'. An inline config, or the
+   * id of a bundled preset from `configs/engines/` (the only form accepted over
+   * HTTP, as for `customEngine`).
+   */
+  acpAgent?: AcpAgentConfig | string;
+  /**
    * Internal, content-free correlation metadata for external transcript
-   * indexers. Public callers normally omit this; fanout/council populate it so
-   * their short-lived native sessions remain linked after Claw cleans them up.
+   * indexers. Public callers normally omit this; fanout and council populate it
+   * so their short-lived native sessions stay linked after Claw cleans them up.
    */
   orchestration?: OrchestrationAgentContext;
-  /**
-   * Explicit remote-lifecycle fields. The execution host is authoritative for
-   * `executionHost`. Parent identity is supplied by the caller or, for a missing
-   * parent session id only, by a first-line MEMENTO-DELEGATE-FROM marker.
-   */
-  parentMachineId?: string;
-  parentSessionId?: string;
-  parentToolId?: ParentToolId;
-  originHost?: string;
-  executionHost?: string;
-  remoteSessionHandle?: string;
-}
-
-export const PARENT_TOOL_IDS = ['codex', 'claude_code', 'cursor', 'opencode'] as const;
-export type ParentToolId = (typeof PARENT_TOOL_IDS)[number];
-
-export type OrchestrationRunKind = 'session' | 'fanout' | 'council' | 'autoloop' | 'ultraplan' | 'ultrareview';
-export type OrchestrationAgentStatus = 'declared' | 'idle' | 'running' | 'completed' | 'failed' | 'aborted';
-export type OrchestrationRunStatus = 'running' | 'completed' | 'failed' | 'aborted';
-
-export interface OrchestrationAgentContext {
-  runId: string;
-  runKind: OrchestrationRunKind;
-  agentKey: string;
-  agentName: string;
-  codename?: string;
-  engine: EngineType;
-  model?: string;
-  effort?: EffortLevel;
-  cwd: string;
-  parentMachineId?: string;
-  parentSessionId?: string;
-  parentToolId?: ParentToolId;
-  originHost?: string;
-  executionHost?: string;
-  remoteSessionHandle?: string;
 }
 
 // ─── Session Stats ───────────────────────────────────────────────────────────
@@ -558,12 +615,15 @@ export interface SessionStats {
   /**
    * How full the context is (0-100). Two different readings, by engine:
    *
-   * - one-shot engines (4.11.0) and codex (4.12.1): the last turn's prompt over
-   *   the window the engine enforces, so it rises and falls with the conversation.
-   * - `claude` and persistent `custom`: cumulative `tokensIn + tokensOut` over the
-   *   model's registry window, so it only grows and overcounts a conversation
-   *   whose history is replayed each turn. `getContextWindow()` falls back to
-   *   200,000 for a model that is not in the registry.
+   * - every engine but persistent `custom`: the last turn's prompt over the window
+   *   the engine reports it enforces (`claude`, `codex`, `codex-app`, `acp`), else
+   *   the model's registry window (the agent preset's window for `acp`). It rises
+   *   and falls with the conversation. For `claude` the prompt includes cached
+   *   reads and cache writes. `getContextWindow()` falls back to 200,000 for a
+   *   model that is not in the registry.
+   * - persistent `custom`: cumulative `tokensIn + tokensOut` over the engine
+   *   config's `contextWindow` (200,000 when unset), so it only grows and
+   *   overcounts a conversation whose history is replayed each turn.
    *
    * Distinct in either case from `tokensIn`, which is total billed input tokens.
    */
@@ -572,6 +632,13 @@ export interface SessionStats {
   retries: number;
   /** Last API retry error category (e.g. "overloaded", "rate_limit") */
   lastRetryError?: string;
+  /**
+   * Turns the model refused and the CLI re-ran on another model (Claude's
+   * `system/model_refusal_fallback`), and the most recent one. The run ledger
+   * compares the count across a turn to mark the rows where it happened.
+   */
+  refusalFallbacks?: number;
+  lastRefusalFallback?: { from: string; to: string; category?: string };
   /** Plugins that failed to load due to unmet dependencies (from system/init event, CLI 2.1.121+) */
   pluginErrors?: Array<{ plugin: string; reason: string }>;
   /** Codex thread ID captured from the most recent `thread.started` event (Codex 0.119+). Used by `codex_resume`. */
@@ -584,6 +651,8 @@ export interface SessionStats {
   opencodeSessionId?: string;
   /** Grok Build session ID captured from the turn's JSON result. Reused via `--resume` for multi-turn context. */
   grokSessionId?: string;
+  /** ACP session id from `session/new`; a later session loads it with `session/load` or `session/resume`. */
+  acpSessionId?: string;
   /**
    * True when the most recent turn's token counts came from estimateTokens()
    * because the engine reported no usage. Cost derived from those counts is an
@@ -663,27 +732,6 @@ export interface StreamEvent {
 
 // ─── Results ─────────────────────────────────────────────────────────────────
 
-/**
- * How a managed session stands after engine-reported errors.
- *
- * - `degraded`: the engine reported an error but its process is still ready.
- *   Codex raises these for conditions it survives (an unreachable MCP server, a
- *   retried stream). The session keeps serving turns, and the next turn that
- *   completes cleanly returns it to `ok`.
- * - `failed`: the engine process is gone or not ready. It stays failed until the
- *   session is stopped and started again; sends are refused by the engine.
- */
-export type SessionHealthState = 'ok' | 'degraded' | 'failed';
-
-/** Engine errors recorded against a managed session. Message text is secret-redacted and length-capped. */
-export interface SessionHealth {
-  state: SessionHealthState;
-  /** Errors reported since the session started, including ones that did not change its state. */
-  errorCount: number;
-  lastError?: string;
-  lastErrorAt?: string;
-}
-
 export interface SessionInfo {
   name: string;
   claudeSessionId?: string;
@@ -698,12 +746,9 @@ export interface SessionInfo {
   budgetUsd?: number;
   /** True once `costUsd` reached `budgetUsd` — further turns are refused. */
   budgetExhausted?: boolean;
-  /** Present once the engine has reported an error; absent means none so far. */
-  health?: SessionHealth;
+  /** The Claude account the session is running under now, when it runs under one. */
+  claudeAccount?: string;
   engine?: EngineType;
-  orchestrationRunId?: string;
-  orchestrationAgentKey?: string;
-  /** Wrapper name on the execution host. Present when `name` has been qualified. */
   localName?: string;
   parentMachineId?: string;
   parentSessionId?: string;
@@ -711,6 +756,8 @@ export interface SessionInfo {
   originHost?: string;
   executionHost?: string;
   remoteSessionHandle?: string;
+  orchestrationRunId?: string;
+  orchestrationAgentKey?: string;
 }
 
 /** A tool call the engine refused to run during a turn. */
@@ -726,8 +773,6 @@ export interface SendResult {
   sessionId?: string;
   error?: string;
   events: StreamEvent[];
-  orchestrationRunId?: string;
-  orchestrationAgentKey?: string;
   /**
    * Tool calls the engine blocked during this turn. Present only when there was
    * at least one.
@@ -741,6 +786,26 @@ export interface SendResult {
    * successful turn as work done needs this field to know otherwise.
    */
   permissionDenials?: PermissionDenial[];
+  /**
+   * Images the engine generated during this turn, as files on this machine.
+   * Present only when there was at least one. Codex is the engine that
+   * generates them (its built-in image generation); the reply text may name
+   * the same files, but this list is the one to read.
+   */
+  images?: GeneratedImage[];
+  /**
+   * Tokens and cost this send added to the session's running totals — `getStats()` accumulates
+   * over the session, so it cannot say what one turn cost. Measured inside the per-session send
+   * chain, so a send queued behind another is not charged for it.
+   */
+  usage?: { tokensIn: number; tokensOut: number; costUsd: number };
+}
+
+export interface GeneratedImage {
+  /** Absolute path of the saved image. */
+  path: string;
+  /** The prompt the engine actually used, when it reports one. */
+  revisedPrompt?: string;
 }
 
 export interface GrepMatch {
@@ -818,7 +883,7 @@ export interface ISession {
   // ── Lifecycle ───────────────────────────────────────────────────────────
   /** Initialise the engine subprocess. Engine-specific; config passed via constructor. */
   start(): Promise<this>;
-  stop(): void | Promise<void>;
+  stop(): void;
   pause(): void;
   resume(): void;
 
@@ -855,7 +920,6 @@ export interface PluginConfig {
   defaultModel?: string;
   defaultPermissionMode: PermissionMode;
   defaultEffort: EffortLevel;
-  /** Maximum open sessions per manager, including idle/starting sessions; 0 disables the limit. */
   maxConcurrentSessions: number;
   sessionTtlMinutes: number;
   proxy?: ProxyConfig;
@@ -864,9 +928,8 @@ export interface PluginConfig {
 }
 
 export interface ProxyConfig {
+  /** Register the proxy routes on the gateway. On unless this is `false`. */
   enabled: boolean;
-  bigModel: string;
-  smallModel: string;
 }
 
 // ─── Inbox Types ────────────────────────────────────────────────────────────
@@ -877,10 +940,10 @@ export interface InboxMessage {
   timestamp: string;
   read: boolean;
   summary?: string;
-  /** Durable receiver-host message id. Omitted by the in-memory local inbox. */
-  id?: string;
-  /** Origin host display name. Omitted when the sender is local. */
+  /** Origin host display name. Omitted for a same-machine send. */
   host?: string;
+  /** Stable receiver-host message id. Omitted for an in-process send. */
+  id?: string;
 }
 
 export interface UltraplanResult {
@@ -940,6 +1003,8 @@ export interface AgentPersona extends AgentBinding {
   role?: string;
   baseUrl?: string;
   permissionMode?: PermissionMode;
+  /** Forwarded to the seat's session; engine adapters apply it as they already do. */
+  sandboxMode?: SessionConfig['sandboxMode'];
   customEngine?: CustomEngineConfig;
   /** Per-agent reasoning effort passed to the agent's session. */
   /** Per-agent ultracode / dynamic workflows (council, claude engine only). */
@@ -984,6 +1049,10 @@ export interface CouncilSession {
   endTime?: string;
   finalSummary?: string;
   compactContext?: string;
+  /** Why the run failed, when it did — a refused task or directory, a worktree that could not be made. */
+  error?: string;
+  /** Every agent turn summed, as each send measured it — the council's share of its run's cost. */
+  costUsd?: number;
 }
 
 // ─── Council Post-Processing Types ─────────────────────────────────────────

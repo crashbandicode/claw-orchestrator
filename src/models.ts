@@ -38,30 +38,44 @@ export interface ModelDef {
 
 const MODELS: ModelDef[] = [
   // ── Anthropic ──────────────────────────────────────────────────────────
-  // The Fable tier sits above Opus: $10/$50 per Mtok and a full 1M-token
-  // context at standard pricing (no long-context surcharge). Mythos is the same
-  // model at the same price under limited availability, so each generation is
-  // registered in both spellings — an unregistered id does not fail, it prices
-  // at the family default.
+  // The Fable tier sits above Opus, with a full 1M-token context at standard
+  // pricing (no long-context surcharge): $8/$40 per Mtok for 5.2, $10/$50 for
+  // 5 and 5.1. Mythos is the same model at the same price under limited
+  // availability, so each generation is registered in both spellings — an
+  // unregistered id does not fail, it prices at the family default.
   //
-  // Cache reads are where the two generations differ, and 5.1 is the exception
-  // to a rule that holds everywhere else in this file: a cache hit is 0.1x base
-  // input on every Claude model EXCEPT Fable 5.1 and Mythos 5.1, which are
-  // 0.025x — $0.25 per Mtok against a $10 input price. Deriving it from the
-  // input rate would over-report those two by 4x. Cache *writes* keep the usual
-  // 1.25x / 2x multipliers, which is why only the read is stored here.
+  // Cache reads are where the generations differ. A cache hit is 0.1x base
+  // input on most Claude models, but 0.025x on Fable/Mythos 5.1 and 5.2 —
+  // $0.25 and $0.20 per Mtok — and 0.05x on Opus 5.5 and Sonnet 5.5. Deriving
+  // it from the input rate would over-report the 0.025x ones by 4x. Cache
+  // *writes* keep the usual 1.25x / 2x multipliers, which is why only the read
+  // is stored here.
   //
-  // The `fable` alias points at 5.1 because that is what the CLI's own `fable`
-  // resolves to — verified against 2.1.258 by reading `modelUsage.canonicalModel`
-  // back from a real turn, not inferred from the release note. (A Claude apps
-  // gateway session still resolves `fable` to Fable 5 while gateways catch up;
-  // that is the gateway's mapping, not this registry's.)
+  // The `fable` alias points at 5.2 because that is what the CLI's own `fable`
+  // resolves to — verified against 2.1.321 by reading `modelUsage` back from a
+  // real turn, not inferred from the release note. (A Claude apps gateway
+  // session may still resolve `fable` to an older Fable while gateways catch
+  // up; that is the gateway's mapping, not this registry's.)
+  {
+    id: 'claude-fable-5-2',
+    engine: 'claude',
+    provider: 'anthropic',
+    pricing: { input: 8, output: 40, cached: 0.2 },
+    aliases: ['fable'],
+    contextWindow: 1_000_000,
+  },
+  {
+    id: 'claude-mythos-5-2',
+    engine: 'claude',
+    provider: 'anthropic',
+    pricing: { input: 8, output: 40, cached: 0.2 },
+    contextWindow: 1_000_000,
+  },
   {
     id: 'claude-fable-5-1',
     engine: 'claude',
     provider: 'anthropic',
     pricing: { input: 10, output: 50, cached: 0.25 },
-    aliases: ['fable'],
     contextWindow: 1_000_000,
   },
   {
@@ -127,13 +141,13 @@ const MODELS: ModelDef[] = [
   },
   // Sonnet 5.5 is the model `--model sonnet` resolves to since CLI 2.1.284
   // (verified against the binary), so the `sonnet` alias moved to it, as `opus`
-  // did for Opus 5.5. It is priced like Sonnet 5 — $2/$10 per Mtok, cached read
-  // 0.1× input, 1M-token context — so the move changes no cost figure today.
+  // did for Opus 5.5. $2/$10 per Mtok like Sonnet 5, 1M-token context, but a
+  // cache hit is 0.05× input ($0.10), not the usual 0.1×, as on Opus 5.5.
   {
     id: 'claude-sonnet-5-5',
     engine: 'claude',
     provider: 'anthropic',
-    pricing: { input: 2, output: 10, cached: 0.2 },
+    pricing: { input: 2, output: 10, cached: 0.1 },
     aliases: ['sonnet'],
     contextWindow: 1_000_000,
   },
@@ -185,12 +199,25 @@ const MODELS: ModelDef[] = [
     pricing: { input: 5, output: 25, cached: 0.5 },
     contextWindow: 200_000,
   },
+  // Haiku 5.5 (2026-10-07) is what `--model haiku` resolves to in CLI 2.1.295
+  // (verified against the binary), so the `haiku` alias moved to it. 1M-token
+  // context. Priced by prompt length: $0.10/$0.50 per Mtok (cache hit $0.01) for
+  // a prompt up to 100K tokens, $0.50/$2.50 ($0.05) above. The registry is
+  // single-tier, so this is the lower tier; Claude Code reports its own cost,
+  // which is what the ledger and `maxBudgetUsd` use for Claude sessions.
+  {
+    id: 'claude-haiku-5-5',
+    engine: 'claude',
+    provider: 'anthropic',
+    pricing: { input: 0.1, output: 0.5, cached: 0.01 },
+    aliases: ['haiku'],
+    contextWindow: 1_000_000,
+  },
   {
     id: 'claude-haiku-4-5',
     engine: 'claude',
     provider: 'anthropic',
     pricing: { input: 1, output: 5, cached: 0.1 },
-    aliases: ['haiku'],
     contextWindow: 200_000,
   },
 
@@ -280,6 +307,23 @@ const MODELS: ModelDef[] = [
     engine: 'codex',
     provider: 'openai',
     pricing: { input: 2, output: 10, cached: 0.2 },
+    contextWindow: 1_050_000,
+  },
+  // Codex 0.159.3 added GPT-6.1 Sol. Same list price as GPT-6 Sol, but its cache
+  // reads are 5% of input rather than 10%, the same change Opus 5.5 made.
+  {
+    id: 'gpt-6.1-sol',
+    engine: 'codex',
+    provider: 'openai',
+    pricing: { input: 2, output: 10, cached: 0.1 },
+    contextWindow: 1_050_000,
+  },
+  // Codex 0.166.0 lists GPT-6.1 Terra, at half of Sol's list price throughout.
+  {
+    id: 'gpt-6.1-terra',
+    engine: 'codex',
+    provider: 'openai',
+    pricing: { input: 1, output: 5, cached: 0.05 },
     contextWindow: 1_050_000,
   },
   {
@@ -469,45 +513,22 @@ const MODELS: ModelDef[] = [
   // a non-issue — $2/$0.50/$6 below a 200K prompt and $4/$1/$12 at or above it,
   // charged across the whole request. We register the base tier, as with every
   // other long-context tier in this file; the engine bills the right one itself.
-  // Verified against docs.x.ai/docs/models and grok 1.0.5 (`grok models`).
+  // Verified against docs.x.ai/docs/models.md and `grok models`: 1.0.67 made
+  // grok-4.7 the default and only selectable model, at grok-4.6's prices.
   {
-    id: 'grok-4.6',
+    id: 'grok-4.7',
     engine: 'grok',
     provider: 'xai',
     pricing: { input: 2, output: 6, cached: 0.5 },
     aliases: ['grok'],
     contextWindow: 500_000,
   },
-
-  // Fork native routes, checked against Cursor's model/pricing documentation.
-  // Registry presence does not assert that every account advertises the route.
   {
-    id: 'grok-4.7',
-    engine: 'cursor',
+    id: 'grok-4.6',
+    engine: 'grok',
     provider: 'xai',
     pricing: { input: 2, output: 6, cached: 0.5 },
-    contextWindow: 256_000,
-  },
-  {
-    id: 'gemini-3.8-flash-high',
-    engine: 'cursor',
-    provider: 'google',
-    pricing: { input: 0.75, output: 3.5, cached: 0.075 },
-    contextWindow: 1_000_000,
-  },
-  {
-    id: 'composer-2.5',
-    engine: 'cursor',
-    provider: 'cursor',
-    pricing: { input: 0.5, output: 2.5, cached: 0.2 },
-    contextWindow: 200_000,
-  },
-  {
-    id: 'composer-2.5-fast',
-    engine: 'cursor',
-    provider: 'cursor',
-    pricing: { input: 3, output: 15, cached: 0.5 },
-    contextWindow: 200_000,
+    contextWindow: 500_000,
   },
 
   // ── Cursor Composer ────────────────────────────────────────────────────
@@ -597,10 +618,6 @@ export function resolveEngineAndModel(model: string): { engine: EngineType; mode
   if (model.startsWith('agy/')) {
     return { engine: 'agy', model: resolveAlias(model.slice('agy/'.length)) };
   }
-
-  // OpenCode provider IDs are transport bindings, including gateway-only models
-  // such as Nemotron. Keep their complete provider/model identifier intact.
-  if (model.startsWith('nvidia/') || model.startsWith('nvidia-b/')) return { engine: 'opencode', model };
 
   // 1. Exact match (id or alias)
   const known = lookupModel(model);
@@ -701,6 +718,34 @@ function effectivePricing(key: string): ModelPricing | undefined {
   return _pricingOverrides.get(key) ?? lookupModel(key)?.pricing;
 }
 
+/** Models already warned about: the warning is per name, not per priced turn or streamed update. */
+const _warnedUnknown = new Set<string>();
+function warnOnce(model: string, message: string): void {
+  if (_warnedUnknown.has(model)) return;
+  _warnedUnknown.add(model);
+  console.warn(message);
+}
+
+/** A model's price from a runtime override or the registry; undefined when it has neither. */
+export function knownModelPricing(model: string): ModelPricing | undefined {
+  return effectivePricing(pricingKey(model));
+}
+
+/**
+ * A model served by the caller's own gateway (`CLAWO_CLAUDE_GATEWAY`) is priced
+ * only from the registry or `pricingOverrides`. Without either its cost is not
+ * known, and is recorded as 0 rather than at another model's rate.
+ */
+export function gatewayModelPricing(model: string): ModelPricing {
+  const known = knownModelPricing(model);
+  if (known) return known;
+  warnOnce(
+    model,
+    `[models] "${model}" has no price: its cost is recorded as 0. Set pricingOverrides to track what it costs.`,
+  );
+  return { input: 0, output: 0 };
+}
+
 /** Get pricing for a model. Falls back to sonnet pricing for unknown models. */
 export function getModelPricing(model?: string, defaultModel = 'claude-sonnet-4-6'): ModelPricing {
   // No model means "the engine default" — which still goes through the override
@@ -709,7 +754,7 @@ export function getModelPricing(model?: string, defaultModel = 'claude-sonnet-4-
   // puts no minLength on `model`, and the config spread preserves it verbatim).
   const direct = effectivePricing(pricingKey(model || defaultModel));
   if (direct) return direct;
-  if (model) console.warn(`[models] Unknown model "${model}" — falling back to ${defaultModel} pricing`);
+  if (model) warnOnce(model, `[models] Unknown model "${model}" — falling back to ${defaultModel} pricing`);
   return effectivePricing(pricingKey(defaultModel)) ?? { input: 0, output: 0 };
 }
 
@@ -721,6 +766,16 @@ export function getModelPricing(model?: string, defaultModel = 'claude-sonnet-4-
  */
 export function hasPricingOverride(model?: string, defaultModel = 'claude-sonnet-4-6'): boolean {
   return _pricingOverrides.has(pricingKey(model || defaultModel));
+}
+
+/**
+ * Whether this model has a price of its own — a registry entry or a runtime
+ * override — rather than the default model's, which getModelPricing() falls
+ * back to. An engine with its own rate for models the registry cannot price
+ * asks this, since the fallback rate is never zero and cannot be told apart.
+ */
+export function hasOwnPricing(model?: string): boolean {
+  return !!model && effectivePricing(pricingKey(model)) !== undefined;
 }
 
 /** Mutable pricing table for runtime overrides (backward compat). */
@@ -780,6 +835,18 @@ export function isGeminiModel(model: string): boolean {
 }
 
 /** Check if a model string is a Claude model. */
+/**
+ * `CLAWO_CLAUDE_GATEWAY=1`: the `claude` engine talks to an Anthropic-compatible
+ * gateway of the caller's own (`ANTHROPIC_BASE_URL`, or a session's `baseUrl`)
+ * that serves non-Claude models under their own names. Any model name then goes
+ * to the CLI as given, and the built-in proxy — which exists to route a
+ * non-Claude model through the OpenClaw gateway — is not started.
+ */
+export function claudeGatewayMode(env: NodeJS.ProcessEnv = process.env): boolean {
+  const v = env.CLAWO_CLAUDE_GATEWAY?.trim().toLowerCase();
+  return v === '1' || v === 'true';
+}
+
 export function isClaudeModel(model: string): boolean {
   const l = model.toLowerCase();
   return (

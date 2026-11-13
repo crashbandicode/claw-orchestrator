@@ -6,7 +6,7 @@
  * and optionally override _cleanupProc() for extra cleanup (readline, streams).
  */
 
-import { ChildProcess, execFileSync } from 'node:child_process';
+import { ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -23,8 +23,8 @@ import {
   getModelPricing as _getModelPricingBase,
 } from './types.js';
 import { resolveAlias, getContextWindow } from './models.js';
+import { killEngineTree } from './engine-spawn.js';
 import { MAX_HISTORY_ITEMS, DEFAULT_HISTORY_LIMIT, SESSION_EVENT } from './constants.js';
-import { sanitizeCwd } from './validation.js';
 
 // ─── Engine Configuration ──────────────────────────────────────────────────
 
@@ -146,11 +146,8 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
 
   async start(): Promise<this> {
     if (this.options.cwd) {
-      this.options.cwd = sanitizeCwd(this.options.cwd)!;
-      const isWindowsPath = /^(?:[a-zA-Z]:[\\/]|\\\\)/.test(this.options.cwd!);
-      const isForeignPath =
-        process.platform === 'win32' ? path.posix.isAbsolute(this.options.cwd!) && !isWindowsPath : isWindowsPath;
-      if (!isForeignPath && !fs.existsSync(this.options.cwd!)) {
+      this.options.cwd = path.resolve(this.options.cwd);
+      if (!fs.existsSync(this.options.cwd)) {
         fs.mkdirSync(this.options.cwd, { recursive: true });
       }
     }
@@ -207,7 +204,11 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
       const before = this._stats.tokensIn;
       this._run(textMessage, options)
         .then(() => this._recordTurnInputTokens(before))
-        .catch((err) => this.emit(SESSION_EVENT.ERROR, err));
+        .catch((err) => {
+          // Fire-and-forget: nothing may be listening, and an unheard 'error' throws.
+          if (this.listenerCount(SESSION_EVENT.ERROR) > 0) this.emit(SESSION_EVENT.ERROR, err);
+          else this.emit(SESSION_EVENT.LOG, `[error] ${(err as Error).message}`);
+        });
       return { requestId, sent: true };
     }
 
@@ -359,7 +360,7 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
 
   getCost(): CostBreakdown {
     const pricing = this._getModelPricing();
-    const displayModel = this.options.model || this.engineCfg.defaultModelDisplay || this.engineCfg.defaultModel;
+    const displayModel = this._billedModel() || this.engineCfg.defaultModelDisplay || this.engineCfg.defaultModel;
 
     if (this.engineCfg.supportsCachedTokens) {
       const cachedPrice = pricing.cached ?? 0;
@@ -423,35 +424,23 @@ export abstract class BaseOneShotSession extends EventEmitter implements ISessio
   /** Override in subclasses that need extra cleanup (readline, stream destroy). */
   protected _cleanupProc(): void {
     if (this.currentProc) {
-      try {
-        // On Windows `kill` ends only the process it is given, and the engine
-        // CLI's own children keep running; taskkill /T takes the whole tree. It
-        // runs synchronously on the cleanup path, so it is bounded: a hung
-        // taskkill must not stall the server's event loop.
-        if (process.platform === 'win32' && this.currentProc.pid) {
-          try {
-            execFileSync('taskkill', ['/pid', String(this.currentProc.pid), '/T', '/F'], {
-              stdio: 'ignore',
-              timeout: 5_000,
-              windowsHide: true,
-            });
-          } catch {
-            this.currentProc.kill('SIGTERM');
-          }
-        } else {
-          this.currentProc.kill('SIGTERM');
-        }
-      } catch {
-        // Process may have already exited
-      }
+      killEngineTree(this.currentProc);
       this.currentProc = null;
     }
   }
 
   // ── Protected Helpers (for subclass _run() implementations) ────────────
 
+  /**
+   * The model this session is billed as, when known; the engine default applies
+   * otherwise. The configured model, unless an engine can report what it ran.
+   */
+  protected _billedModel(): string | undefined {
+    return this.options.model;
+  }
+
   protected _getModelPricing() {
-    return _getModelPricingBase(this.options.model, this.engineCfg.defaultModel);
+    return _getModelPricingBase(this._billedModel(), this.engineCfg.defaultModel);
   }
 
   /**

@@ -11,31 +11,33 @@
  * we lift it per-session via `--enable goals` rather than touching global
  * config.
  *
- * Protocol notes (verified against codex-cli 0.165.0):
+ * Protocol notes (verified against codex-cli 0.164.0):
  *   - Frames are line-delimited JSON-RPC 2.0 messages over stdio.
- *   - Lifecycle: `initialize` → `thread/start` → `turn/start` (per send).
- *   - Goals are `thread/goal/set`, `thread/goal/get`, and `thread/goal/clear`.
- *     Pause and resume are `thread/goal/set` with `status`. `origin: "user"`
- *     is what authorizes the change. Notifications are `thread/goal/updated`
- *     and `thread/goal/cleared`.
- *   - `/side` is an ephemeral `thread/fork` plus a hidden boundary item via
- *     `thread/inject_items`. The parent thread id stays put. The side thread
- *     is unsubscribed when its answer arrives.
+ *   - Lifecycle: `initialize` → `thread/start` (or `thread/resume`) →
+ *     `turn/start` (per send).
+ *   - Goals are typed RPCs: `thread/goal/set` (objective, status, tokenBudget),
+ *     `thread/goal/get`, `thread/goal/clear`. Setting an objective starts the
+ *     server's own turn loop, which runs until the goal leaves `active`; each
+ *     change arrives as `thread/goal/updated`. A thread resumed with an active
+ *     goal continues on its own.
+ *   - `error` notifications carry `{ error: { message, codexErrorInfo },
+ *     willRetry }`; `codexErrorInfo` names the failure (`serverOverloaded`,
+ *     `usageLimitExceeded`, …) so callers need not match message text.
  */
 
-import { spawn, ChildProcess } from 'node:child_process';
+import { ChildProcess } from 'node:child_process';
+import { spawnEngine } from './engine-spawn.js';
+import { resolveCodexMcpDisableArgs, validateCodexMcpSelection } from './codex-mcp.js';
 import { EventEmitter } from 'node:events';
 import * as readline from 'node:readline';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { resolveWindowsNodeInvocation } from './windows-command.js';
-import { resolveCodexMcpDisableArgs, validateCodexMcpSelection } from './codex-mcp.js';
-import { createStdinErrorReporter, guardChildStreams, type ChildStreamName } from './child-process-guard.js';
 
 import type {
   SessionConfig,
   SessionStats,
   EffortLevel,
+  GeneratedImage,
   StreamEvent,
   ISession,
   SessionSendOptions,
@@ -44,6 +46,8 @@ import type {
 } from './types.js';
 import { getModelPricing, resolveAlias, getContextWindow } from './models.js';
 import { SESSION_EVENT, MAX_HISTORY_ITEMS, DEFAULT_HISTORY_LIMIT } from './constants.js';
+import { sanitizeSecrets } from './sanitize.js';
+import { codexReasoningEffort } from './persistent-codex-session.js';
 
 // ─── Hand-translated protocol types (subset we use) ────────────────────────
 //
@@ -52,7 +56,7 @@ import { SESSION_EVENT, MAX_HISTORY_ITEMS, DEFAULT_HISTORY_LIMIT } from './const
 // generated bindings under `src/generated/codex-app/`.
 
 type SandboxMode = 'read-only' | 'workspace-write' | 'danger-full-access';
-type ThreadGoalStatus = 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete';
+export type ThreadGoalStatus = 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete';
 
 /** Hidden user item Codex's TUI injects so inherited fork history is not the side task. */
 const SIDE_BOUNDARY_PROMPT = `Side conversation boundary.
@@ -90,15 +94,32 @@ You may perform non-mutating inspection, including reading or searching files an
 
 Do not modify files, source, git state, permissions, configuration, or any other workspace state unless the user explicitly requests that mutation in this side conversation. Do not request escalated permissions or broader sandbox access unless the user explicitly requests a mutation that requires it. If the user explicitly requests a mutation, keep it minimal, local to the request, and avoid disrupting the main thread.`;
 
-interface ThreadGoal {
+export interface ThreadGoal {
   threadId: string;
   objective: string;
   status: ThreadGoalStatus;
+  tokenBudget: number | null;
+  tokensUsed: number;
+  timeUsedSeconds: number;
   createdAt: number;
   updatedAt: number;
-  timeUsedSeconds: number;
-  tokensUsed: number;
-  tokenBudget?: number | null;
+}
+
+/** The last `error` notification, with the server's own classification. */
+export interface CodexAppError {
+  message: string;
+  /** `codexErrorInfo` as a name: a string variant, or the key of an object variant. */
+  code: string | null;
+  /** True when the server itself will retry the request. */
+  willRetry: boolean;
+  at: string;
+}
+
+/** Name of a `CodexErrorInfo` value: `'serverOverloaded'`, or `'httpConnectionFailed'` for `{ httpConnectionFailed: … }`. */
+function errorInfoName(info: unknown): string | null {
+  if (typeof info === 'string') return info;
+  if (info && typeof info === 'object') return Object.keys(info)[0] ?? null;
+  return null;
 }
 
 interface ThreadGoalUpdatedNotification {
@@ -128,7 +149,7 @@ interface ThreadTokenUsageUpdatedNotification {
 interface ItemCompletedNotification {
   threadId: string;
   turnId: string;
-  item: { type: string; id?: string; text?: string };
+  item: { type: string; id?: string; text?: string; savedPath?: string | null; revisedPrompt?: string | null };
 }
 
 interface AgentMessageDeltaNotification {
@@ -140,37 +161,12 @@ interface AgentMessageDeltaNotification {
 
 interface TurnCompletedNotification {
   threadId: string;
-  turn: { id: string; status: string };
-}
-
-/** v2 `ErrorNotification` (plus the flat `message` older servers sent). */
-interface ErrorNotification {
-  error?: { message?: string; additionalDetails?: string | null };
-  message?: string;
-  threadId?: string;
-  turnId?: string;
-  willRetry?: boolean;
-}
-
-/** An `error` notification from the app-server, as an `Error` the session manager can record. */
-export class CodexAppServerError extends Error {
-  constructor(
-    message: string,
-    readonly turnId?: string,
-  ) {
-    super(message);
-    this.name = 'CodexAppServerError';
-  }
-}
-
-/** Historical Claw public key `codex-app-<8>-<timestamp>`. Not a Codex thread id. */
-function isCodexAppWrapperKey(id: string): boolean {
-  return id.startsWith('codex-app-');
-}
-
-function threadIdFromResumeResult(result: { thread?: { id?: string } } | undefined): string | undefined {
-  const id = result?.thread?.id;
-  return typeof id === 'string' && id.length > 0 ? id : undefined;
+  turn: {
+    id: string;
+    status: string;
+    /** Set on a failed or interrupted turn: the same shape as an `error` notification's. */
+    error?: { message?: string; codexErrorInfo?: unknown } | null;
+  };
 }
 
 // ─── PersistentCodexAppServerSession ───────────────────────────────────────
@@ -186,16 +182,9 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
   private codexBin: string;
   private proc: ChildProcess | null = null;
   private _rl: readline.Interface | null = null;
-  private _stopping: Promise<void> | null = null;
   private _isReady = false;
   private _isPaused = false;
   private _isBusy = false;
-  /**
-   * True from the moment a waiting turn is started until `turn/completed` or
-   * process exit. A caller timeout detaches only the waiter; this stays set so
-   * a second turn cannot start and idle TTL cannot treat the session as idle.
-   */
-  private _turnLive = false;
   private _startTime: string | null = null;
   private _nextRpcId = 1;
   private pendingRequests = new Map<number, PendingRequest>();
@@ -203,28 +192,28 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
 
   // Per-session state populated by notifications
   private threadId?: string;
-  /** Thread ids observed from thread/started and handshake responses before READY. */
-  private _startupThreadIds: string[] = [];
   /**
    * Set when `start()` opened a fresh thread and `appendSystemPrompt` is set.
    * Nothing passes it to `thread/start`, so the instructions ride on the first
    * turn instead, as for the one-shot engines; a resumed thread already has them.
    */
   private _instructionsPending = false;
-  /** Effective initial effort returned by Codex, used to restore auto after a turn override. */
-  private _sessionDefaultEffort?: string;
   private currentTurnId?: string;
-  private currentGoal: ThreadGoal | null = null;
-  /** Ephemeral `/side` fork. Its turn must not complete or replace the parent turn. */
   private _sideThreadId?: string;
   private _sideTurnId?: string;
-  private _sideLive = false;
   private _sideText = '';
+  private _sideLive = false;
   private _sideResolve: ((text: string) => void) | null = null;
-  private _sideReject: ((error: Error) => void) | null = null;
+  private _sideReject: ((err: Error) => void) | null = null;
+  private currentGoal: ThreadGoal | null = null;
+  private _lastError: CodexAppError | null = null;
+  /** The turn the last `error` notification the server would not retry belonged to. */
+  private _lastErrorTurn: string | null = null;
 
   // Per-turn buffers (reset at each send)
   private turnAssistantText = '';
+  /** Images saved by `imageGeneration` items in the current turn. */
+  private turnImages: GeneratedImage[] = [];
   private turnResolve: ((r: TurnResult) => void) | null = null;
   private turnReject: ((e: Error) => void) | null = null;
 
@@ -245,6 +234,13 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
   private _lastTurnTokensIn = 0;
   /** The window the app-server is enforcing, from `tokenUsage.modelContextWindow`. */
   private _modelContextWindow?: number;
+
+  /**
+   * The model the app-server reports for the thread. With no `model` param it
+   * runs the one in the user's `~/.codex/config.toml`, and pricing that thread
+   * at this wrapper's default misstates its cost.
+   */
+  private _reportedModel?: string;
 
   constructor(config: SessionConfig, codexBin?: string) {
     super();
@@ -272,6 +268,14 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
   get codexThreadId(): string | undefined {
     return this.threadId;
   }
+  /** The most recent `error` notification, or null. */
+  get lastError(): CodexAppError | null {
+    return this._lastError;
+  }
+  /** True while a turn is in flight on this thread, including the goal loop's own turns. */
+  get turnActive(): boolean {
+    return this.currentTurnId !== undefined;
+  }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────
 
@@ -281,208 +285,142 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
       if (!fs.existsSync(this.options.cwd)) fs.mkdirSync(this.options.cwd, { recursive: true });
     }
 
-    const resumeId = this.options.resumeSessionId?.trim() || undefined;
-    if (resumeId && isCodexAppWrapperKey(resumeId)) {
-      throw new Error(
-        `Cannot resume Codex app-server from Claw wrapper key '${resumeId}'. Pass the full Codex thread UUID from stats.codexThreadId; wrapper keys of the form codex-app-<prefix>-<timestamp> are not native thread ids and are not guessed.`,
-      );
-    }
-
-    // `codex app-server` has no --ignore-user-config, so "no user MCP servers" is built
-    // from per-server disable/stub `-c` overrides. Resolved before spawning: a
-    // failure here (unknown selection, codex cannot list its servers) must stop the
-    // start rather than let the servers the caller excluded load.
-    const mcpArgs = await this._mcpConfigArgs();
-
-    try {
-      const args = ['app-server', '--listen', 'stdio://', '--enable', 'goals', ...mcpArgs];
-      const invocation = resolveWindowsNodeInvocation(this.codexBin);
-      this.proc = spawn(invocation.command, [...invocation.prefixArgs, ...args], {
-        cwd: this.options.cwd,
-        env: { ...process.env },
-        stdio: ['pipe', 'pipe', 'pipe'],
-        windowsHide: process.platform === 'win32',
-      });
-
-      this._rl = readline.createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });
-      this._rl.on('line', (line) => this._handleLine(line));
-
-      this.proc.stderr?.on('data', (data: Buffer) => {
-        this.emit(SESSION_EVENT.LOG, `[codex-app-stderr] ${data.toString()}`);
-      });
-
-      // An unlistened 'error' on the ChildProcess or on one of its pipes is an
-      // uncaught exception that ends the host: ENOENT/EACCES from spawn, EPIPE
-      // from a write to an app-server that already closed stdin.
-      guardChildStreams(this.proc, (stream, err) => this._onStreamError(stream, err));
-
-      this.proc.on('error', (err) => {
-        // The process could not be spawned, or could not be signalled. A spawn
-        // failure never emits 'exit', so without this the handshake RPC would wait
-        // forever; settle it the way an exit does.
-        this._settleProcessGone(`codex app-server process error: ${err.message}`);
-        this._reportError(err);
-      });
-
-      this.proc.on('exit', (code) => {
-        this._settleProcessGone(
-          `codex app-server exited (code=${code}) before responding`,
-          `codex app-server exited mid-turn (code=${code})`,
-        );
-        this.emit(SESSION_EVENT.CLOSE, code ?? 0);
-      });
-
-      await this._handshake(resumeId);
-      return this;
-    } catch (err) {
-      await this._abortStartup();
-      throw err;
-    }
-  }
-
-  /**
-   * `-c` overrides that leave only the selected MCP servers (none by default) when
-   * `ignoreUserConfig` is set; nothing otherwise. See codex-mcp.ts for why disabled
-   * servers also need a type-matching transport stub.
-   */
-  private async _mcpConfigArgs(): Promise<string[]> {
     const selection = validateCodexMcpSelection(this.options, 'codex-app');
-    if (this.options.ignoreUserConfig !== true) return [];
-    return resolveCodexMcpDisableArgs({
-      codexBin: this.codexBin,
+    const mcpArgs =
+      this.options.ignoreUserConfig === true
+        ? await resolveCodexMcpDisableArgs({
+            codexBin: this.codexBin,
+            cwd: this.options.cwd,
+            keep: selection ?? [],
+          })
+        : [];
+    const args = ['app-server', '--listen', 'stdio://', '--enable', 'goals', ...mcpArgs];
+    this.proc = spawnEngine(this.codexBin, args, {
+      launcher: this.options.launcher,
       cwd: this.options.cwd,
-      keep: selection ?? [],
+      env: { ...process.env },
+      stdio: ['pipe', 'pipe', 'pipe'],
     });
-  }
 
-  /**
-   * initialize → thread/resume or thread/start. Session effort belongs in
-   * `config.model_reasoning_effort` (ThreadStartParams has no top-level effort).
-   * An explicit resume never falls back to a fresh thread.
-   */
-  private async _handshake(resumeId: string | undefined): Promise<void> {
+    this._rl = readline.createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });
+    this._rl.on('line', (line) => this._handleLine(line));
+
+    this.proc.stderr?.on('data', (data: Buffer) => {
+      this.emit(SESSION_EVENT.LOG, `[codex-app-stderr] ${sanitizeSecrets(data.toString())}`);
+    });
+
+    // Ends the process's part in this session once, whether it exited or never
+    // started. Pending requests and the turn are rejected so callers don't hang.
+    let ended = false;
+    const end = (code: number | null, reason: string): void => {
+      if (ended) return;
+      ended = true;
+      this._isReady = false;
+      for (const pending of this.pendingRequests.values()) {
+        pending.reject(new Error(`codex app-server ${reason} before responding`));
+      }
+      this.pendingRequests.clear();
+      if (this.turnReject) {
+        this.turnReject(new Error(`codex app-server ${reason} mid-turn`));
+        this.turnReject = null;
+        this.turnResolve = null;
+      }
+      if (this._sideReject) {
+        this._sideReject(new Error(`codex app-server ${reason} mid-turn`));
+        this._sideReject = null;
+        this._sideResolve = null;
+        this._sideLive = false;
+      }
+      this.emit(SESSION_EVENT.CLOSE, code ?? 0);
+    };
+    this.proc.on('exit', (code) => end(code, `exited (code=${code})`));
+    // Every 'error' needs a listener: an unheard one throws out of the event
+    // loop, and inside OpenClaw that loop is the gateway's. A spawn that fails
+    // (codex not on PATH) raises one here, and writing to a process that has
+    // just died raises one on stdin.
+    this.proc.on('error', (err) => {
+      this.emit(SESSION_EVENT.LOG, `[codex-app] process error: ${err.message}`);
+      end(null, `failed (${err.message})`);
+    });
+    this.proc.stdin?.on('error', (err) => this.emit(SESSION_EVENT.LOG, `[codex-app] stdin: ${err.message}`));
+    this._rl.on('error', (err) => this.emit(SESSION_EVENT.LOG, `[codex-app] stdout: ${err.message}`));
+
+    // 1. initialize
     await this._request('initialize', {
       clientInfo: { name: 'claw-orchestrator', title: null, version: '3.0.0' },
     });
 
-    const startParams: Record<string, unknown> = {
+    // 2. thread/start — captures threadId both from the response and the
+    //    `thread/started` notification (which arrives before the response per
+    //    observed protocol semantics).
+    const effort = codexReasoningEffort(this.options.effort);
+    const startParams = {
       cwd: this.options.cwd,
       model: this.options.model,
       sandbox: (this.options.sandboxMode || 'workspace-write') as SandboxMode,
+      // Nothing here can answer an approval prompt, so none may be asked: with
+      // the server's default (the user's config, often `on-request`) a command
+      // that wanted approval left the turn waiting forever. The sandbox mode is
+      // the boundary instead.
+      approvalPolicy: 'never',
+      // On the thread, not only on `turn/start`: the goal loop starts its own
+      // turns, and those read the thread's config.
+      ...(effort ? { config: { model_reasoning_effort: effort } } : {}),
     };
-    const sessionEffort = this._rpcEffort(this.options.effort);
-    if (sessionEffort) startParams.config = { model_reasoning_effort: sessionEffort };
-
-    let threadResp: { thread?: { id?: string }; reasoningEffort?: string | null };
+    // When resuming a known thread, use `thread/resume` (loads prior turns)
+    // instead of `thread/start` (which opens a fresh thread). A stale/unknown
+    // thread id (e.g. a wrong-engine id from auto-resume, or a thread that no
+    // longer exists) degrades gracefully to a fresh thread rather than failing
+    // the whole session.
+    const resumeId = this.options.resumeSessionId;
+    let threadResp: { thread?: { id?: string }; model?: unknown };
     let resumed = false;
     if (resumeId) {
       try {
         threadResp = (await this._request('thread/resume', { threadId: resumeId, ...startParams })) as {
           thread?: { id?: string };
-          reasoningEffort?: string | null;
+          model?: unknown;
         };
+        resumed = true;
       } catch (err) {
-        throw new Error(
-          `Failed to resume Codex app-server thread '${resumeId}': ${(err as Error).message}. The session was not started; no fresh thread was created.`,
-        );
+        this.emit(SESSION_EVENT.LOG, `[codex-app] thread/resume failed (${(err as Error).message}); starting fresh`);
+        threadResp = (await this._request('thread/start', startParams)) as typeof threadResp;
       }
-      this._noteStartupThreadId(threadIdFromResumeResult(threadResp));
-      this._assertResumeIdentity(resumeId);
-      this.threadId = resumeId;
-      resumed = true;
     } else {
-      threadResp = (await this._request('thread/start', startParams)) as {
-        thread?: { id?: string };
-        reasoningEffort?: string | null;
-      };
-      this._noteStartupThreadId(threadIdFromResumeResult(threadResp));
-      if (!this.threadId && threadResp?.thread?.id) {
-        this.threadId = threadResp.thread.id;
-      }
-      if (!this.threadId) {
-        throw new Error('codex app-server did not return a thread id from thread/start');
-      }
+      threadResp = (await this._request('thread/start', startParams)) as typeof threadResp;
     }
-
-    const initialEffort = threadResp.reasoningEffort;
-    this._sessionDefaultEffort = typeof initialEffort === 'string' ? initialEffort : sessionEffort;
+    if (!this.threadId && threadResp?.thread?.id) {
+      this.threadId = threadResp.thread.id;
+    }
+    if (!this.threadId) {
+      throw new Error('codex app-server did not return a thread id from thread/start');
+    }
+    if (typeof threadResp.model === 'string' && threadResp.model) this._reportedModel = threadResp.model;
     this._instructionsPending = !resumed && !!this.options.appendSystemPrompt?.trim();
 
-    this.sessionId = this.threadId;
+    this.sessionId = `codex-app-${this.threadId.slice(0, 8)}-${Date.now().toString(36)}`;
     this._startTime = new Date().toISOString();
     this._isReady = true;
     this.emit(SESSION_EVENT.READY);
     this.emit(SESSION_EVENT.INIT, { type: 'system', subtype: 'init', session_id: this.sessionId });
+    return this;
   }
 
-  private _noteStartupThreadId(id: string | undefined): void {
-    if (typeof id === 'string' && id.length > 0) this._startupThreadIds.push(id);
-  }
-
-  private _assertResumeIdentity(resumeId: string): void {
-    const ids = [...new Set(this._startupThreadIds)];
-    if (ids.length === 0) {
-      throw new Error(
-        `Codex app-server thread/resume did not return a thread id for '${resumeId}'. The session was not started; no fresh thread was created.`,
-      );
-    }
-    const mismatch = ids.find((id) => id !== resumeId);
-    if (mismatch) {
-      throw new Error(
-        `Codex app-server thread/resume identity mismatch: requested '${resumeId}', got '${mismatch}'. The session was not started; no fresh thread was created.`,
-      );
-    }
-  }
-
-  /** Kill the app-server we spawned, close readline, and drop pending RPCs. */
-  private async _abortStartup(): Promise<void> {
-    for (const pending of this.pendingRequests.values()) {
-      pending.reject(new Error('codex app-server startup aborted'));
-    }
-    this.pendingRequests.clear();
-    this.threadId = undefined;
-    this.sessionId = undefined;
-    this._startupThreadIds.length = 0;
-    this._isReady = false;
-    await this.stop();
-  }
-
-  stop(): Promise<void> {
-    if (this._stopping) return this._stopping;
+  stop(): void {
     if (this._rl) {
       this._rl.close();
       this._rl = null;
     }
-    const proc = this.proc;
-    this.proc = null;
+    if (this.proc) {
+      try {
+        this.proc.kill('SIGTERM');
+      } catch {
+        // Already gone.
+      }
+      this.proc = null;
+    }
     this._isReady = false;
     this._isPaused = false;
-    if (!proc || proc.exitCode != null || proc.signalCode != null) return Promise.resolve();
-
-    // Codex holds an exclusive thread writer until app-server exits. Do not
-    // acknowledge stop (or restart for model/tools) while that writer is alive.
-    this._stopping = new Promise<void>((resolve) => {
-      const forceKill = setTimeout(() => {
-        try {
-          proc.kill('SIGKILL');
-        } catch {
-          // The close event below remains the completion signal.
-        }
-      }, 5000);
-      forceKill.unref();
-      proc.once('close', () => {
-        clearTimeout(forceKill);
-        resolve();
-      });
-      try {
-        proc.kill('SIGTERM');
-      } catch {
-        // An already-exiting process will still emit close.
-      }
-    }).finally(() => {
-      this._stopping = null;
-    });
-    return this._stopping;
   }
 
   pause(): void {
@@ -507,44 +445,42 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     this._instructionsPending = false;
     if (instructions) text = `${instructions}\n\n---\n\n${text}`;
 
-    if (this._turnLive) {
-      throw new Error('Codex app-server native turn still in progress');
-    }
-
     if (!options.waitForComplete) {
-      this._fireAndForgetTurn(text, options).catch((err) => this._reportError(err as Error));
+      this._fireAndForgetTurn(text, options).catch((err) => this._emitError(err as Error));
       return { requestId: this._nextRpcId, sent: true };
     }
 
-    this._turnLive = true;
     this._isBusy = true;
     try {
       return await this._runTurn(text, options);
-    } catch (err) {
-      const timedOut = err instanceof Error && err.message === 'Timeout waiting for Codex app-server turn to complete';
-      if (!timedOut) this._turnLive = false;
-      throw err;
     } finally {
-      if (!this._turnLive) this._isBusy = false;
+      this._isBusy = false;
     }
   }
 
-  private async _fireAndForgetTurn(text: string, options: SessionSendOptions = {}): Promise<void> {
-    await this._request('turn/start', this._turnStartParams(text, options.effort));
+  private async _fireAndForgetTurn(text: string, options: SessionSendOptions): Promise<void> {
+    await this._request('turn/start', this._turnStartParams(text, options));
+  }
+
+  /** `turn/start` params. The effort holds for this turn and the ones after it. */
+  private _turnStartParams(text: string, options: SessionSendOptions): Record<string, unknown> {
+    const effort = codexReasoningEffort(options.effort ?? this.options.effort);
+    return {
+      threadId: this.threadId,
+      input: [{ type: 'text', text, text_elements: [] }],
+      ...(effort ? { effort } : {}),
+    };
   }
 
   private async _runTurn(text: string, options: SessionSendOptions): Promise<TurnResult> {
     const timeout = options.timeout || 600_000;
     this.turnAssistantText = '';
+    this.turnImages = [];
 
     const turnPromise = new Promise<TurnResult>((resolve, reject) => {
       this.turnResolve = resolve;
       this.turnReject = reject;
     });
-    // The waiter below only attaches after turn/start is acknowledged. A turn
-    // settled before then (the request failed, the timeout fired, the process
-    // went away) would otherwise be an unhandled rejection, which ends the host.
-    turnPromise.catch(() => undefined);
 
     // Wire up text streaming for this turn
     const onText = (chunk: string) => {
@@ -566,14 +502,7 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     }, timeout);
 
     try {
-      try {
-        await this._request('turn/start', this._turnStartParams(text, options.effort));
-      } catch (err) {
-        // The turn never started; leave no waiter behind for a later exit to reject.
-        this.turnResolve = null;
-        this.turnReject = null;
-        throw err;
-      }
+      await this._request('turn/start', this._turnStartParams(text, options));
       const result = await turnPromise;
       return result;
     } finally {
@@ -596,62 +525,14 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
         if (err) {
           this.pendingRequests.delete(id);
           reject(err);
-          // The stream's own 'error' event reports the same fault (see _onStreamError).
-          this._stdinFault(err);
         }
       });
     });
   }
 
-  /** One report per stdin fault, whether it arrives by write callback or by 'error' event. */
-  private _stdinFault = createStdinErrorReporter((err) => {
-    // A process that never spawned reports ENOENT/EACCES once, through its own
-    // 'error'; the write the handshake then aimed at its dead stdin is not a second fault.
-    if (this.proc?.pid !== undefined) this._reportError(err);
-  });
-
-  /** A fault on one of the app-server's pipes. Reported, never thrown. */
-  private _onStreamError(stream: ChildStreamName, err: Error): void {
-    if (stream === 'stdin') {
-      this._stdinFault(err);
-      return;
-    }
-    if (stream === 'stdout') {
-      // Responses can no longer arrive, so waiting RPCs and the turn would hang.
-      this._settleProcessGone(`codex app-server stdout error: ${err.message}`);
-    }
-    this._reportError(new Error(`codex app-server ${stream} error: ${err.message}`));
-  }
-
-  /**
-   * The app-server is gone or unusable: not ready, and nothing waiting on it may
-   * hang. Shared by process `exit`, process `error` and a stdout fault.
-   */
-  private _settleProcessGone(pendingMessage: string, turnMessage: string = pendingMessage): void {
-    this._isReady = false;
-    this._turnLive = false;
-    this._isBusy = false;
-    // Reject any pending requests so callers don't hang.
-    for (const pending of this.pendingRequests.values()) {
-      pending.reject(new Error(pendingMessage));
-    }
-    this.pendingRequests.clear();
-    if (this.turnReject) {
-      this.turnReject(new Error(turnMessage));
-      this.turnReject = null;
-      this.turnResolve = null;
-    }
-    if (this._sideReject) {
-      this._sideReject(new Error(turnMessage));
-      this._sideReject = null;
-      this._sideResolve = null;
-      this._sideLive = false;
-    }
-  }
-
-  private _isSideEvent(params: unknown): boolean {
-    const threadId = (params as { threadId?: unknown } | undefined)?.threadId;
-    return typeof threadId === 'string' && threadId.length > 0 && threadId === this._sideThreadId;
+  private _reply(id: number | string, error: { code: number; message: string }): void {
+    if (!this.proc?.stdin?.writable) return;
+    this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, error }) + '\n');
   }
 
   private _handleLine(line: string): void {
@@ -659,7 +540,7 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     if (!trimmed) return;
     let msg: {
       jsonrpc?: string;
-      id?: number;
+      id?: number | string | null;
       method?: string;
       params?: unknown;
       result?: unknown;
@@ -687,6 +568,15 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
       return;
     }
 
+    // Request from the server (has method and id): approvals, user input,
+    // client-side tool calls. None is supported here, and an unanswered request
+    // blocks the turn that sent it, so each gets an error reply at once.
+    if (msg.method && msg.id !== undefined && msg.id !== null) {
+      this.emit(SESSION_EVENT.LOG, `[codex-app] declined server request ${msg.method}`);
+      this._reply(msg.id, { code: -32601, message: `${msg.method} is not supported by this client` });
+      return;
+    }
+
     // Notification (has method, no id)
     if (msg.method) {
       this._dispatchNotification(msg.method, msg.params);
@@ -697,10 +587,7 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     switch (method) {
       case 'thread/started': {
         const p = params as ThreadStartedNotification;
-        if (p.thread?.id) {
-          this._noteStartupThreadId(p.thread.id);
-          if (!this.threadId) this.threadId = p.thread.id;
-        }
+        if (p.thread?.id && !this.threadId) this.threadId = p.thread.id;
         break;
       }
       case 'turn/started': {
@@ -710,10 +597,6 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
           break;
         }
         this.currentTurnId = p.turn?.id;
-        // A goal continuation starts a parent turn without send(). Mark it busy
-        // so a later send cannot overlap it. Side turns are excluded above.
-        this._turnLive = true;
-        this._isBusy = true;
         break;
       }
       case 'item/agentMessage/delta': {
@@ -735,6 +618,13 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
             this._sideText = p.item.text;
           }
           break;
+        }
+        // Codex's built-in image generation reports where it saved the file.
+        if (p.item?.type === 'imageGeneration' && typeof p.item.savedPath === 'string' && p.item.savedPath) {
+          this.turnImages.push({
+            path: p.item.savedPath,
+            ...(typeof p.item.revisedPrompt === 'string' ? { revisedPrompt: p.item.revisedPrompt } : {}),
+          });
         }
         if (p.item?.type === 'agentMessage' && typeof p.item.text === 'string') {
           // Agent messages may arrive as one final text payload (when no
@@ -787,8 +677,6 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
           this._finishSideTurn(p);
           break;
         }
-        this._turnLive = false;
-        this._isBusy = false;
         // This notification can itself report how the turn ended. The engine's
         // TurnStatus is `completed | interrupted | failed | inProgress`, so the counter
         // tests for completion rather than for the absence of failure: an interrupted
@@ -796,6 +684,22 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
         // partial text and is not a success. `stop_reason` keeps its own two-state
         // mapping, so `interrupted` stays out of the error bucket there.
         const failed = p.turn?.status === 'failed';
+        // A failed goal turn may report its cause only here, not as an `error`
+        // notification: a model at capacity ends the turn with
+        // `turn.error.codexErrorInfo: serverOverloaded` and the goal then goes
+        // `blocked` (codex 0.166.0). Surfaced as `codex:error` unless the same
+        // turn already raised a final one.
+        const turnError = p.turn?.error;
+        if (turnError && p.turn.status !== 'completed' && this._lastErrorTurn !== p.turn.id) {
+          this._lastError = {
+            message: turnError.message ?? 'codex app-server turn failed',
+            code: errorInfoName(turnError.codexErrorInfo),
+            willRetry: false,
+            at: new Date().toISOString(),
+          };
+          this._lastErrorTurn = p.turn.id;
+          this.emit('codex:error', this._lastError);
+        }
         this._stats.turns++;
         if (p.turn?.status === 'completed') this._stats.turnsSucceeded++;
         this._stats.lastActivity = new Date().toISOString();
@@ -808,6 +712,7 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
           result: turnText,
           stop_reason: failed ? 'error' : 'end_turn',
           session_id: this.threadId,
+          ...(this.turnImages.length ? { generated_images: [...this.turnImages] } : {}),
         };
         this.emit(SESSION_EVENT.RESULT, event);
         this.emit(SESSION_EVENT.TURN_COMPLETE, event);
@@ -830,25 +735,21 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
         break;
       }
       case 'error': {
-        // v2 `ErrorNotification` is `{ error: TurnError, threadId, turnId, willRetry }`
-        // (generate-json-schema, 0.161.0); the text is at `error.message`. Reading a
-        // top-level `message` found nothing, so every error surfaced as the bare
-        // 'codex app-server error' with no cause. A top-level `message` is still
-        // honoured for servers that send the older flat shape.
-        const p = params as ErrorNotification;
-        const text = p.error?.message ?? p.message;
-        const message = typeof text === 'string' && text.length > 0 ? text : 'codex app-server error (no message)';
-        if (p.willRetry === true) {
-          // Codex is retrying (a dropped stream, a reconnect) and the turn goes on.
-          // It is progress information, not a failure to report.
-          this.emit(SESSION_EVENT.LOG, `[codex-app-error] will retry: ${message}`);
-          break;
-        }
-        // Reported, never thrown: the notification does not end the turn or the
-        // server. A turn that really failed is settled by the `turn/completed`
-        // that follows it, and a dead server by the process `exit` handler, so
-        // settling the waiter here would also free a turn Codex is still running.
-        this._reportError(new CodexAppServerError(message, p.turnId));
+        const p = params as {
+          error?: { message?: string; codexErrorInfo?: unknown };
+          willRetry?: boolean;
+          turnId?: string;
+        };
+        const message = p.error?.message ?? 'codex app-server error';
+        this._lastError = {
+          message,
+          code: errorInfoName(p.error?.codexErrorInfo),
+          willRetry: p.willRetry === true,
+          at: new Date().toISOString(),
+        };
+        this._lastErrorTurn = p.willRetry === true ? null : (p.turnId ?? null);
+        this.emit('codex:error', this._lastError);
+        this._emitError(new Error(message));
         break;
       }
       default:
@@ -907,11 +808,11 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
   }
 
   getCost(): CostBreakdown {
-    const pricing = getModelPricing(this.options.model, 'gpt-5.5');
+    const pricing = getModelPricing(this._billedModel(), 'gpt-5.5');
     const cachedPrice = pricing.cached ?? 0;
     const nonCachedIn = Math.max(0, this._stats.tokensIn - this._stats.cachedTokens);
     return {
-      model: this.options.model || 'gpt-5.5',
+      model: this._billedModel() || 'gpt-5.5',
       tokensIn: this._stats.tokensIn,
       tokensOut: this._stats.tokensOut,
       cachedTokens: this._stats.cachedTokens,
@@ -925,90 +826,86 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     };
   }
 
-  // ── Public goal helpers (used by codex_goal_* tools) ───────────────────
+  // ── Goals (`thread/goal/*`) ────────────────────────────────────────────
 
-  private _requireThread(): string {
+  /**
+   * Set, update or resume the thread's goal (`thread/goal/set`). An objective
+   * starts the server's turn loop; `status: 'active'` resumes a paused or
+   * stopped one, `'paused'` pauses it. Fields left out keep their value.
+   */
+  async setGoal(p: {
+    objective?: string;
+    status?: 'active' | 'paused';
+    tokenBudget?: number | null;
+  }): Promise<ThreadGoal> {
     if (!this.threadId) throw new Error('No thread id');
-    return this.threadId;
+    const params: Record<string, unknown> = { threadId: this.threadId, origin: 'user' };
+    if (p.objective !== undefined) params.objective = p.objective;
+    if (p.status !== undefined) params.status = p.status;
+    if (p.tokenBudget !== undefined) params.tokenBudget = p.tokenBudget;
+    const resp = (await this._request('thread/goal/set', params)) as { goal?: ThreadGoal };
+    if (!resp?.goal) throw new Error('thread/goal/set returned no goal');
+    this.currentGoal = resp.goal;
+    return resp.goal;
   }
 
-  private _rememberGoal(goal: ThreadGoal | null | undefined): ThreadGoal | null {
-    this.currentGoal = goal ?? null;
+  /** The thread's goal as the server holds it now (`thread/goal/get`), or null. */
+  async getGoal(): Promise<ThreadGoal | null> {
+    if (!this.threadId) throw new Error('No thread id');
+    const resp = (await this._request('thread/goal/get', { threadId: this.threadId })) as { goal?: ThreadGoal | null };
+    this.currentGoal = resp?.goal ?? null;
     return this.currentGoal;
   }
 
-  /** Read the goal from the server. Does not start a turn. */
-  async refreshGoal(): Promise<ThreadGoal | null> {
-    const threadId = this._requireThread();
-    const resp = (await this._request('thread/goal/get', { threadId })) as { goal?: ThreadGoal | null };
-    return this._rememberGoal(resp?.goal);
-  }
-
-  /** Set or replace the objective and mark it active. Does not start a model turn by itself. */
-  async setGoal(objective: string): Promise<ThreadGoal> {
-    const trimmed = objective.trim();
-    if (!trimmed) throw new Error('Codex goal requires an objective');
-    const threadId = this._requireThread();
-    const resp = (await this._request('thread/goal/set', {
-      threadId,
-      objective: trimmed,
-      status: 'active',
-      origin: 'user',
-    })) as { goal?: ThreadGoal };
-    if (!resp?.goal?.objective) throw new Error('thread/goal/set did not return a goal');
-    this._rememberGoal(resp.goal);
-    return resp.goal;
-  }
-
-  /** Pause, resume, or otherwise change status without replacing the objective. */
-  async setGoalStatus(status: ThreadGoalStatus): Promise<ThreadGoal> {
-    const threadId = this._requireThread();
-    const resp = (await this._request('thread/goal/set', {
-      threadId,
-      status,
-      origin: 'user',
-    })) as { goal?: ThreadGoal };
-    if (!resp?.goal) throw new Error('thread/goal/set did not return a goal');
-    this._rememberGoal(resp.goal);
-    return resp.goal;
-  }
-
-  async clearGoal(): Promise<{ cleared: boolean }> {
-    const threadId = this._requireThread();
-    const resp = (await this._request('thread/goal/clear', { threadId, origin: 'user' })) as { cleared?: boolean };
+  /** Remove the thread's goal (`thread/goal/clear`). */
+  async clearGoal(): Promise<void> {
+    if (!this.threadId) throw new Error('No thread id');
+    await this._request('thread/goal/clear', { threadId: this.threadId, origin: 'user' });
     this.currentGoal = null;
-    return { cleared: resp?.cleared !== false };
+  }
+
+  // ── App-server v2 RPCs (Codex 0.137) ───────────────────────────────────
+  //
+  // Method names + param shapes verified against `codex app-server
+  // generate-json-schema` (TurnInterruptParams/TurnSteerParams/ThreadForkParams/
+  // ThreadRollbackParams/ModelListResponse/ThreadGoal*Params).
+
+  /** The id of the most recent turn (set by the `turn/started` notification). */
+  get activeTurnId(): string | undefined {
+    return this.currentTurnId;
+  }
+
+  /** Cancel the in-flight turn (`turn/interrupt`). No-op when no turn is active. */
+  async interrupt(): Promise<{ interrupted: boolean }> {
+    if (!this.threadId) throw new Error('No thread id');
+    if (!this.currentTurnId) return { interrupted: false };
+    await this._request('turn/interrupt', { threadId: this.threadId, turnId: this.currentTurnId });
+    return { interrupted: true };
   }
 
   /**
-   * Codex 0.165 goal commands are RPCs, not a user turn. `slashArgs` keeps the
-   * tool vocabulary: empty reads, `pause` / `resume` / `clear` change status,
-   * `edit <objective>` replaces the text, and anything else sets an active goal.
-   * `timeoutMs` is unused because these calls do not wait for pursuit.
+   * Add input to the in-flight turn without restarting it (`turn/steer`). That
+   * includes a turn the goal loop started, which no `send()` is waiting on.
+   * When no turn is in flight, falls back to a normal turn so the message is
+   * not lost.
    */
-  async sendGoalCommand(slashArgs: string, timeoutMs = 120_000): Promise<{ text: string; goal: ThreadGoal | null }> {
-    void timeoutMs;
-    const arg = slashArgs.trim();
-    if (arg === '') {
-      const goal = await this.refreshGoal();
-      return { text: goal ? `Goal ${goal.status}: ${goal.objective}` : 'No goal', goal };
+  async steer(text: string): Promise<{ steered: boolean; turnId?: string; text?: string }> {
+    if (!this.threadId) throw new Error('No thread id');
+    if (this.currentTurnId) {
+      const resp = (await this._request('turn/steer', {
+        threadId: this.threadId,
+        expectedTurnId: this.currentTurnId,
+        input: [{ type: 'text', text, text_elements: [] }],
+      })) as { turnId?: string };
+      return { steered: true, turnId: resp?.turnId };
     }
-    if (arg === 'pause') {
-      const goal = await this.setGoalStatus('paused');
-      return { text: `Goal paused: ${goal.objective}`, goal };
-    }
-    if (arg === 'resume') {
-      const goal = await this.setGoalStatus('active');
-      return { text: `Goal active: ${goal.objective}`, goal };
-    }
-    if (arg === 'clear') {
-      const cleared = await this.clearGoal();
-      return { text: cleared.cleared ? 'Goal cleared' : 'No goal to clear', goal: null };
-    }
-    const edit = /^edit\s+([\s\S]+)$/.exec(arg);
-    const objective = edit ? edit[1] : arg;
-    const goal = await this.setGoal(objective);
-    return { text: `Goal ${goal.status}: ${goal.objective}`, goal };
+    const r = (await this.send(text, { waitForComplete: true })) as TurnResult;
+    return { steered: false, text: r.text };
+  }
+
+  private _isSideEvent(params: unknown): boolean {
+    const threadId = (params as { threadId?: unknown } | undefined)?.threadId;
+    return typeof threadId === 'string' && threadId.length > 0 && threadId === this._sideThreadId;
   }
 
   /**
@@ -1020,7 +917,8 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
     prompt: string,
     timeoutMs = 120_000,
   ): Promise<{ text: string; sideThreadId: string; parentThreadId: string }> {
-    const parentThreadId = this._requireThread();
+    if (!this.threadId) throw new Error('No thread id');
+    const parentThreadId = this.threadId;
     const question = prompt.trim();
     if (!question) throw new Error('Codex side conversation requires a prompt');
     if (this._sideThreadId) throw new Error('A Codex side conversation is already open');
@@ -1100,7 +998,7 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
       this._sideLive = false;
       reject(new Error('Timeout waiting for Codex side conversation'));
     }, timeoutMs);
-    const params = this._turnStartParams(text);
+    const params = this._turnStartParams(text, {});
     params.threadId = sideThreadId;
     return this._request('turn/start', params)
       .then(() => turnPromise)
@@ -1127,43 +1025,6 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
       this._sideReject = null;
       resolve(text);
     }
-  }
-
-  // ── App-server v2 RPCs (Codex 0.137) ───────────────────────────────────
-  //
-  // Method names + param shapes verified against `codex app-server
-  // generate-json-schema` (TurnInterruptParams/TurnSteerParams/ThreadForkParams/
-  // ThreadRollbackParams/ModelListResponse/ThreadGoal*Params).
-
-  /** The id of the most recent turn (set by the `turn/started` notification). */
-  get activeTurnId(): string | undefined {
-    return this.currentTurnId;
-  }
-
-  /** Cancel the in-flight turn (`turn/interrupt`). No-op when no turn is active. */
-  async interrupt(): Promise<{ interrupted: boolean }> {
-    if (!this.threadId) throw new Error('No thread id');
-    if (!this.currentTurnId) return { interrupted: false };
-    await this._request('turn/interrupt', { threadId: this.threadId, turnId: this.currentTurnId });
-    return { interrupted: true };
-  }
-
-  /**
-   * Add input to the in-flight turn without restarting it (`turn/steer`). When
-   * no turn is in flight, falls back to a normal turn so the message is not lost.
-   */
-  async steer(text: string): Promise<{ steered: boolean; turnId?: string; text?: string }> {
-    if (!this.threadId) throw new Error('No thread id');
-    if (this._isBusy && this.currentTurnId) {
-      const resp = (await this._request('turn/steer', {
-        threadId: this.threadId,
-        expectedTurnId: this.currentTurnId,
-        input: [{ type: 'text', text, text_elements: [] }],
-      })) as { turnId?: string };
-      return { steered: true, turnId: resp?.turnId };
-    }
-    const r = (await this.send(text, { waitForComplete: true })) as TurnResult;
-    return { steered: false, text: r.text };
   }
 
   /** Branch this thread into a new one (`thread/fork`); returns the forked thread id. */
@@ -1205,54 +1066,15 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
   // ── Helpers ────────────────────────────────────────────────────────────
 
   /**
-   * Map engine-agnostic effort onto the app-server `ReasoningEffort` string.
-   * Native 0.155.1 `codex_protocol::openai_models::ReasoningEffort` wire values
-   * are none|minimal|low|medium|high|xhigh|max|ultra (plus persistent/custom,
-   * which are not in our union). `auto` / omitted leave the engine default.
-   * Levels are forwarded exactly — `max`/`ultra` stay themselves.
+   * Report an error to whoever listens. An `error` notification is news about
+   * the thread — the server often retries on its own, and a failed turn is
+   * already reported by `turn/completed` — so it must not reach Node's
+   * unhandled-`'error'` rule, which throws: with no listener attached, one
+   * overloaded-endpoint notice took the whole server down.
    */
-  private _rpcEffort(effort?: EffortLevel): string | undefined {
-    if (!effort || effort === 'auto') return undefined;
-    const known: ReadonlySet<string> = new Set(['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra']);
-    return known.has(effort) ? effort : undefined;
-  }
-
-  /**
-   * `TurnStartParams.effort` overrides reasoning for this turn and subsequent
-   * turns. Always send the effective explicit level so a later turn restores
-   * the session default.
-   *
-   * Do **not** send `effort: null` to unpin. rust-v0.155.1
-   * `turn_processor.rs` maps `params.effort` with `.map(Some)` and comments
-   * "public null does not clear effort" (same as `thread/settings/update`).
-   * JSON null deserializes like omission for this single `Option` field.
-   * There is no public double-option clear, unlike `service_tier`. Restore the
-   * initial effective session effort from thread/start or thread/resume instead.
-   * This also keeps an auto session from inheriting a one-turn override forever.
-   */
-  private _turnStartParams(text: string, turnEffort?: EffortLevel): Record<string, unknown> {
-    const params: Record<string, unknown> = {
-      threadId: this.threadId,
-      input: [{ type: 'text', text, text_elements: [] }],
-    };
-    const explicitTurn = turnEffort !== undefined;
-    const value = this._rpcEffort(explicitTurn ? turnEffort : this.options.effort) ?? this._sessionDefaultEffort;
-    if (value) params.effort = value;
-    return params;
-  }
-
-  /**
-   * Emit `error` only when something listens. An unlistened `error` event is thrown
-   * by EventEmitter from inside the stdout callback, which ends the host process;
-   * the session manager always listens, but a session used on its own may not, and
-   * one app-server's notification must never be able to kill its host.
-   */
-  private _reportError(err: Error): void {
-    if (this.listenerCount(SESSION_EVENT.ERROR) > 0) {
-      this.emit(SESSION_EVENT.ERROR, err);
-    } else {
-      this.emit(SESSION_EVENT.LOG, `[codex-app-error] ${err.message}`);
-    }
+  private _emitError(err: Error): void {
+    if (this.listenerCount(SESSION_EVENT.ERROR) > 0) this.emit(SESSION_EVENT.ERROR, err);
+    else this.emit(SESSION_EVENT.LOG, `[codex-app] ${err.message}`);
   }
 
   private _addHistory(entry: { time: string; type: string; event: unknown }): void {
@@ -1271,13 +1093,18 @@ export class PersistentCodexAppServerSession extends EventEmitter implements ISe
    */
   private _estimateContextPercent(): number {
     if (this._lastTurnTokensIn <= 0) return 0;
-    const ctx = this._modelContextWindow ?? getContextWindow(this.options.model || 'gpt-5.5');
+    const ctx = this._modelContextWindow ?? getContextWindow(this._billedModel() || 'gpt-5.5');
     if (!ctx) return 0;
     return Math.min(100, Math.round((this._lastTurnTokensIn / ctx) * 100));
   }
 
+  /** The configured model, else the one the app-server reported for the thread. */
+  private _billedModel(): string | undefined {
+    return this.options.model || this._reportedModel;
+  }
+
   private _updateCost(): void {
-    const pricing = getModelPricing(this.options.model, 'gpt-5.5');
+    const pricing = getModelPricing(this._billedModel(), 'gpt-5.5');
     const cachedPrice = pricing.cached ?? 0;
     const nonCachedIn = Math.max(0, this._stats.tokensIn - this._stats.cachedTokens);
     this._stats.costUsd =

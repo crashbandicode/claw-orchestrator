@@ -86,6 +86,11 @@ class FakeHost implements RemoteBrokerHost {
     this.live.delete(name);
   }
 
+  async codexSide(name: string, prompt: string): Promise<Record<string, unknown>> {
+    if (!this.live.has(name)) throw new Error(`Session '${name}' not found`);
+    return { ok: true, text: prompt, sideThreadId: 'side-1', parentThreadId: 'parent-1' };
+  }
+
   listSessions(): SessionInfo[] {
     return [...this.live.values()];
   }
@@ -791,19 +796,26 @@ describe('remote broker socket', () => {
     expect(owned.size).toBe(0);
   });
 
-  it('does not let a second broker reconcile a live operation or resume a manual thread', async () => {
+  it('lets an agent take over a registered manual thread and still refuses a second live owner', async () => {
     const rig = openBroker();
     await rig.broker.listen(rig.socketPath);
     const client = rig.client();
     await client.call('thread.register', { name: 'manual', nativeSessionId: 'native-9' }, { operationId: 'op-manual' });
+    const taken = await client.call(
+      'session.start',
+      { name: 'manual', cwd: os.tmpdir(), engine: 'codex-app' },
+      { operationId: 'op-takeover' },
+    );
+    expect(taken.status).toBe('completed');
+    expect(rig.fake.starts[0]?.resumeSessionId).toBe('native-9');
     const blocked = await client.call(
       'session.start',
       { name: 'other', cwd: os.tmpdir(), engine: 'codex-app', resumeSessionId: 'native-9' },
       { operationId: 'op-second-owner' },
     );
     expect(blocked.status).toBe('failed');
-    expect(blocked.error).toMatch(/second managed owner/);
-    expect(rig.fake.starts).toHaveLength(0);
+    expect(blocked.error).toMatch(/second owner/);
+    expect(rig.fake.starts).toHaveLength(1);
 
     rig.fake.armSendGate();
     await client.call(
@@ -870,6 +882,62 @@ describe('remote broker socket', () => {
     expect(mailbox.read('worker', false)[0]?.status).toBe('delivering');
     expect(operations.get('op-live')?.status).toBe('running');
     expect(intruder.get('op-live')?.status).toBe('running');
+  });
+
+  it('starts a registered manual thread to deliver its mail and keeps a second owner out', async () => {
+    const rig = openBroker();
+    await rig.broker.listen(rig.socketPath);
+    const client = rig.client();
+    await client.call(
+      'thread.register',
+      {
+        name: 'eden-tracing',
+        nativeSessionId: 'ses_e5e0fcf7fffepGBj3OcBjMpCeo',
+        parentToolId: 'opencode',
+      },
+      { operationId: 'op-eden-reg' },
+    );
+    const queued = await client.call(
+      'thread.send',
+      { name: 'eden-tracing', from: 'planner', message: 'continue', messageId: 'msg-eden' },
+      { operationId: 'op-eden-queue' },
+    );
+    expect(queued.status).toBe('completed');
+    expect((queued.result as { delivered?: boolean }).delivered).toBe(false);
+    expect(rig.fake.starts).toHaveLength(0);
+
+    const delivered = await client.call(
+      'inbox.deliver',
+      { name: 'eden-tracing' },
+      { operationId: 'op-eden-deliver' },
+    );
+    expect(delivered.status).toBe('completed');
+    expect(rig.fake.starts).toEqual([
+      expect.objectContaining({
+        name: 'eden-tracing',
+        engine: 'opencode',
+        resumeSessionId: 'ses_e5e0fcf7fffepGBj3OcBjMpCeo',
+      }),
+    ]);
+    expect(rig.fake.sends).toHaveLength(1);
+
+    const follow = await client.call(
+      'thread.send',
+      { name: 'eden-tracing', from: 'planner', message: 'next', messageId: 'msg-eden-2' },
+      { operationId: 'op-eden-live-send' },
+    );
+    expect(follow.status).toBe('completed');
+    expect((follow.result as { delivered?: boolean }).delivered).toBe(true);
+    expect(rig.fake.sends).toHaveLength(2);
+
+    const again = await client.call(
+      'session.start',
+      { name: 'eden-tracing', cwd: os.tmpdir(), engine: 'opencode' },
+      { operationId: 'op-eden-second' },
+    );
+    expect(again.status).toBe('failed');
+    expect(again.error).toMatch(/second owner/);
+    expect(rig.fake.starts).toHaveLength(1);
   });
 
   it('cancels a mailbox wait on service shutdown and keeps one managed delivery', async () => {

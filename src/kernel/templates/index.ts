@@ -7,9 +7,23 @@
  * caller's task, agents, and cwd.
  */
 
-import type { AcceptanceContract } from '../../verify/contract.js';
-import type { CouncilNode, FanoutAgentSpec, FanoutNode, NodeSpec, WorkflowSpec } from '../types.js';
+import {
+  DEFAULT_CHECK_TIMEOUT_MS,
+  DEFAULT_HTTP_TIMEOUT_MS,
+  DEFAULT_SCREENSHOT_TIMEOUT_MS,
+  type AcceptanceContract,
+} from '../../verify/contract.js';
+import type {
+  CouncilAgentSpec,
+  CouncilNode,
+  FanoutAgentSpec,
+  FanoutNode,
+  GoalNode,
+  NodeSpec,
+  WorkflowSpec,
+} from '../types.js';
 import { DEFAULT_AGENT_TIMEOUT_MS as FANOUT_AGENT_TIMEOUT_MS } from '../../fanout.js';
+import { DEFAULT_NODE_TIMEOUT_MS } from '../engine.js';
 import {
   DEFAULT_AGENT_TIMEOUT_MS as COUNCIL_AGENT_TIMEOUT_MS,
   DEFAULT_MAX_ROUNDS,
@@ -37,6 +51,26 @@ export function fanoutNodeBudget(
 }
 
 /**
+ * The same for a fan-out whose agents may run goals. Goal agents run in parallel
+ * with the turn agents and with each other, so the node needs the longer of the
+ * two: the turn agents' worst case, or the longest goal (the kernel's node
+ * timeout when a goal sets none).
+ */
+export function fanoutAgentsBudget(
+  agents: FanoutAgentSpec[],
+  synthesize: boolean | undefined,
+  agentTimeoutMs = FANOUT_AGENT_TIMEOUT_MS,
+): number {
+  const turns = agents.filter((a) => !a.objective?.trim()).length;
+  const goals = agents.filter((a) => !!a.objective?.trim());
+  const turnBudget = turns > 0 ? fanoutNodeBudget(turns, synthesize, agentTimeoutMs) : 0;
+  const goalBudget = goals.length
+    ? Math.max(...goals.map((a) => a.timeoutMs || DEFAULT_NODE_TIMEOUT_MS)) + SESSION_READY_TIMEOUT_MS
+    : 0;
+  return Math.max(turnBudget, goalBudget) || fanoutNodeBudget(agents.length, synthesize, agentTimeoutMs);
+}
+
+/**
  * Worst case for a council node. Per agent per round, `Council.runSingleAgent`
  * may start and send up to `EMPTY_RESPONSE_MAX_RETRIES + 1` times and then send
  * `FOLLOWUP_MAX_RETRIES` follow-ups.
@@ -59,7 +93,8 @@ export interface CommonArgs {
 }
 
 export interface CouncilArgs extends CommonArgs {
-  agents: FanoutAgentSpec[];
+  agents: CouncilAgentSpec[];
+  /** Default `DEFAULT_MAX_ROUNDS`, as for `council_start`. */
   maxRounds?: number;
 }
 
@@ -72,6 +107,7 @@ export interface CouncilArgs extends CommonArgs {
  * recorded on the run.
  */
 export function councilWorkflow(args: CouncilArgs): WorkflowSpec {
+  const maxRounds = args.maxRounds ?? DEFAULT_MAX_ROUNDS;
   return {
     name: 'council',
     cwd: args.cwd,
@@ -83,9 +119,9 @@ export function councilWorkflow(args: CouncilArgs): WorkflowSpec {
         task: args.task,
         agents: args.agents,
         projectDir: args.cwd,
-        maxRounds: args.maxRounds,
+        maxRounds,
         agentTimeoutMs: COUNCIL_AGENT_TIMEOUT_MS,
-        timeoutMs: councilNodeBudget(args.agents.length, args.maxRounds),
+        timeoutMs: councilNodeBudget(args.agents.length, maxRounds),
       },
     ],
   };
@@ -110,7 +146,7 @@ export function fanoutWorkflow(args: FanoutArgs): WorkflowSpec {
         synthesize: args.synthesize,
         cwd: args.cwd,
         agentTimeoutMs: FANOUT_AGENT_TIMEOUT_MS,
-        timeoutMs: fanoutNodeBudget(args.agents.length, args.synthesize),
+        timeoutMs: fanoutAgentsBudget(args.agents, args.synthesize),
       },
     ],
   };
@@ -120,7 +156,7 @@ export interface SolveArgs extends CommonArgs {
   /** Agents that explore the problem in parallel before anything is written. */
   scouts: FanoutAgentSpec[];
   /** Engine/model that does the implementation. */
-  implementer?: { engine?: FanoutAgentSpec['engine']; model?: string };
+  implementer?: { engine?: FanoutAgentSpec['engine']; model?: string; acpAgent?: string };
   /** Reviewers that read the finished change. */
   reviewers?: FanoutAgentSpec[];
   /** Ask a human before writing anything. */
@@ -130,7 +166,7 @@ export interface SolveArgs extends CommonArgs {
 }
 
 /**
- * The flagship: triage → (gate) → implement → verify → repair-until-green → review.
+ * The flagship: triage → (gate) → implement → (review) → verify → repair-until-green.
  *
  * The repair loop is the part that needs the kernel rather than a prompt: the
  * router sends control back to the implementer while the verifier is red and the
@@ -162,6 +198,7 @@ export function solveWorkflow(args: SolveArgs): WorkflowSpec {
     prompt: args.task,
     engine: args.implementer?.engine,
     model: args.implementer?.model,
+    acpAgent: args.implementer?.acpAgent,
     cwd: args.cwd,
     // A failed implementation attempt still goes to the verifier, so the
     // evidence bundle records what was actually wrong rather than just "the
@@ -236,6 +273,104 @@ export function solveWorkflow(args: SolveArgs): WorkflowSpec {
   };
 }
 
+export interface GoalArgs extends CommonArgs {
+  /** Who runs the goal: a Codex `codex-app` thread (default) or a Claude Code session. */
+  engine?: GoalNode['engine'];
+  /** Model for the goal's thread; omitted means the engine's own default. */
+  model?: string;
+  effort?: string;
+  sandboxMode?: GoalNode['sandboxMode'];
+  /** Argv prefix the engine runs under, e.g. a sandbox wrapper. */
+  launcher?: string[];
+  /** Start on this existing thread or Claude session (its goal is replaced). */
+  threadId?: string;
+  tokenBudget?: number;
+  /** Wall-clock budget for one goal pass. Omitted means none. */
+  goalTimeoutMs?: number;
+  /** How many times a red verifier may send the goal back. Default 1. */
+  maxRepairs?: number;
+}
+
+/**
+ * A `/goal` judged by checks it did not write: goal → verify → repair.
+ *
+ * The goal runs on one thread — a Codex `codex-app` thread, or a Claude Code
+ * session — until the agent calls it complete. That is the agent's opinion;
+ * the verifier's contract is the verdict. On red, the router sends control
+ * back to the same thread with the failing checks while repair budget remains.
+ */
+export function goalWorkflow(args: GoalArgs): WorkflowSpec {
+  const maxRepairs = args.maxRepairs ?? 1;
+  const goal: GoalNode = {
+    id: 'goal',
+    kind: 'goal',
+    objective: args.task,
+    ...(args.engine ? { engine: args.engine } : {}),
+    cwd: args.cwd,
+    model: args.model,
+    effort: args.effort,
+    sandboxMode: args.sandboxMode,
+    launcher: args.launcher,
+    threadId: args.threadId,
+    tokenBudget: args.tokenBudget,
+    timeoutMs: args.goalTimeoutMs,
+    // A goal that ends out of budget or blocked still goes to the verifier, so
+    // the verdict says what state the tree was left in.
+    onFailure: 'continue',
+  };
+  return {
+    name: 'goal',
+    cwd: args.cwd,
+    contract: args.contract,
+    maxNodeVisits: maxRepairs + 3,
+    nodes: [
+      goal,
+      {
+        id: 'verify',
+        kind: 'verifier',
+        contract: 'run',
+        cwd: args.cwd,
+        onFailure: 'continue',
+        // A judge that times a training run takes hours; the kernel's 30-minute
+        // node default would cut the verdict off. Sized from the checks.
+        timeoutMs: contractBudget(args.contract),
+      },
+      {
+        id: 'repair-gate',
+        kind: 'router',
+        routes: [
+          {
+            when: {
+              type: 'and',
+              all: [
+                { type: 'node_failed', node: 'verify' },
+                { type: 'visits_lt', node: 'goal', n: maxRepairs + 1 },
+              ],
+            },
+            to: 'goal',
+          },
+        ],
+      },
+    ],
+  };
+}
+
+/** Every check run once, in turn, at its own timeout, plus a margin for evidence. */
+function contractBudget(contract: AcceptanceContract | undefined): number {
+  const checks = contract?.checks ?? [];
+  const sum = checks.reduce((total, c) => {
+    const spec = ('spec' in c ? c.spec : c) as { type?: string; timeoutMs?: number };
+    const fallback =
+      spec.type === 'http'
+        ? DEFAULT_HTTP_TIMEOUT_MS
+        : spec.type === 'screenshot'
+          ? DEFAULT_SCREENSHOT_TIMEOUT_MS
+          : DEFAULT_CHECK_TIMEOUT_MS;
+    return total + (spec.timeoutMs && spec.timeoutMs > 0 ? spec.timeoutMs : fallback);
+  }, 0);
+  return Math.max(30 * 60_000, sum * ((contract?.fixOnFailureRounds ?? 0) + 1) + 5 * 60_000);
+}
+
 // ─── Legacy mode workflows ──────────────────────────────────────────────────
 //
 // The `council_*`, `fanout_*`, `ultraplan_*` and `ultrareview_*` tools keep
@@ -289,6 +424,7 @@ export interface LegacyFanoutArgs {
   synthesize?: boolean;
   synthesisEngine?: FanoutNode['synthesisEngine'];
   synthesisModel?: string;
+  synthesisAcpAgent?: string;
   synthesisPermissionMode?: string;
   maxTurnsPerAgent?: number;
   maxBudgetUsd?: number;
@@ -309,13 +445,14 @@ export function legacyFanoutWorkflow(args: LegacyFanoutArgs): WorkflowSpec {
         synthesize: args.synthesize,
         synthesisEngine: args.synthesisEngine,
         synthesisModel: args.synthesisModel,
+        synthesisAcpAgent: args.synthesisAcpAgent,
         synthesisPermissionMode: args.synthesisPermissionMode,
         maxTurnsPerAgent: args.maxTurnsPerAgent,
         maxBudgetUsd: args.maxBudgetUsd,
         cwd: args.cwd,
         // `||`: a zero timeout reaches the send as "use the default", so budget for that.
         agentTimeoutMs: args.timeoutMs || FANOUT_AGENT_TIMEOUT_MS,
-        timeoutMs: fanoutNodeBudget(args.agents.length, args.synthesize, args.timeoutMs || FANOUT_AGENT_TIMEOUT_MS),
+        timeoutMs: fanoutAgentsBudget(args.agents, args.synthesize, args.timeoutMs || FANOUT_AGENT_TIMEOUT_MS),
       },
     ],
   };
@@ -365,6 +502,7 @@ export function legacyUltraplanWorkflow(args: LegacyUltraplanArgs): WorkflowSpec
         model: args.model,
         permissionMode: 'plan' as PermissionMode,
         effort: 'max' as EffortLevel,
+        appendSystemPrompt: ULTRAPLAN_SYSTEM_PROMPT,
         timeoutMs: args.timeoutMs,
         prompt:
           `# Ultraplan Task\n\n${args.task}\n\nExplore the project, understand the codebase, analyze ` +
@@ -375,9 +513,9 @@ export function legacyUltraplanWorkflow(args: LegacyUltraplanArgs): WorkflowSpec
   };
 }
 
-export type TemplateName = 'council' | 'fanout' | 'solve';
+export type TemplateName = 'council' | 'fanout' | 'solve' | 'goal';
 
-export const TEMPLATE_NAMES: readonly TemplateName[] = ['council', 'fanout', 'solve'];
+export const TEMPLATE_NAMES: readonly TemplateName[] = ['council', 'fanout', 'solve', 'goal'];
 
 export interface UltraappArgs {
   /** UltraApp's own run id, which its store is keyed by. */
@@ -419,6 +557,7 @@ export function ultraappWorkflow(args: UltraappArgs): WorkflowSpec {
       appRunId: args.appRunId,
       runDir: args.runDir,
       slug: args.slug,
+      codebasePath: args.codebasePath,
       // The synth stage is a three-agent, eight-round council (ultraapp/council-adapter.ts).
       timeoutMs: councilNodeBudget(3, 8),
     },

@@ -29,8 +29,7 @@
  * nothing on stderr. Treat a wrong model as a failed turn, not a quiet swap.
  */
 
-import { spawn } from 'node:child_process';
-import { guardChildStreams } from './child-process-guard.js';
+import { spawnEngine } from './engine-spawn.js';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -60,6 +59,12 @@ interface AgyUsage {
 interface AgyStreamEvent {
   event?: string;
   conversation_id?: string;
+  /** Progress of one step; an `agent_response` step carries its own request's usage (agy 1.5.3). */
+  step_update?: {
+    conversation_id?: string;
+    step_type?: string;
+    usage?: AgyUsage;
+  };
   result?: {
     conversation_id?: string;
     status?: string;
@@ -209,6 +214,10 @@ export class PersistentAgySession extends BaseOneShotSession {
 
     if (this.agyConversationId) args.push('--conversation', this.agyConversationId);
 
+    // agy 1.4.12 takes the same `settings` value as Claude Code: inline JSON or a
+    // file path, applied to this run only and never saved.
+    if (this.options.settings) args.push('--settings', this.options.settings);
+
     // 1.2.6 changed the default for a headless run from 5 minutes to unlimited,
     // so passing this is also what keeps a stuck turn from running forever.
     args.push('--print-timeout', `${agyPrintTimeoutSec(timeoutMs)}s`);
@@ -263,6 +272,9 @@ export class PersistentAgySession extends BaseOneShotSession {
       let stderr = '';
       let settled = false;
       let turnUsage: AgyUsage | undefined;
+      // Prompt of the turn's latest request. `result.usage` sums every request
+      // of the turn, so it is the turn's spend, not the context's size.
+      let lastRequestPrompt = 0;
       let turnStatus: string | undefined;
       // agy reports a rejected invocation (bad model/effort pair, unknown slug)
       // as a stream-json result event carrying `error`, and prints nothing on
@@ -271,13 +283,13 @@ export class PersistentAgySession extends BaseOneShotSession {
       let turnError: string | undefined;
 
       const startedAt = Date.now();
-      const proc = spawn(this.engineBin, args, {
+      const proc = spawnEngine(this.engineBin, args, {
+        launcher: this.options.launcher,
         cwd: this.options.cwd,
         env: { ...process.env },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
-      guardChildStreams(proc);
 
       const timer = setTimeout(() => {
         if (!settled) {
@@ -325,6 +337,15 @@ export class PersistentAgySession extends BaseOneShotSession {
         }
         if (evt.event === 'init' && evt.conversation_id && !this.agyConversationId) {
           this.agyConversationId = evt.conversation_id;
+        }
+        const step = evt.event === 'step_update' ? evt.step_update : undefined;
+        if (step?.step_type === 'agent_response' && step.usage) {
+          // A subagent's steps belong to a conversation of its own.
+          const own =
+            !step.conversation_id || !this.agyConversationId || step.conversation_id === this.agyConversationId;
+          // `input_tokens` leaves the cached reads out; the prompt is both.
+          const prompt = (step.usage.input_tokens ?? 0) + (step.usage.cache_read_tokens ?? 0);
+          if (own && prompt > 0) lastRequestPrompt = prompt;
         }
         if (evt.event === 'result' && evt.result) {
           const r = evt.result;
@@ -413,6 +434,7 @@ export class PersistentAgySession extends BaseOneShotSession {
           this._markTurnEstimated();
           this._updateCost();
         }
+        if (lastRequestPrompt > 0) this._reportTurnInputTokens(lastRequestPrompt);
 
         this._addHistory({ text, code });
 

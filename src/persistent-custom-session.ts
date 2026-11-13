@@ -15,7 +15,8 @@
  * without writing engine-specific code.
  */
 
-import { spawn, ChildProcess } from 'node:child_process';
+import { ChildProcess } from 'node:child_process';
+import { killEngineTree, spawnEngine } from './engine-spawn.js';
 import { EventEmitter } from 'node:events';
 import * as readline from 'node:readline';
 import * as fs from 'node:fs';
@@ -34,9 +35,8 @@ import {
   type CustomEngineConfig,
   getModelPricing as _getModelPricingBase,
 } from './types.js';
-import { resolveAlias, estimateTokens, hasPricingOverride } from './models.js';
+import { resolveAlias, estimateTokens, hasOwnPricing, hasPricingOverride } from './models.js';
 import { buildSanitizer } from './sanitize.js';
-import { createStdinErrorReporter, guardChildStreams, reportSessionError } from './child-process-guard.js';
 import { resolveCustomEngine } from './engine-presets.js';
 
 import {
@@ -54,17 +54,15 @@ import {
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
 function getModelPricing(model: string | undefined, engineConfig: CustomEngineConfig) {
-  // Try the model registry first; fall back to engine-level pricing.
-  // A user-configured override is not a fallback: an all-zero rate is what a
-  // subscription seat is *supposed* to look like, and it reads identically to
-  // "the registry had nothing", so ask which one it was rather than guessing.
-  // Without this, zeroing a model would hand back engineConfig.pricing — the
-  // opposite of what was asked for, and dearer than not overriding at all.
-  const base = _getModelPricingBase(model, 'claude-sonnet-4-6');
-  if (base.input === 0 && base.output === 0 && engineConfig.pricing && !hasPricingOverride(model)) {
+  // The engine's own rate is for a model the registry cannot price: an
+  // unregistered one, or none at all (the CLI runs its own default). A
+  // user-configured override still wins, including one on the default model a
+  // session with no model falls back to: an all-zero subscription rate must not
+  // be replaced by the engine's dearer one.
+  if (engineConfig.pricing && !hasOwnPricing(model) && !hasPricingOverride(model)) {
     return engineConfig.pricing;
   }
-  return base;
+  return _getModelPricingBase(model, 'claude-sonnet-4-6');
 }
 
 function resolveBin(engineConfig: CustomEngineConfig): string {
@@ -88,8 +86,8 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
   private _rl: readline.Interface | null = null;
   private _streamCallbacks: StreamCallbacks | null = null;
   private _contextHighFired = false;
-  /** One session error per stdin fault, whether it arrives by write callback or by 'error' event. */
-  private _stdinFault = createStdinErrorReporter((err) => reportSessionError(this, err, `[${this.engineConfig.name}]`));
+  /** Set when `appendSystemPrompt` has no flag and must lead the first message. */
+  private _instructionsPending = false;
 
   // One-shot mode state
   private currentProc: ChildProcess | null = null;
@@ -152,6 +150,16 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     return this._isBusy;
   }
 
+  /**
+   * 'error' reaches listeners only. With none attached — between turns nothing
+   * listens — an emitted 'error' throws out of the event loop, which in the
+   * OpenClaw plugin is the gateway's.
+   */
+  private _emitError(err: Error): void {
+    if (this.listenerCount(SESSION_EVENT.ERROR) > 0) this.emit(SESSION_EVENT.ERROR, err);
+    else this.emit(SESSION_EVENT.LOG, `[custom] ${err.message}`);
+  }
+
   // ─── Start ───────────────────────────────────────────────────────────────
 
   async start(): Promise<this> {
@@ -208,6 +216,9 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     if (this.options.appendSystemPrompt && a.appendSystemPrompt) {
       args.push(a.appendSystemPrompt, this.options.appendSystemPrompt);
     }
+    // A resumed conversation already carries the instructions.
+    const resumed = !!(this.options.resumeSessionId && a.resume);
+    this._instructionsPending = !a.appendSystemPrompt && !resumed && !!this.options.appendSystemPrompt?.trim();
 
     // Limits
     if (this.options.maxTurns && a.maxTurns) {
@@ -234,21 +245,14 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
       ...this.engineConfig.env,
     };
 
-    this.proc = spawn(this.engineBin, args, {
+    this.proc = spawnEngine(this.engineBin, args, {
+      launcher: this.options.launcher,
       cwd: this.options.cwd,
       env: spawnEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
       detached: true,
     });
     this.proc.unref();
-
-    // A pipe fault with no listener (EPIPE when the engine closes stdin before a
-    // write lands) is an uncaught exception that ends the whole host.
-    const label = `[${this.engineConfig.name}]`;
-    guardChildStreams(this.proc, (stream, err) => {
-      if (stream === 'stdin') this._stdinFault(err);
-      else reportSessionError(this, new Error(`${stream} error: ${err.message}`), label);
-    });
 
     // Parse stdout line-by-line
     this._rl = readline.createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });
@@ -264,12 +268,15 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
       }
     });
     this._rl.on('error', (err: Error) => {
-      reportSessionError(this, new Error(`readline error: ${err.message}`), label);
+      this._emitError(new Error(`readline error: ${err.message}`));
     });
 
     this.proc.stderr?.on('data', (data: Buffer) => {
       this.emit(SESSION_EVENT.LOG, `[${this.engineConfig.name}-stderr] ${this.sanitize(data.toString())}`);
     });
+    // Writing to a CLI that has just died raises 'error' on stdin as well as in
+    // the write callback; unheard, it would throw out of the event loop.
+    this.proc.stdin?.on('error', (err) => this.emit(SESSION_EVENT.LOG, `[stdin] ${err.message}`));
 
     this.proc.on('close', (code) => {
       this._isReady = false;
@@ -285,7 +292,7 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
       }
       this._rl = null;
       this.proc = null;
-      reportSessionError(this, err, label);
+      this._emitError(err);
     });
 
     // Wait for ready
@@ -385,6 +392,13 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     const requestId = ++this.currentRequestId;
 
     let finalMessage = typeof message === 'string' ? message : message;
+    if (this._instructionsPending) {
+      this._instructionsPending = false;
+      finalMessage =
+        typeof finalMessage === 'string'
+          ? this._withAppendedInstructions(finalMessage)
+          : [{ type: 'text', text: this.options.appendSystemPrompt!.trim() }, ...finalMessage];
+    }
     if (typeof finalMessage === 'string') {
       if (options.effort === 'high' || options.effort === 'max') {
         finalMessage = `ultrathink\n\n${finalMessage}`;
@@ -408,7 +422,9 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     if (!stdin || stdin.writable === false) {
       throw new Error('Session stdin is not writable (process may have exited). Call start() first.');
     }
-    stdin.write(JSON.stringify(payload) + '\n', (err) => this._stdinFault(err));
+    stdin.write(JSON.stringify(payload) + '\n', (err) => {
+      if (err) this._emitError(new Error(`Failed to write to stdin: ${err.message}`));
+    });
 
     if (options.callbacks) this._streamCallbacks = options.callbacks;
 
@@ -435,7 +451,7 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     const textMessage = typeof message === 'string' ? message : JSON.stringify(message);
 
     if (!options.waitForComplete) {
-      this._runOneShot(textMessage, options).catch((err) => this.emit(SESSION_EVENT.ERROR, err));
+      this._runOneShot(textMessage, options).catch((err) => this._emitError(err));
       return { requestId, sent: true };
     }
 
@@ -451,9 +467,11 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     const a = this.engineConfig.args;
     const args: string[] = [];
 
-    // Print mode + message
+    // Print mode + message. Nothing carries over between sends, so instructions
+    // the CLI has no flag for lead every message.
+    const prompt = a.appendSystemPrompt ? message : this._withAppendedInstructions(message);
     if (a.print) args.push(a.print);
-    args.push(message);
+    args.push(prompt);
 
     // Output format
     if (a.outputFormat && a.outputFormatValue) args.push(a.outputFormat, a.outputFormatValue);
@@ -472,6 +490,9 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
     // System prompts
     if (this.options.systemPrompt && a.systemPrompt) {
       args.push(a.systemPrompt, this.options.systemPrompt);
+    }
+    if (this.options.appendSystemPrompt && a.appendSystemPrompt) {
+      args.push(a.appendSystemPrompt, this.options.appendSystemPrompt);
     }
 
     // Max turns
@@ -504,18 +525,18 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
       let settled = false;
       let gotUsageFromEvents = false;
 
-      const proc = spawn(this.engineBin, args, {
+      const proc = spawnEngine(this.engineBin, args, {
+        launcher: this.options.launcher,
         cwd: this.options.cwd,
         env: spawnEnv,
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
-      guardChildStreams(proc);
 
       const timer = setTimeout(() => {
         if (!settled) {
           settled = true;
-          proc.kill('SIGTERM');
+          killEngineTree(proc);
           reject(new Error(`Timeout waiting for ${this.engineConfig.name} response`));
         }
       }, timeout);
@@ -567,7 +588,7 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
         this._stats.lastActivity = now;
 
         if (!gotUsageFromEvents && resultText.value.length > 0) {
-          this._stats.tokensIn += estimateTokens(message);
+          this._stats.tokensIn += estimateTokens(prompt);
           this._stats.tokensOut += estimateTokens(resultText.value);
           this._updateCost();
           this._stats.tokensEstimated = true;
@@ -704,10 +725,7 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
         break;
 
       case 'error':
-        this.emit(
-          SESSION_EVENT.ERROR,
-          new Error(String((event as Record<string, unknown>).error) || JSON.stringify(event)),
-        );
+        this._emitError(new Error(String((event as Record<string, unknown>).error) || JSON.stringify(event)));
         break;
 
       case 'result': {
@@ -1054,11 +1072,7 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
       this.currentProc.stdin?.end();
       this.currentProc.stdout?.destroy();
       this.currentProc.stderr?.destroy();
-      try {
-        this.currentProc.kill('SIGTERM');
-      } catch {
-        /* ignore */
-      }
+      killEngineTree(this.currentProc);
       this.currentProc = null;
     }
 
@@ -1068,6 +1082,17 @@ export class PersistentCustomSession extends EventEmitter implements ISession {
   }
 
   // ─── Private ─────────────────────────────────────────────────────────────
+
+  /**
+   * Put `appendSystemPrompt` at the top of a message, for a CLI that maps no
+   * flag for it — the channel the built-in engines without one use. A user turn
+   * binds less firmly than a system prompt, but a council seat's charter would
+   * otherwise not arrive at all.
+   */
+  private _withAppendedInstructions(message: string): string {
+    const instructions = this.options.appendSystemPrompt?.trim();
+    return instructions ? `${instructions}\n\n---\n\n${message}` : message;
+  }
 
   private _appendPermissionArgs(args: string[]): void {
     const a = this.engineConfig.args;

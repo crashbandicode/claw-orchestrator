@@ -8,9 +8,12 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
+import { spawn, execFileSync, type ChildProcess } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type {
   ISession,
   SessionConfig,
@@ -20,8 +23,6 @@ import type {
   CostBreakdown,
   EffortLevel,
 } from '../types.js';
-import { SESSION_EVENT } from '../constants.js';
-import { defaultOrchestrationOutboxFile, type OrchestrationLifecycleEvent } from '../orchestration-events.js';
 
 // ─── Mock ISession ──────────────────────────────────────────────────────────
 
@@ -29,7 +30,6 @@ class MockSession extends EventEmitter implements ISession {
   sessionId?: string;
   conversationId?: string;
   threadId?: string;
-  codexThreadId?: string;
   private _isReady = true;
   private _isPaused = false;
   private _isBusy = false;
@@ -41,8 +41,8 @@ class MockSession extends EventEmitter implements ISession {
   stopCalled = 0;
   sendCalls: Array<{ message: string | unknown[]; options?: SessionSendOptions }> = [];
   compactCalls: string[] = [];
-  cursorChatId?: string;
-  opencodeSessionId?: string;
+  contextPercentOverride?: number;
+  compactThrows = false;
   /** Overrides the result event this session resolves with. */
   nextEvent?: Record<string, unknown>;
   /** Test seam for exercising real SessionManager/dispatcher send outcomes. */
@@ -76,7 +76,7 @@ class MockSession extends EventEmitter implements ISession {
     return this;
   }
 
-  stop(): void | Promise<void> {
+  stop(): void {
     this.stopCalled++;
   }
 
@@ -122,12 +122,9 @@ class MockSession extends EventEmitter implements ISession {
       isReady: this._isReady,
       startTime: new Date().toISOString(),
       lastActivity: new Date().toISOString(),
-      contextPercent: 5,
+      contextPercent: this.contextPercentOverride ?? 5,
       retries: 0,
       sessionId: this.sessionId,
-      codexThreadId: this.codexThreadId,
-      cursorChatId: this.cursorChatId,
-      opencodeSessionId: this.opencodeSessionId,
       uptime: 60,
     };
   }
@@ -155,6 +152,7 @@ class MockSession extends EventEmitter implements ISession {
 
   async compact(summary?: string): Promise<TurnResult | { requestId: number; sent: boolean }> {
     this.compactCalls.push(summary || '');
+    if (this.compactThrows) throw new Error('compact unsupported');
     return { text: 'compacted', event: { type: 'result' } };
   }
 
@@ -183,12 +181,6 @@ function patchCreateSession(manager: InstanceType<typeof SessionManager>): void 
   (manager as any)._createSession = (_engine: string, _config: SessionConfig): ISession => {
     const mock = new MockSession();
     if (_engine === 'agy' && _config.resumeSessionId) mock.conversationId = _config.resumeSessionId;
-    if (_engine === 'cursor' && _config.resumeSessionId && !/^cursor-\d+-/.test(_config.resumeSessionId)) {
-      mock.cursorChatId = _config.resumeSessionId.replace(/^cursor-live-/, '');
-    }
-    if (_engine === 'codex-app') {
-      mock.codexThreadId = _config.resumeSessionId || '019c6dcb-93ad-7dc1-b531-418d213b8761';
-    }
     mockSessions.push(mock);
     createdConfigs.push(_config);
     return mock;
@@ -206,6 +198,8 @@ function patchCreateSession(manager: InstanceType<typeof SessionManager>): void 
 // and collide inside — the developer's real ~/.claw-orchestrator/wf.
 const TEST_WF_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-sm-wf-'));
 process.env.CLAWO_WF_DIR = TEST_WF_DIR;
+// The session file's lock is a real file; keep it out of the developer's ~/.openclaw.
+process.env.CLAWO_SESSIONS_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-sm-sessions-'));
 
 vi.mock('node:fs', async () => {
   const actual = await vi.importActual<typeof import('node:fs')>('node:fs');
@@ -271,6 +265,8 @@ vi.mock('node:fs', async () => {
 // Import AFTER mocking fs
 const { SessionManager } = await import('../session-manager.js');
 const { Msg: AutoloopMsg } = await import('../autoloop/messages.js');
+const { leaseIsStale, readLease } = await import('../kernel/store.js');
+const { AUTOLOOP_PROOF_BYTES, AUTOLOOP_PROOF_RELPATH } = await import('./helpers/autoloop-owner-child.js');
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
@@ -289,37 +285,6 @@ function createManager(overrides?: Record<string, unknown>): InstanceType<typeof
 
 function lastMock(): MockSession {
   return mockSessions[mockSessions.length - 1];
-}
-
-const NATIVE_CURSOR_ID = 'd9133160-dd01-402e-8dbb-8166263fff40';
-
-function identityBoundEvents(runId?: string): OrchestrationLifecycleEvent[] {
-  const file = defaultOrchestrationOutboxFile();
-  if (!fs.existsSync(file)) return [];
-  return fs
-    .readFileSync(file, 'utf8')
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as OrchestrationLifecycleEvent)
-    .filter((e) => e.event === 'agent.identity_bound' && (!runId || e.run_id === runId));
-}
-
-function readAgentEvents(agentName: string): OrchestrationLifecycleEvent[] {
-  const file = defaultOrchestrationOutboxFile();
-  if (!fs.existsSync(file)) return [];
-  return fs
-    .readFileSync(file, 'utf8')
-    .trim()
-    .split('\n')
-    .filter(Boolean)
-    .map((line) => JSON.parse(line) as OrchestrationLifecycleEvent)
-    .filter((event) => event.agent_name === agentName);
-}
-
-function sessionRunId(manager: unknown, name: string): string {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  return (manager as any).sessions.get(name).orchestration.runId as string;
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -341,7 +306,6 @@ describe('SessionManager', () => {
 
   afterEach(async () => {
     await mgr.shutdown();
-    vi.unstubAllEnvs();
     vi.useRealTimers();
   });
 
@@ -356,8 +320,6 @@ describe('SessionManager', () => {
       expect(info.created).toBeDefined();
       expect(info.stats).toBeDefined();
       expect(info.stats.isReady).toBe(true);
-      expect(info.orchestrationRunId).toMatch(/^session-/);
-      expect(info.orchestrationAgentKey).toBe('test1');
       expect(lastMock().startCalled).toBe(1);
     });
 
@@ -403,6 +365,23 @@ describe('SessionManager', () => {
 
       expect(internals.sessions.has('idle-one')).toBe(false);
       expect(internals._activePids.has('idle-one')).toBe(false);
+    });
+
+    it('idle cleanup detaches the goal adapter listening to the session', async () => {
+      await mgr.startSession({ name: 'idle-goal', cwd: '/tmp' });
+      const internals = mgr as unknown as {
+        sessions: Map<string, { lastActivity: number }>;
+        _claudeGoals: Map<string, { detach(): void }>;
+        _cleanupIdleSessions(): void;
+      };
+      const detach = vi.fn();
+      internals._claudeGoals.set('idle-goal', { detach });
+      internals.sessions.get('idle-goal')!.lastActivity = 0;
+
+      internals._cleanupIdleSessions();
+
+      expect(detach).toHaveBeenCalledOnce();
+      expect(internals._claudeGoals.has('idle-goal')).toBe(false);
     });
 
     it('idle cleanup leaves a live session and its PID alone', async () => {
@@ -531,93 +510,6 @@ describe('SessionManager', () => {
   // ─── Max Concurrent Sessions ────────────────────────────────────────
 
   describe('max concurrent sessions', () => {
-    it('preserves five as the default when no configuration is supplied', async () => {
-      vi.stubEnv('CLAWO_MAX_CONCURRENT_SESSIONS', '');
-      const maxMgr = createManager({ maxConcurrentSessions: undefined });
-      try {
-        for (let i = 0; i < 5; i++) await maxMgr.startSession({ name: `default-${i}`, cwd: '/tmp' });
-        await expect(maxMgr.startSession({ name: 'sixth', cwd: '/tmp' })).rejects.toThrow(
-          'Max concurrent sessions (5) reached',
-        );
-      } finally {
-        await maxMgr.shutdown();
-      }
-    });
-
-    it.each([0, 8])('allows eight concurrent starts with capacity %s', async (limit) => {
-      const maxMgr = createManager({ maxConcurrentSessions: limit });
-      try {
-        const sessions = await Promise.all(
-          Array.from({ length: 8 }, (_, i) => maxMgr.startSession({ name: `s-${i}`, cwd: '/tmp' })),
-        );
-        expect(sessions).toHaveLength(8);
-        expect(maxMgr.listSessions()).toHaveLength(8);
-      } finally {
-        await maxMgr.shutdown();
-      }
-    });
-
-    it('rejects concurrent starts beyond a finite cap without creating their engines', async () => {
-      const maxMgr = createManager({ maxConcurrentSessions: 2 });
-      try {
-        const results = await Promise.allSettled(
-          Array.from({ length: 6 }, (_, i) => maxMgr.startSession({ name: `s-${i}`, cwd: '/tmp' })),
-        );
-        expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(2);
-        expect(results.filter((r) => r.status === 'rejected')).toHaveLength(4);
-        expect(mockSessions).toHaveLength(2);
-        const existing = await maxMgr.startSession({ name: 's-0', cwd: '/tmp' });
-        expect(existing.name).toBe('s-0');
-      } finally {
-        await maxMgr.shutdown();
-      }
-    });
-
-    it('releases a reserved slot when engine startup fails', async () => {
-      const maxMgr = createManager({ maxConcurrentSessions: 1 });
-      const fail = vi.spyOn(MockSession.prototype, 'start').mockRejectedValueOnce(new Error('startup failed'));
-      try {
-        await expect(maxMgr.startSession({ name: 'failed', cwd: '/tmp' })).rejects.toThrow('startup failed');
-        expect((await maxMgr.startSession({ name: 'replacement', cwd: '/tmp' })).name).toBe('replacement');
-      } finally {
-        fail.mockRestore();
-        await maxMgr.shutdown();
-      }
-    });
-
-    it.each(['0', '8'])('reads MCP environment capacity %s when no plugin limit is specified', async (limit) => {
-      vi.stubEnv('CLAWO_MAX_CONCURRENT_SESSIONS', limit);
-      const maxMgr = createManager({ maxConcurrentSessions: undefined });
-      try {
-        for (let i = 0; i < 8; i++) await maxMgr.startSession({ name: `env-${i}`, cwd: '/tmp' });
-        expect(maxMgr.listSessions()).toHaveLength(8);
-      } finally {
-        await maxMgr.shutdown();
-      }
-    });
-
-    it('gives explicit plugin capacity precedence over the environment', async () => {
-      vi.stubEnv('CLAWO_MAX_CONCURRENT_SESSIONS', '0');
-      const maxMgr = createManager({ maxConcurrentSessions: 1 });
-      try {
-        await maxMgr.startSession({ name: 'first', cwd: '/tmp' });
-        await expect(maxMgr.startSession({ name: 'second', cwd: '/tmp' })).rejects.toThrow(
-          'Max concurrent sessions (1) reached',
-        );
-      } finally {
-        await maxMgr.shutdown();
-      }
-    });
-
-    it.each([-1, 1.5, NaN, Infinity])('rejects invalid configured capacity %s', (limit) => {
-      expect(() => createManager({ maxConcurrentSessions: limit })).toThrow('must be a non-negative integer');
-    });
-
-    it.each(['-1', '1.5', 'NaN', 'Infinity', 'invalid'])('rejects invalid environment capacity %s', (limit) => {
-      vi.stubEnv('CLAWO_MAX_CONCURRENT_SESSIONS', limit);
-      expect(() => createManager({ maxConcurrentSessions: undefined })).toThrow('must be a non-negative integer');
-    });
-
     it('throws when limit is reached', async () => {
       const maxMgr = createManager({ maxConcurrentSessions: 2 });
 
@@ -648,21 +540,6 @@ describe('SessionManager', () => {
 
   // ─── sendMessage ────────────────────────────────────────────────────
 
-  describe('cursorGoalSet', () => {
-    it('sends /goal on a cursor session and rejects any other engine', async () => {
-      await mgr.startSession({ name: 'cursor-goal', cwd: '/tmp', engine: 'cursor' });
-      await mgr.cursorGoalSet('cursor-goal', '  ship the fix  ', 1234);
-      expect(lastMock().sendCalls.at(-1)).toMatchObject({
-        message: '/goal ship the fix',
-        options: { waitForComplete: true, timeout: 1234 },
-      });
-
-      await mgr.startSession({ name: 'claude-goal', cwd: '/tmp', engine: 'claude' });
-      await expect(mgr.cursorGoalSet('claude-goal', 'ship the fix')).rejects.toThrow(/engine: "cursor"/);
-      await expect(mgr.cursorGoalSet('cursor-goal', '   ')).rejects.toThrow(/objective/);
-    });
-  });
-
   describe('sendMessage', () => {
     it('sends message and returns output', async () => {
       await mgr.startSession({ name: 'msg-test', cwd: '/tmp' });
@@ -670,8 +547,6 @@ describe('SessionManager', () => {
 
       expect(result.output).toContain('hello world');
       expect(result.sessionId).toBeDefined();
-      expect(result.orchestrationRunId).toMatch(/^session-/);
-      expect(result.orchestrationAgentKey).toBe('msg-test');
       expect(lastMock().sendCalls.length).toBe(1);
       expect(lastMock().sendCalls[0].message).toBe('hello world');
     });
@@ -837,7 +712,7 @@ describe('SessionManager', () => {
     it('resolves haiku alias', async () => {
       await mgr.startSession({ name: 'haiku-test', model: 'haiku', cwd: '/tmp' });
       const list = mgr.listSessions();
-      expect(list[0].model).toBe('claude-haiku-4-5');
+      expect(list[0].model).toBe('claude-haiku-5-5');
     });
 
     it('passes through unknown model strings as-is', async () => {
@@ -862,6 +737,35 @@ describe('SessionManager', () => {
       mgr.setModel('model-set', 'sonnet');
       const list = mgr.listSessions();
       expect(list[0].model).toBe('claude-sonnet-5-5');
+    });
+
+    // Engines do not share a model namespace: a Claude id handed to codex, agy,
+    // grok or opencode names a model that CLI does not have.
+    it('gives defaultModel only to an engine that runs that model', async () => {
+      await mgr.shutdown();
+      mgr = createManager({ defaultModel: 'opus', maxConcurrentSessions: 10 });
+      const engines = ['claude', 'codex', 'codex-app', 'agy', 'grok', 'opencode'] as const;
+      for (const engine of engines) await mgr.startSession({ name: `dm-${engine}`, cwd: '/tmp', engine });
+      expect(createdConfigs.map((c) => [c.engine, c.model])).toEqual([
+        ['claude', 'opus'],
+        ['codex', undefined],
+        ['codex-app', undefined],
+        ['agy', undefined],
+        ['grok', undefined],
+        ['opencode', undefined],
+      ]);
+      // A model the caller names is theirs, whatever the engine.
+      await mgr.startSession({ name: 'dm-explicit', cwd: '/tmp', engine: 'codex', model: 'opus' });
+      expect(createdConfigs.at(-1)?.model).toBe('opus');
+    });
+
+    it('gives a non-Claude defaultModel to the engines that run it', async () => {
+      await mgr.shutdown();
+      mgr = createManager({ defaultModel: 'gpt-5.5', maxConcurrentSessions: 10 });
+      for (const engine of ['codex', 'codex-app', 'grok'] as const) {
+        await mgr.startSession({ name: `dm-${engine}`, cwd: '/tmp', engine });
+      }
+      expect(createdConfigs.map((c) => c.model)).toEqual(['gpt-5.5', 'gpt-5.5', undefined]);
     });
   });
 
@@ -951,6 +855,66 @@ describe('SessionManager', () => {
       await mgr.startSession({ name: 'compact-test2', cwd: '/tmp' });
       await mgr.compactSession('compact-test2');
       expect(lastMock().compactCalls).toEqual(['']);
+    });
+  });
+
+  // ─── generated images ───────────────────────────────────────────────
+
+  describe('generated images', () => {
+    it('surfaces the images an engine attached to its result', async () => {
+      await mgr.startSession({ name: 'img', cwd: '/tmp', engine: 'codex' });
+      lastMock().sendImplementation = async () => ({
+        text: 'drawn',
+        event: { type: 'result', generated_images: [{ path: '/g/a.png' }, { bogus: true }] },
+      });
+      const result = await mgr.sendMessage('img', 'draw');
+      expect(result.images).toEqual([{ path: '/g/a.png' }]);
+    });
+
+    it('leaves the field out when there are none', async () => {
+      await mgr.startSession({ name: 'noimg', cwd: '/tmp' });
+      const result = await mgr.sendMessage('noimg', 'hi');
+      expect(result).not.toHaveProperty('images');
+    });
+  });
+
+  // ─── autoCompactPercent ─────────────────────────────────────────────
+
+  describe('autoCompactPercent', () => {
+    it('compacts before a send once context reaches the threshold', async () => {
+      await mgr.startSession({ name: 'ac-hit', cwd: '/tmp', autoCompactPercent: 85 });
+      const mock = lastMock();
+      mock.contextPercentOverride = 85;
+      await mgr.sendMessage('ac-hit', 'hello');
+      expect(mock.compactCalls).toEqual(['']);
+      expect(mock.sendCalls.map((c) => c.message)).toEqual(['hello']);
+    });
+
+    it('leaves the session alone below the threshold or when unset', async () => {
+      await mgr.startSession({ name: 'ac-below', cwd: '/tmp', autoCompactPercent: 85 });
+      lastMock().contextPercentOverride = 84;
+      await mgr.sendMessage('ac-below', 'hello');
+      expect(lastMock().compactCalls).toEqual([]);
+
+      await mgr.startSession({ name: 'ac-off', cwd: '/tmp' });
+      lastMock().contextPercentOverride = 99;
+      await mgr.sendMessage('ac-off', 'hello');
+      expect(lastMock().compactCalls).toEqual([]);
+    });
+
+    it('still sends when the compact fails', async () => {
+      await mgr.startSession({ name: 'ac-fail', cwd: '/tmp', autoCompactPercent: 50 });
+      const mock = lastMock();
+      mock.contextPercentOverride = 90;
+      mock.compactThrows = true;
+      await mgr.sendMessage('ac-fail', 'hello');
+      expect(mock.sendCalls.map((c) => c.message)).toEqual(['hello']);
+    });
+
+    it.each([0, 100, Number.NaN])('rejects an out-of-range threshold (%s)', async (value) => {
+      await expect(mgr.startSession({ name: 'ac-bad', cwd: '/tmp', autoCompactPercent: value })).rejects.toThrow(
+        'autoCompactPercent must be a number from 1 to 99',
+      );
     });
   });
 
@@ -1076,6 +1040,28 @@ describe('SessionManager', () => {
       // Messages should be marked as read
       const unread = mgr.sessionInbox('s2');
       expect(unread.length).toBe(0);
+    });
+
+    it('stopping a session drops its queued messages, so a new session under the name starts empty', async () => {
+      await mgr.startSession({ name: 's1', cwd: '/tmp' });
+      await mgr.startSession({ name: 's2', cwd: '/tmp' });
+      mockSessions[1].setBusy(true);
+      await mgr.sessionSendTo('s1', 's2', 'for the old s2');
+
+      await mgr.stopSession('s2');
+      await mgr.startSession({ name: 's2', cwd: '/tmp' });
+      expect(mgr.sessionInbox('s2', false)).toEqual([]);
+    });
+
+    it('keeps the queued messages of a session stopped to be resumed', async () => {
+      await mgr.startSession({ name: 's1', cwd: '/tmp' });
+      await mgr.startSession({ name: 's2', cwd: '/tmp' });
+      mockSessions[1].setBusy(true);
+      await mgr.sessionSendTo('s1', 's2', 'still for s2');
+
+      await mgr.stopSession('s2', { keepPersisted: true });
+      await mgr.startSession({ name: 's2', cwd: '/tmp' });
+      expect(mgr.sessionInbox('s2').map((m) => m.text)).toEqual(['still for s2']);
     });
 
     it('sessionDeliverInbox returns 0 when inbox is empty', async () => {
@@ -1307,6 +1293,16 @@ describe('SessionManager', () => {
     });
   });
 
+  // Through the real agent node: a spec field the executor drops would pass a
+  // spec-level assertion and still reach the session without it.
+  it('gives the ultraplan session the plan-only instruction', async () => {
+    const result = await mgr.ultraplanStart('plan task', { cwd: '/tmp' });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (mgr as any).kernel.wait(result.id);
+    expect(createdConfigs).toHaveLength(1);
+    expect(createdConfigs[0].appendSystemPrompt).toContain('plan only');
+  });
+
   // ─── Health ─────────────────────────────────────────────────────────
 
   describe('health', () => {
@@ -1411,123 +1407,6 @@ describe('SessionManager', () => {
 
       await shortTtlMgr.shutdown();
     });
-
-    it('does not reap a busy session or a session held by a remote operation', async () => {
-      const shortTtlMgr = createManager({ sessionTtlMinutes: 1 });
-      await shortTtlMgr.startSession({ name: 'busy-ttl', cwd: '/tmp' });
-      lastMock().setBusy(true);
-      vi.advanceTimersByTime(2 * 60_000);
-      expect(shortTtlMgr.listSessions().map((session) => session.name)).toContain('busy-ttl');
-
-      lastMock().setBusy(false);
-      shortTtlMgr.holdSession('busy-ttl');
-      vi.advanceTimersByTime(2 * 60_000);
-      expect(shortTtlMgr.listSessions().map((session) => session.name)).toContain('busy-ttl');
-
-      shortTtlMgr.releaseSessionHold('busy-ttl');
-      vi.advanceTimersByTime(2 * 60_000);
-      expect(shortTtlMgr.listSessions().map((session) => session.name)).not.toContain('busy-ttl');
-      await shortTtlMgr.shutdown();
-    });
-
-    it('reaps a session after its send chain settles and keeps a queued send', async () => {
-      const shortTtlMgr = createManager({ sessionTtlMinutes: 1 });
-      await shortTtlMgr.startSession({ name: 'settled', cwd: '/tmp' });
-      await shortTtlMgr.sendMessage('settled', 'hello');
-      vi.advanceTimersByTime(2 * 60_000);
-      expect(shortTtlMgr.listSessions().map((session) => session.name)).not.toContain('settled');
-
-      await shortTtlMgr.startSession({ name: 'queued', cwd: '/tmp' });
-      let releaseSend: () => void = () => undefined;
-      const gate = new Promise<void>((resolve) => {
-        releaseSend = resolve;
-      });
-      lastMock().sendImplementation = () =>
-        gate.then(() => ({ text: 'later', event: { type: 'result', result: 'done' } }));
-      const pending = shortTtlMgr.sendMessage('queued', 'hold');
-      await Promise.resolve();
-      vi.advanceTimersByTime(2 * 60_000);
-      expect(shortTtlMgr.listSessions().map((session) => session.name)).toContain('queued');
-      releaseSend();
-      await pending;
-      vi.advanceTimersByTime(2 * 60_000);
-      expect(shortTtlMgr.listSessions().map((session) => session.name)).not.toContain('queued');
-      await shortTtlMgr.shutdown();
-    });
-  });
-
-  describe('remote lifecycle fields', () => {
-    it('refuses a new turn while the native session is still busy', async () => {
-      await mgr.startSession({ name: 'busy-send', cwd: '/tmp' });
-      lastMock().setBusy(true);
-      await expect(mgr.sendMessage('busy-send', 'again')).rejects.toThrow(/native turn still in progress/);
-      expect(lastMock().sendCalls).toHaveLength(0);
-    });
-
-    it('copies explicit parent fields into the outbox without wrapping the native id', async () => {
-      const nativeId = '019c6dcb-93ad-7dc1-b531-418d213b8761';
-      await mgr.startSession({
-        name: 'remote-child',
-        cwd: '/tmp',
-        engine: 'codex-app',
-        resumeSessionId: nativeId,
-        parentMachineId: '11111111-1111-4111-8111-111111111111',
-        parentSessionId: 'parent-native',
-        parentToolId: 'cursor',
-        originHost: 'yoga',
-        executionHost: 'studio',
-        remoteSessionHandle: 'studio::remote-child',
-      });
-      const info = mgr.getStatus('remote-child');
-      expect(info.claudeSessionId).toBe(nativeId);
-      expect(info.remoteSessionHandle).toBe('studio::remote-child');
-      expect(info.executionHost).toBe('studio');
-      expect(info.originHost).toBe('yoga');
-      expect(info.parentSessionId).toBe('parent-native');
-      const events = readAgentEvents('remote-child');
-      expect(events.find((event) => event.event === 'agent.declared')).toMatchObject({
-        parent_machine_id: '11111111-1111-4111-8111-111111111111',
-        parent_session_id: 'parent-native',
-        parent_tool_id: 'cursor',
-        origin_host: 'yoga',
-        execution_host: 'studio',
-        remote_session_handle: 'studio::remote-child',
-      });
-      expect(events.find((event) => event.event === 'agent.identity_bound')).toMatchObject({
-        native_session_id: nativeId,
-        remote_session_handle: 'studio::remote-child',
-      });
-    });
-
-    it('fills a missing parent session id from a delegate marker and ignores handoff and tangent markers', async () => {
-      await mgr.startSession({ name: 'marked-child', cwd: '/tmp', engine: 'codex-app' });
-      await mgr.sendMessage('marked-child', 'MEMENTO-HANDOFF-FROM: handoff-id\ncontinue');
-      await mgr.sendMessage('marked-child', 'MEMENTO-TANGENT-FROM: tangent-id\ncontinue');
-      expect(readAgentEvents('marked-child').some((event) => event.parent_session_id)).toBe(false);
-
-      await mgr.sendMessage('marked-child', 'MEMENTO-DELEGATE-FROM: parent-native\nwork');
-      expect(readAgentEvents('marked-child').some((event) => event.parent_session_id === 'parent-native')).toBe(true);
-      expect(mgr.getStatus('marked-child').claudeSessionId).not.toContain('::');
-    });
-
-    it('persists a dedicated state directory instead of the shared registry', async () => {
-      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'crs-state-'));
-      const writeFile = fs.writeFile as unknown as { mock: { calls: unknown[][] } };
-      const before = writeFile.mock.calls.length;
-      const isolated = createManager({ stateDirectory: dir });
-      await isolated.startSession({ name: 'iso', cwd: '/tmp' });
-      vi.advanceTimersByTime(6_000);
-      const registry = path.join(dir, 'claude-sessions.json');
-      const added = writeFile.mock.calls.slice(before);
-      expect(added.some((call) => String(call[0]) === `${registry}.tmp` && String(call[1]).includes('"iso"'))).toBe(
-        true,
-      );
-      expect(added.some((call) => String(call[0]).includes(`${path.sep}.openclaw${path.sep}`))).toBe(false);
-      const rename = fs.rename as unknown as { mock: { calls: unknown[][] } };
-      expect(rename.mock.calls.some((call) => String(call[1]) === registry)).toBe(true);
-      await isolated.shutdown();
-      fs.rmSync(dir, { recursive: true, force: true });
-    });
   });
 
   // ─── Constructor Config ─────────────────────────────────────────────
@@ -1630,6 +1509,21 @@ describe('SessionManager', () => {
 
       expect(createdConfigs[1].resumeSessionId).toBe('11111111-2222-3333-4444-555555555555');
       expect(createdConfigs[1].resumeSessionId).not.toMatch(/^mock-session-/);
+    });
+
+    // A codex-app session's `sessionId` is our own label. `thread/resume` needs
+    // the app-server's thread id; handed the label it failed and the session
+    // quietly opened a brand-new thread.
+    it('uses the codex-app thread id, not the session label, when switching models', async () => {
+      await mgr.startSession({ name: 'cxapp-switch', cwd: '/tmp', engine: 'codex-app', model: 'gpt-6.1-sol' });
+      const mock = lastMock() as MockSession & { codexThreadId?: string };
+      mock.codexThreadId = '019c6dcb-93ad-7dc1-b531-418d213b8761';
+      mock.setBusy(false);
+
+      await mgr.sendMessage('cxapp-switch', 'hello');
+      await mgr.switchModel('cxapp-switch', 'gpt-6-luna');
+
+      expect(createdConfigs[1].resumeSessionId).toBe('019c6dcb-93ad-7dc1-b531-418d213b8761');
     });
   });
 
@@ -1798,6 +1692,13 @@ describe('SessionManager', () => {
           plannerEngine: 'not-real' as 'claude',
         }),
       ).rejects.toThrow("Planner engine 'not-real' is not supported");
+      expect(createdConfigs).toEqual([]);
+    });
+
+    it('rejects an acp role before creating a session', async () => {
+      await expect(mgr.autoloopStart({ runId: 'acp-coder', workspace: '/tmp', coderEngine: 'acp' })).rejects.toThrow(
+        "Coder engine 'acp' is not supported by Autoloop",
+      );
       expect(createdConfigs).toEqual([]);
     });
 
@@ -2367,6 +2268,73 @@ describe('SessionManager', () => {
       });
 
       describe('Autoloop timeout resilience integration', () => {
+        it('publishes a genuine planner send timeout so a non-owning autoloopStatus can see the pause', async () => {
+          const runId = 'timeout-status-non-owning';
+          const workspace = workspaceFor(runId);
+          await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 600_000 });
+          const handle = mgr.getAutoloop(runId)!;
+          const planner = mockSessions[0];
+          planner.sendImplementation = async () => {
+            planner.sendImplementation = undefined;
+            throw new Error('Timeout waiting for response');
+          };
+
+          await mgr.autoloopChat(runId, 'one planner send that reaches its deadline');
+
+          expect(planner.sendCalls).toHaveLength(1);
+          expect(handle.runner.state.status).toBe('paused');
+          const pending = handle.runner.state.pending_dispatch!;
+          expect(pending.dispatch_id).toMatch(/^dispatch_[a-f0-9]{64}$/);
+          expect(handle.runner.state.status_reason).toBe(`awaiting_resume:send_timeout:planner:${pending.dispatch_id}`);
+
+          const auditRows = fs
+            .readFileSync(auditPathFor(workspace, runId), 'utf8')
+            .trim()
+            .split('\n')
+            .map((line) => JSON.parse(line) as { kind: string; payload: unknown })
+            .filter((row) => row.kind === 'send_timeout');
+          expect(auditRows).toHaveLength(1);
+          expect(auditRows[0].payload).toEqual(pending);
+
+          const observer = createManager();
+          try {
+            const observed = observer.autoloopStatus(runId);
+            expect(observed?.status).toBe('paused');
+            expect(observed?.status_reason).toBe(`awaiting_resume:send_timeout:planner:${pending.dispatch_id}`);
+            expect(observed?.pending_dispatch).toEqual(pending);
+            expect(observed?.pending_dispatch).toEqual(auditRows[0].payload);
+          } finally {
+            await observer.shutdown();
+          }
+
+          expect(mockSessions).toHaveLength(1);
+          expect(createdConfigs.map((config) => config.name)).toEqual([`autoloop-${runId}-planner`]);
+          expect(planner.sendCalls).toHaveLength(1);
+        });
+
+        it('publishes an operator pause so a non-owning autoloopStatus can see the pause', async () => {
+          const runId = 'operator-pause-status-non-owning';
+          const workspace = workspaceFor(runId);
+          await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 600_000 });
+          const handle = mgr.getAutoloop(runId)!;
+
+          await handle.runner.send(AutoloopMsg.pause(0, { reason: 'operator-hold' }));
+
+          expect(handle.runner.state.status).toBe('paused');
+          expect(handle.runner.state.status_reason).toBe('operator-hold');
+          expect(handle.runner.state.pending_dispatch).toBeNull();
+
+          const observer = createManager();
+          try {
+            const observed = observer.autoloopStatus(runId);
+            expect(observed?.status).toBe('paused');
+            expect(observed?.status_reason).toBe('operator-hold');
+            expect(observed?.pending_dispatch).toBeNull();
+          } finally {
+            await observer.shutdown();
+          }
+        });
+
         it('carries a genuine timed-out send through an atomic increase and a distinct later send', async () => {
           const runId = 'timeout-integration-lifecycle';
           const workspace = workspaceFor(runId);
@@ -2561,6 +2529,285 @@ describe('SessionManager', () => {
       });
     });
 
+    describe('abrupt owner loss then public autoloopResume', () => {
+      const OWNER_CHILD = fileURLToPath(new URL('./helpers/autoloop-owner-child.ts', import.meta.url));
+
+      const initGitWorkspace = (workspace: string): void => {
+        fs.mkdirSync(workspace, { recursive: true });
+        execFileSync('git', ['init', '-b', 'main'], { cwd: workspace });
+        execFileSync('git', ['config', 'user.email', 'autoloop-test@example.com'], { cwd: workspace });
+        execFileSync('git', ['config', 'user.name', 'autoloop-test'], { cwd: workspace });
+        fs.writeFileSync(path.join(workspace, 'README.md'), 'workspace\n');
+        execFileSync('git', ['add', 'README.md'], { cwd: workspace });
+        execFileSync('git', ['commit', '-m', 'init'], { cwd: workspace });
+      };
+
+      const spawnOwner = (runId: string, workspace: string, mode: 'committed-iter' | 'planner-only'): ChildProcess =>
+        spawn(process.execPath, ['--import', 'tsx', OWNER_CHILD], {
+          env: {
+            ...process.env,
+            AUTOLOOP_MODE: mode,
+            AUTOLOOP_RUN_ID: runId,
+            AUTOLOOP_WORKSPACE: workspace,
+            CLAWO_WF_DIR: TEST_WF_DIR,
+          },
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+
+      const waitReadyThenSigkill = async (proc: ChildProcess): Promise<void> => {
+        let stderr = '';
+        proc.stderr?.on('data', (chunk: Buffer) => {
+          stderr += chunk.toString();
+        });
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error(`owner child never READY: ${stderr.slice(0, 800)}`)), 45_000);
+          proc.stdout?.on('data', (chunk: Buffer) => {
+            if (chunk.toString().includes('READY')) {
+              clearTimeout(timer);
+              resolve();
+            }
+          });
+          proc.on('exit', (code, signal) => {
+            clearTimeout(timer);
+            reject(
+              new Error(`owner child exited before READY code=${String(code)} signal=${String(signal)} ${stderr}`),
+            );
+          });
+          proc.on('error', reject);
+        });
+        proc.kill('SIGKILL');
+        await new Promise<void>((resolve) => {
+          proc.on('exit', () => resolve());
+        });
+        await vi.waitFor(
+          () => {
+            expect(proc.pid === undefined || proc.killed || proc.exitCode !== null).toBe(true);
+          },
+          { timeout: 5_000, interval: 50 },
+        );
+      };
+
+      beforeEach(() => {
+        vi.useRealTimers();
+      });
+
+      it('resumes a committed coder iteration into Reviewer after the owner process dies', async () => {
+        const runId = 'kill-owner-open-iter';
+        const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+        initGitWorkspace(workspace);
+        const ledgerIter = path.join(workspace, 'tasks', runId, 'iter', '0');
+        const required = ['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'] as const;
+
+        const proc = spawnOwner(runId, workspace, 'committed-iter');
+        await waitReadyThenSigkill(proc);
+
+        const observer = createManager();
+        try {
+          await vi.waitFor(
+            () => {
+              expect(leaseIsStale(readLease(runId))).toBe(true);
+              expect(observer.workflowStatus(runId).state).toBe('running');
+            },
+            { timeout: 5_000, interval: 50 },
+          );
+          for (const name of required) {
+            expect(fs.existsSync(path.join(ledgerIter, name))).toBe(true);
+          }
+          expect(fs.existsSync(path.join(ledgerIter, 'verdict.json'))).toBe(false);
+          const subject = execFileSync('git', ['log', '-1', '--format=%s'], { cwd: workspace, encoding: 'utf8' });
+          expect(subject.startsWith('autoloop/iter-0:')).toBe(true);
+          const headBefore = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim();
+          const proofBefore = fs.readFileSync(path.join(workspace, AUTOLOOP_PROOF_RELPATH));
+          expect(proofBefore.toString()).toBe(AUTOLOOP_PROOF_BYTES);
+          const artifactBefore = Object.fromEntries(
+            required.map((name) => [name, fs.readFileSync(path.join(ledgerIter, name))]),
+          );
+
+          const actualFs = await vi.importActual<typeof import('node:fs')>('node:fs');
+          const sessionsPath = path.join(process.env.CLAWO_SESSIONS_DIR!, 'claude-sessions.json');
+          // Missing must not compare equal to an empty file: null vs Buffer.
+          // Snapshot the killed owner's on-disk bytes as they are — do not plant a row.
+          const registryBefore: Buffer | null = actualFs.existsSync(sessionsPath)
+            ? actualFs.readFileSync(sessionsPath)
+            : null;
+
+          createdConfigs = [];
+          mockSessions = [];
+          const resumeMgr = createManager();
+          const coderName = `autoloop-${runId}-coder`;
+          const startSession = resumeMgr.startSession.bind(resumeMgr);
+          const sendMessage = resumeMgr.sendMessage.bind(resumeMgr);
+          const startCalls: Array<Partial<SessionConfig> & { name?: string }> = [];
+          const sendCalls: string[] = [];
+          resumeMgr.startSession = async (config) => {
+            startCalls.push(config);
+            return startSession(config);
+          };
+          resumeMgr.sendMessage = async (name, message, options) => {
+            sendCalls.push(name);
+            return sendMessage(name, message, options);
+          };
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const origCreate = (resumeMgr as any)._createSession.bind(resumeMgr);
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          (resumeMgr as any)._createSession = (engine: string, config: SessionConfig): ISession => {
+            const mock = origCreate(engine, config) as MockSession;
+            if (config.name.endsWith('-reviewer')) {
+              mock.sendImplementation = async (message) => {
+                const text = typeof message === 'string' ? message : JSON.stringify(message);
+                expect(text).toContain('[review_request iter=0]');
+                return {
+                  text: '```autoloop\n{"tool":"review_complete","args":{"decision":"hold","metric":null,"audit_notes":"recovered from ledger"}}\n```',
+                  event: { type: 'result', result: 'ok' },
+                };
+              };
+            }
+            return mock;
+          };
+
+          // The module fs stub no-ops claude-sessions.json, which would hide a
+          // destructive write from the unmocked byte snapshot. For this resume
+          // window only, route that path through real disk I/O so a sync
+          // savePersistedSessions would change the snapshotted bytes.
+          const isClaudeSessionsPath = (p: unknown): boolean =>
+            typeof p === 'string' && p.includes('claude-sessions.json');
+          const prevExists = vi.mocked(fs.existsSync).getMockImplementation();
+          const prevRead = vi.mocked(fs.readFileSync).getMockImplementation();
+          const prevWrite = vi.mocked(fs.writeFileSync).getMockImplementation();
+          const prevRename = vi.mocked(fs.renameSync).getMockImplementation();
+          vi.mocked(fs.existsSync).mockImplementation((p: string) =>
+            isClaudeSessionsPath(p) ? actualFs.existsSync(p) : prevExists!(p),
+          );
+          vi.mocked(fs.readFileSync).mockImplementation((p: string, enc?: string) =>
+            isClaudeSessionsPath(p) ? actualFs.readFileSync(p, enc as BufferEncoding) : prevRead!(p, enc),
+          );
+          vi.mocked(fs.writeFileSync).mockImplementation((p: unknown, ...rest: unknown[]) => {
+            if (isClaudeSessionsPath(p)) {
+              (actualFs.writeFileSync as (...a: unknown[]) => void)(p, ...rest);
+              return;
+            }
+            return prevWrite!(p, ...rest);
+          });
+          vi.mocked(fs.renameSync).mockImplementation((from: unknown, to: unknown) => {
+            if (isClaudeSessionsPath(from) || isClaudeSessionsPath(to)) {
+              (actualFs.renameSync as (...a: unknown[]) => void)(from, to);
+              return;
+            }
+            return prevRename!(from, to);
+          });
+          vi.mocked(fs.writeFileSync).mockClear();
+          vi.mocked(fs.renameSync).mockClear();
+          vi.mocked(fs.writeFile).mockClear();
+          vi.mocked(fs.rename).mockClear();
+
+          const restoreSessionsFsMock = (): void => {
+            vi.mocked(fs.existsSync).mockImplementation(prevExists!);
+            vi.mocked(fs.readFileSync).mockImplementation(prevRead!);
+            vi.mocked(fs.writeFileSync).mockImplementation(prevWrite!);
+            vi.mocked(fs.renameSync).mockImplementation(prevRename!);
+          };
+
+          try {
+            await resumeMgr.autoloopResume(runId);
+            const verdictPath = path.join(ledgerIter, 'verdict.json');
+            await vi.waitFor(
+              () => {
+                expect(fs.existsSync(verdictPath)).toBe(true);
+              },
+              { timeout: 8_000, interval: 50 },
+            );
+            const reviewer = mockSessions.find((_, i) => createdConfigs[i]?.name.endsWith('-reviewer'));
+            const coder = mockSessions.find((_, i) => createdConfigs[i]?.name.endsWith('-coder'));
+            expect(reviewer?.sendCalls.some((c) => String(c.message).includes('[review_request iter=0]'))).toBe(true);
+            expect(coder?.sendCalls ?? []).toHaveLength(0);
+            expect(startCalls.map((c) => c.name)).not.toContain('autoloop-kill-owner-open-iter-coder');
+            expect(createdConfigs.map((c) => c.name)).not.toContain('autoloop-kill-owner-open-iter-coder');
+            expect(resumeMgr.hasSession(coderName)).toBe(false);
+            expect(resumeMgr.listSessions().some((s) => s.name === coderName)).toBe(false);
+            expect(startCalls.some((c) => c.name === coderName && c.resumeSessionId)).toBe(false);
+            expect(createdConfigs.some((c) => c.name === coderName && c.resumeSessionId)).toBe(false);
+            expect(sendCalls.filter((name) => name === coderName)).toHaveLength(0);
+            // Any mocked write/rename of the registry during resume fails even
+            // when the module stub would otherwise no-op the bytes. Real-disk
+            // pass-through is also live, so a sync save would break the snapshot.
+            const registryWriteSync = vi.mocked(fs.writeFileSync).mock.calls.filter((c) => isClaudeSessionsPath(c[0]));
+            const registryRenameSync = vi
+              .mocked(fs.renameSync)
+              .mock.calls.filter((c) => isClaudeSessionsPath(c[0]) || isClaudeSessionsPath(c[1]));
+            const registryWriteAsync = vi.mocked(fs.writeFile).mock.calls.filter((c) => isClaudeSessionsPath(c[0]));
+            const registryRenameAsync = vi
+              .mocked(fs.rename)
+              .mock.calls.filter((c) => isClaudeSessionsPath(c[0]) || isClaudeSessionsPath(c[1]));
+            expect(registryWriteSync, 'mocked writeFileSync of claude-sessions.json during resume').toEqual([]);
+            expect(registryRenameSync, 'mocked renameSync of claude-sessions.json during resume').toEqual([]);
+            expect(registryWriteAsync, 'mocked writeFile of claude-sessions.json during resume').toEqual([]);
+            expect(registryRenameAsync, 'mocked rename of claude-sessions.json during resume').toEqual([]);
+            const registryAfter: Buffer | null = actualFs.existsSync(sessionsPath)
+              ? actualFs.readFileSync(sessionsPath)
+              : null;
+            // Missing must stay missing — never treat absence as Buffer.alloc(0).
+            if (registryBefore === null) {
+              expect(registryAfter, 'missing claude-sessions.json must stay absent').toBeNull();
+            } else {
+              expect(registryAfter, 'claude-sessions.json must still exist after resume').not.toBeNull();
+              expect(registryAfter!.equals(registryBefore), 'historical registry bytes must be unchanged').toBe(true);
+            }
+            expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace, encoding: 'utf8' }).trim()).toBe(
+              headBefore,
+            );
+            expect(fs.readFileSync(path.join(workspace, AUTOLOOP_PROOF_RELPATH)).equals(proofBefore)).toBe(true);
+            for (const name of required) {
+              expect(fs.readFileSync(path.join(ledgerIter, name)).equals(artifactBefore[name])).toBe(true);
+            }
+          } finally {
+            // Restore the no-op stub before shutdown so a debounced/shutdown
+            // persist cannot rewrite the snapshotted registry after the assert.
+            restoreSessionsFsMock();
+            await resumeMgr.shutdown();
+          }
+        } finally {
+          await observer.shutdown();
+        }
+      }, 60_000);
+
+      it('plain autoloopResume starts only the Planner after abrupt loss with no open iteration', async () => {
+        const runId = 'kill-owner-planner-only';
+        const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+        initGitWorkspace(workspace);
+
+        const proc = spawnOwner(runId, workspace, 'planner-only');
+        await waitReadyThenSigkill(proc);
+
+        const observer = createManager();
+        try {
+          await vi.waitFor(
+            () => {
+              expect(leaseIsStale(readLease(runId))).toBe(true);
+              expect(observer.workflowStatus(runId).state).toBe('running');
+            },
+            { timeout: 5_000, interval: 50 },
+          );
+
+          createdConfigs = [];
+          mockSessions = [];
+          const resumeMgr = createManager();
+          try {
+            await resumeMgr.autoloopResume(runId);
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            expect(createdConfigs.map((c) => c.name)).toEqual([`autoloop-${runId}-planner`]);
+            expect(mockSessions).toHaveLength(1);
+            const auditPath = path.join(workspace, 'tasks', runId, 'decisions.jsonl');
+            const audit = fs.existsSync(auditPath) ? fs.readFileSync(auditPath, 'utf8') : '';
+            expect(audit).not.toMatch(/timeout_migration/);
+          } finally {
+            await resumeMgr.shutdown();
+          }
+        } finally {
+          await observer.shutdown();
+        }
+      }, 60_000);
+    });
+
     it('records the engines and models spawn_subagents actually chose', async () => {
       // Used to be written as a row into autoloop-registry.jsonl. It lands on
       // the run record now, which is what `autoloop_status` and a later resume
@@ -2623,25 +2870,22 @@ describe('SessionManager', () => {
       });
     });
 
-    it('awaits asynchronous engine shutdown before acknowledging stop', async () => {
-      await mgr.startSession({ name: 'app-stopping', cwd: '/tmp', engine: 'codex-app' });
-      let finish!: () => void;
-      vi.spyOn(lastMock(), 'stop').mockImplementation(
-        () =>
-          new Promise<void>((resolve) => {
-            finish = resolve;
-          }),
-      );
-      let stopped = false;
-      const stopping = mgr.stopSession('app-stopping').then(() => {
-        stopped = true;
-      });
-      await Promise.resolve();
-      expect(stopped).toBe(false);
-      finish();
-      await stopping;
-      expect(stopped).toBe(true);
-      expect(() => mgr.getStatus('app-stopping')).toThrow('not found');
+    // A long-lived session resumed by name after a restart keeps its compaction
+    // threshold; without it the setting silently lapsed on the first restart.
+    it('persists and restores autoCompactPercent', async () => {
+      await mgr.startSession({ name: 'ac-persist', cwd: '/tmp', engine: 'cursor', autoCompactPercent: 85 });
+      await mgr.stopSession('ac-persist', { keepPersisted: true });
+      await mgr.startSession({ name: 'ac-persist', cwd: '/tmp' });
+
+      expect(createdConfigs.at(-1)).toMatchObject({ engine: 'cursor', autoCompactPercent: 85 });
+    });
+
+    it('persists and restores chrome', async () => {
+      await mgr.startSession({ name: 'chrome-persist', cwd: '/tmp', engine: 'cursor', chrome: true });
+      await mgr.stopSession('chrome-persist', { keepPersisted: true });
+      await mgr.startSession({ name: 'chrome-persist', cwd: '/tmp' });
+
+      expect(createdConfigs.at(-1)).toMatchObject({ engine: 'cursor', chrome: true });
     });
 
     it('persists and restores the real Codex thread ID', async () => {
@@ -2657,51 +2901,6 @@ describe('SessionManager', () => {
         sandboxMode: 'read-only',
         resumeSessionId: '019c6dcb-93ad-7dc1-b531-418d213b8761',
       });
-    });
-
-    it('returns and persists the native codex-app ID before any turn and auto-resumes it', async () => {
-      const id = '019c6dcb-93ad-7dc1-b531-418d213b8761';
-      const info = await mgr.startSession({ name: 'app-persist', cwd: '/tmp', engine: 'codex-app' });
-      // The mock deliberately retains a synthetic wrapper sessionId. The manager
-      // must choose the engine-native identity even when those two values differ.
-      expect(info.claudeSessionId).toBe(id);
-      expect(info.stats.codexThreadId).toBe(id);
-      expect(mgr.listPersistedSessions().find((p) => p.name === 'app-persist')?.claudeSessionId).toBe(id);
-      const sent = await mgr.sendMessage('app-persist', 'hello');
-      expect(sent.sessionId).toBe(id);
-      await mgr.stopSession('app-persist', { keepPersisted: true });
-      const resumed = await mgr.startSession({ name: 'app-persist', cwd: '/tmp' });
-      expect(createdConfigs.at(-1)).toMatchObject({ engine: 'codex-app', resumeSessionId: id });
-      expect(resumed.claudeSessionId).toBe(id);
-    });
-
-    it.each(['model', 'tools'] as const)('keeps native codex-app identity across a %s restart', async (change) => {
-      const id = '019c6dcb-93ad-7dc1-b531-418d213b8761';
-      await mgr.startSession({ name: 'app-restart', cwd: '/tmp', engine: 'codex-app', model: 'gpt-6-astra' });
-      if (change === 'model') await mgr.switchModel('app-restart', 'gpt-6-sol');
-      else await mgr.updateTools('app-restart', { allowedTools: ['Read'] });
-      expect(createdConfigs.at(-1)?.resumeSessionId).toBe(id);
-      expect(mgr.getStatus('app-restart').claudeSessionId).toBe(id);
-    });
-
-    it('preserves a failed legacy resume record and releases its reserved session slot', async () => {
-      await mgr.startSession({ name: 'app-legacy', cwd: '/tmp', engine: 'codex-app' });
-      await mgr.stopSession('app-legacy', { keepPersisted: true });
-      const record = mgr.listPersistedSessions().find((p) => p.name === 'app-legacy')!;
-      record.claudeSessionId = 'codex-app-019c6dcb-legacy';
-      const slots = mgr.freeSessionSlots();
-      const start = vi
-        .spyOn(MockSession.prototype, 'start')
-        .mockRejectedValueOnce(new Error('Cannot resume codex-app wrapper ID; use stats.codexThreadId'));
-      try {
-        await expect(mgr.startSession({ name: 'app-legacy' })).rejects.toThrow('use stats.codexThreadId');
-        expect(createdConfigs.at(-1)?.resumeSessionId).toBe(record.claudeSessionId);
-        expect(mgr.listPersistedSessions().find((p) => p.name === 'app-legacy')).toEqual(record);
-        expect(mgr.freeSessionSlots()).toBe(slots);
-        expect(() => mgr.getStatus('app-legacy')).toThrow('not found');
-      } finally {
-        start.mockRestore();
-      }
     });
 
     it('persists the agy conversation UUID after first send and never the synthetic session ID', async () => {
@@ -2785,286 +2984,1839 @@ describe('SessionManager', () => {
     });
   });
 
-  describe('early native identity', () => {
-    it('ignores the synthetic OpenCode handle and binds the native id during send', async () => {
-      await mgr.startSession({ name: 'early-opencode', cwd: '/tmp', engine: 'opencode' });
-      const mock = lastMock();
-      const runId = sessionRunId(mgr, 'early-opencode');
-      expect(identityBoundEvents(runId)).toHaveLength(0);
-      mock.sendImplementation = async () => {
-        mock.opencodeSessionId = 'ses_native_early';
-        mock.sessionId = 'opencode-live-ses_native_early';
-        mock.emit(SESSION_EVENT.NATIVE_IDENTITY, 'ses_native_early');
-        expect(identityBoundEvents(runId)).toMatchObject([
-          { native_session_id: 'ses_native_early', agent_status: 'running' },
-        ]);
-        return { text: 'hello', event: { type: 'result' } };
+  // ─── Closed-ledger resume (S1 RED) + preserve controls (S1 GREEN) ─────
+  // Authorized test-only fixtures on pristine base src. NO production fix.
+  describe('closed-ledger-resume', () => {
+    const OWNER_CHILD = fileURLToPath(new URL('./helpers/autoloop-owner-child.ts', import.meta.url));
+    const MARKER = 'CLOSED_LEDGER_MALFORMED_MARKER_9f3c2a';
+
+    const fence = (tool: string, args: Record<string, unknown>): string =>
+      `\`\`\`autoloop\n${JSON.stringify({ tool, args })}\n\`\`\``;
+
+    const sha256Hex = (data: Buffer | string): string => {
+      const input = typeof data === 'string' ? Buffer.from(data) : data;
+      return createHash('sha256').update(input).digest('hex');
+    };
+
+    /** Observation-only fact line; must print before the first failing assertion. */
+    const s1Fact = (fields: Record<string, unknown>): void => {
+      // Paths in fields must already be workspace-relative; no secrets.
+      console.log(`S1_FACT ${JSON.stringify(fields)}`);
+    };
+
+    /**
+     * Capture logger console channels used by the default Logger (info/debug →
+     * console.log). Forward every call to the originals so S1_FACT stdout
+     * emission and vitest tee keep working.
+     */
+    const withCapturedConsoleLogs = async <T>(fn: () => Promise<T>): Promise<{ result: T; logText: string }> => {
+      const logChunks: string[] = [];
+      const origLog = console.log;
+      const origInfo = console.info;
+      const origWarn = console.warn;
+      const origError = console.error;
+      const captureAndForward =
+        (orig: (...a: unknown[]) => void) =>
+        (...args: unknown[]) => {
+          logChunks.push(args.map(String).join(' '));
+          orig(...args);
+        };
+      console.log = captureAndForward(origLog) as typeof console.log;
+      console.info = captureAndForward(origInfo) as typeof console.info;
+      console.warn = captureAndForward(origWarn) as typeof console.warn;
+      console.error = captureAndForward(origError) as typeof console.error;
+      try {
+        const result = await fn();
+        return { result, logText: logChunks.join('\n') };
+      } finally {
+        console.log = origLog;
+        console.info = origInfo;
+        console.warn = origWarn;
+        console.error = origError;
+      }
+    };
+
+    const initGitWorkspace = (workspace: string): void => {
+      fs.mkdirSync(workspace, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.email', 'autoloop-test@example.com'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.name', 'autoloop-test'], { cwd: workspace });
+      execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: workspace });
+      fs.writeFileSync(path.join(workspace, 'README.md'), 'workspace\n');
+      execFileSync('git', ['add', 'README.md'], { cwd: workspace });
+      execFileSync('git', ['commit', '-m', 'init'], { cwd: workspace });
+    };
+
+    const runJsonPath = (runId: string): string => path.join(TEST_WF_DIR, runId, 'run.json');
+
+    const relCheckpoint = (runId: string): string => `${runId}/run.json`;
+
+    const readPublishedState = (
+      manager: InstanceType<typeof SessionManager>,
+      runId: string,
+    ): { iter: number; metric_history: number[]; status: string; pending_dispatch: unknown } => {
+      const status = manager.workflowStatus(runId);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const state = (status.nodes.main?.data as any)?.state;
+      return {
+        iter: state?.iter ?? -1,
+        metric_history: Array.isArray(state?.metric_history) ? state.metric_history : [],
+        status: String(state?.status ?? status.state),
+        pending_dispatch: state?.pending_dispatch ?? null,
       };
-      const result = await mgr.sendMessage('early-opencode', 'hello');
-      expect(result.sessionId).toBe('ses_native_early');
-      expect(identityBoundEvents(runId)).toHaveLength(1);
-    });
+    };
 
-    it('publishes Claude init identity while the turn is still in flight', async () => {
-      await mgr.startSession({ name: 'early-claude', cwd: '/tmp', engine: 'claude' });
-      const mock = lastMock();
-      const runId = sessionRunId(mgr, 'early-claude');
-      mock.sendImplementation = async () => {
-        mock.sessionId = NATIVE_CURSOR_ID;
-        mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
-        expect(identityBoundEvents(runId).at(-1)).toMatchObject({
-          native_session_id: NATIVE_CURSOR_ID,
-          agent_status: 'running',
-        });
-        return { text: 'hello', event: { type: 'result' } };
-      };
-      await mgr.sendMessage('early-claude', 'hello');
-      expect(identityBoundEvents(runId).filter((e) => e.native_session_id === NATIVE_CURSOR_ID)).toHaveLength(1);
-    });
-
-    it('binds the exact Cursor chat id before the first turn completes', async () => {
-      await mgr.startSession({ name: 'early-native', cwd: '/tmp', engine: 'cursor' });
-      const mock = lastMock();
-      const runId = sessionRunId(mgr, 'early-native');
-      expect(identityBoundEvents(runId)).toHaveLength(0);
-
-      let boundDuringSend = 0;
-      mock.sendImplementation = async () => {
-        mock.cursorChatId = NATIVE_CURSOR_ID;
-        mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
-        const bound = identityBoundEvents(runId);
-        boundDuringSend = bound.length;
-        expect(bound[0]?.native_session_id).toBe(NATIVE_CURSOR_ID);
-        expect(bound[0]?.agent_status).toBe('running');
-        return { text: 'still going', event: { type: 'result', result: 'done' } };
-      };
-
-      const result = await mgr.sendMessage('early-native', 'hello');
-      expect(boundDuringSend).toBe(1);
-      expect(identityBoundEvents(runId)).toHaveLength(1);
-      expect(result.sessionId).toBe(NATIVE_CURSOR_ID);
-    });
-
-    it('keeps a single identity across repeated native_identity events', async () => {
-      await mgr.startSession({ name: 'repeat-native', cwd: '/tmp', engine: 'cursor' });
-      const mock = lastMock();
-      const runId = sessionRunId(mgr, 'repeat-native');
-      mock.cursorChatId = NATIVE_CURSOR_ID;
-      mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
-      mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
-      mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
-      const bound = identityBoundEvents(runId);
-      expect(bound).toHaveLength(1);
-      expect(bound[0]?.native_session_id).toBe(NATIVE_CURSOR_ID);
-    });
-
-    it('binds a same-thread Cursor resume at start and ignores the same id later', async () => {
-      await mgr.startSession({
-        name: 'resume-native',
-        cwd: '/tmp',
-        engine: 'cursor',
-        resumeSessionId: `cursor-live-${NATIVE_CURSOR_ID}`,
+    const recordCheckpointFact = (
+      test: string,
+      phase: string,
+      manager: InstanceType<typeof SessionManager> | null,
+      runId: string,
+    ): { iter: number; metric_history: number[]; bytes: Buffer; sha256: string; len: number } => {
+      const bytes = fs.existsSync(runJsonPath(runId)) ? fs.readFileSync(runJsonPath(runId)) : Buffer.alloc(0);
+      const published = manager
+        ? readPublishedState(manager, runId)
+        : { iter: -1, metric_history: [], status: 'n/a', pending_dispatch: null };
+      // Prefer live published state when a manager is attached; fall back to durable bytes.
+      let iter = published.iter;
+      let metric_history = published.metric_history;
+      let pending = published.pending_dispatch !== null && published.pending_dispatch !== undefined;
+      if (manager === null && bytes.length > 0) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const parsed = JSON.parse(bytes.toString('utf8')) as any;
+          const state = parsed?.nodes?.main?.data?.state;
+          iter = state?.iter ?? -1;
+          metric_history = Array.isArray(state?.metric_history) ? state.metric_history : [];
+          pending = state?.pending_dispatch != null;
+        } catch {
+          /* durable parse failure recorded via iter=-1 */
+        }
+      }
+      const sha = sha256Hex(bytes);
+      s1Fact({
+        test,
+        path: relCheckpoint(runId),
+        phase,
+        iter,
+        metric_history,
+        pending_dispatch: pending,
+        checkpoint_sha256: sha,
+        checkpoint_len: bytes.length,
       });
-      const runId = sessionRunId(mgr, 'resume-native');
-      expect(identityBoundEvents(runId).map((e) => e.native_session_id)).toEqual([NATIVE_CURSOR_ID]);
-      lastMock().emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
-      expect(identityBoundEvents(runId)).toHaveLength(1);
-    });
+      return { iter, metric_history, bytes, sha256: sha, len: bytes.length };
+    };
 
-    it('drops the native identity listener on stop', async () => {
-      await mgr.startSession({ name: 'detach-native', cwd: '/tmp', engine: 'cursor' });
-      const mock = lastMock();
-      const runId = sessionRunId(mgr, 'detach-native');
-      await mgr.stopSession('detach-native');
-      mock.cursorChatId = NATIVE_CURSOR_ID;
-      mock.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
-      expect(identityBoundEvents(runId)).toHaveLength(0);
-    });
+    const snapshotLedgerIter = (workspace: string, runId: string, uptoExclusive: number): Record<string, Buffer> => {
+      const out: Record<string, Buffer> = {};
+      for (let i = 0; i < uptoExclusive; i++) {
+        const dir = path.join(workspace, 'tasks', runId, 'iter', String(i));
+        if (!fs.existsSync(dir)) continue;
+        for (const name of fs.readdirSync(dir)) {
+          const p = path.join(dir, name);
+          if (fs.statSync(p).isFile()) out[`iter/${i}/${name}`] = fs.readFileSync(p);
+        }
+      }
+      return out;
+    };
 
-    it('rewires native identity after switchModel and ignores the old session', async () => {
-      await mgr.startSession({ name: 'switch-native', cwd: '/tmp', engine: 'cursor' });
-      const old = lastMock();
-      old.cursorChatId = NATIVE_CURSOR_ID;
-      old.setBusy(false);
-      await mgr.switchModel('switch-native', 'composer-2.5');
-      const runId = sessionRunId(mgr, 'switch-native');
-      const before = identityBoundEvents(runId).length;
-      expect(before).toBeGreaterThanOrEqual(1);
-      old.emit(SESSION_EVENT.NATIVE_IDENTITY, NATIVE_CURSOR_ID);
-      expect(identityBoundEvents(runId)).toHaveLength(before);
-    });
-  });
+    const ledgerFileShas = (workspace: string, runId: string, uptoExclusive: number): Record<string, string> => {
+      const snap = snapshotLedgerIter(workspace, runId, uptoExclusive);
+      const out: Record<string, string> = {};
+      for (const [k, v] of Object.entries(snap)) out[k] = sha256Hex(v);
+      return out;
+    };
 
-  describe('engine error guard', () => {
-    // EventEmitter throws an `error` event nobody listens for, which ends the host
-    // process. MockSession extends EventEmitter exactly as the real sessions do, so
-    // without the manager's listener these emits would throw out of the test.
+    /** Exact fixed refusal message (message property, not substring). */
+    const CLOSED_LEDGER_REFUSAL_MSG = 'Autoloop resume refused: ledger closed-prefix is incomplete or malformed';
 
-    it('survives an error event with no message and records it on the session', async () => {
-      await mgr.startSession({ name: 'guarded', cwd: '/tmp', engine: 'codex-app' });
-      const mock = lastMock();
-
-      expect(() => mock.emit(SESSION_EVENT.ERROR, new Error(''))).not.toThrow();
-      expect(() => mock.emit(SESSION_EVENT.ERROR, undefined)).not.toThrow();
-
-      const status = mgr.getStatus('guarded');
-      expect(status.health).toMatchObject({ state: 'degraded', errorCount: 2 });
-      expect(status.health?.lastError).toBe('engine reported an error without a message');
-      expect(status.health?.lastErrorAt).toBeTruthy();
-      expect(mgr.listSessions().find((s) => s.name === 'guarded')?.health?.errorCount).toBe(2);
-    });
-
-    it('reports no health for a session that has had no errors', async () => {
-      const info = await mgr.startSession({ name: 'quiet', cwd: '/tmp' });
-      expect(info.health).toBeUndefined();
-      expect(mgr.getStatus('quiet').health).toBeUndefined();
-      expect(mgr.health().details[0].health).toBeUndefined();
-    });
-
-    it('keeps other sessions working while one reports errors', async () => {
-      await mgr.startSession({ name: 'noisy', cwd: '/tmp', engine: 'codex-app' });
-      const noisy = lastMock();
-      await mgr.startSession({ name: 'steady', cwd: '/tmp', engine: 'codex-app' });
-
-      noisy.emit(SESSION_EVENT.ERROR, new Error('Transport channel closed'));
-
-      const reply = await mgr.sendMessage('steady', 'still there?');
-      expect(reply.output).toContain('still there?');
-      expect(mgr.getStatus('steady').health).toBeUndefined();
-      expect(mgr.getStatus('noisy').health?.lastError).toBe('Transport channel closed');
-    });
-
-    it('settles an in-flight turn normally, and a clean turn clears degraded', async () => {
-      await mgr.startSession({ name: 'inflight', cwd: '/tmp', engine: 'codex-app' });
-      const mock = lastMock();
-      mock.sendImplementation = async () => {
-        mock.emit(SESSION_EVENT.ERROR, new Error('mcp server unreachable'));
-        return { text: 'done anyway', event: { type: 'result', result: 'done' } };
+    const snapshotLedgerAll = (workspace: string, runId: string): Record<string, Buffer> => {
+      const root = path.join(workspace, 'tasks', runId);
+      const out: Record<string, Buffer> = {};
+      if (!fs.existsSync(root)) return out;
+      const walk = (dir: string, rel: string): void => {
+        for (const name of fs.readdirSync(dir).sort()) {
+          const p = path.join(dir, name);
+          const r = rel ? `${rel}/${name}` : name;
+          const st = fs.statSync(p);
+          if (st.isDirectory()) walk(p, r);
+          else if (st.isFile()) out[r] = fs.readFileSync(p);
+        }
       };
+      walk(root, '');
+      return out;
+    };
 
-      const result = await mgr.sendMessage('inflight', 'work');
-      expect(result.output).toBe('done anyway');
-      expect(result.error).toBeUndefined();
-      // The error was recorded during the turn; the turn then completed cleanly.
-      expect(mgr.getStatus('inflight').health).toMatchObject({ state: 'ok', errorCount: 1 });
-    });
+    const assertLedgerInventoryEqual = (before: Record<string, Buffer>, workspace: string, runId: string): void => {
+      const after = snapshotLedgerAll(workspace, runId);
+      expect(Object.keys(after).sort()).toEqual(Object.keys(before).sort());
+      for (const [k, v] of Object.entries(before)) {
+        expect(after[k]?.equals(v)).toBe(true);
+      }
+    };
 
-    it('lets a failing in-flight turn reject through the existing path', async () => {
-      await mgr.startSession({ name: 'inflight-fail', cwd: '/tmp', engine: 'codex-app' });
-      const mock = lastMock();
-      mock.sendImplementation = async () => {
-        mock.emit(SESSION_EVENT.ERROR, new Error('fatal'));
-        throw new Error('Codex app-server turn failed');
+    type CheckpointProgress = {
+      iter: number | undefined;
+      metric_history: number[];
+      pending_dispatch: unknown;
+    };
+
+    const readCheckpointProgress = (runId: string): CheckpointProgress => {
+      const p = runJsonPath(runId);
+      if (!fs.existsSync(p)) return { iter: undefined, metric_history: [], pending_dispatch: null };
+      const rec = JSON.parse(fs.readFileSync(p, 'utf8')) as {
+        nodes?: { main?: { data?: { state?: Record<string, unknown> } } };
       };
-      await expect(mgr.sendMessage('inflight-fail', 'work')).rejects.toThrow(/turn failed/);
-      expect(mgr.getStatus('inflight-fail').health).toMatchObject({ state: 'degraded', errorCount: 1 });
-      // The session is still usable afterwards.
-      mock.sendImplementation = undefined;
-      await expect(mgr.sendMessage('inflight-fail', 'again')).resolves.toBeTruthy();
-      expect(mgr.getStatus('inflight-fail').health?.state).toBe('ok');
+      const state = rec.nodes?.main?.data?.state;
+      return {
+        iter: typeof state?.iter === 'number' ? state.iter : undefined,
+        metric_history: Array.isArray(state?.metric_history) ? (state.metric_history as number[]) : [],
+        pending_dispatch: state?.pending_dispatch ?? null,
+      };
+    };
+
+    const worktreeGitSnapshot = (workspace: string): { head: string; porcelain: string } => ({
+      head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: workspace }).toString('utf8').trim(),
+      porcelain: execFileSync('git', ['status', '--porcelain'], { cwd: workspace }).toString('utf8'),
     });
 
-    it('marks a session failed when its engine is no longer ready, and keeps it failed', async () => {
-      await mgr.startSession({ name: 'dead', cwd: '/tmp', engine: 'codex-app' });
-      const mock = lastMock();
-      mock.setReady(false);
-      mock.emit(SESSION_EVENT.ERROR, new Error('app-server exited'));
-      expect(mgr.getStatus('dead').health).toMatchObject({ state: 'failed', errorCount: 1 });
-      // A later recovery of the flag does not hide that the engine died.
-      mock.setReady(true);
-      mock.emit(SESSION_EVENT.ERROR, new Error('again'));
-      expect(mgr.getStatus('dead').health?.state).toBe('failed');
-      expect(mgr.health().details.find((d) => d.name === 'dead')?.health?.state).toBe('failed');
+    type WireMode = 'auto-continue' | 'chat-driven';
+
+    const wireClosedLedgerSessions = (
+      manager: InstanceType<typeof SessionManager>,
+      workspace: string,
+      closeCount: number,
+      opts: {
+        mode?: WireMode;
+        afterClose?: 'idle' | 'directive-only';
+        directiveOnlyIter?: number;
+      } = {},
+    ): { coderSends: string[]; reviewerSends: string[]; plannerSends: string[]; plannerDirectives: number } => {
+      const mode: WireMode = opts.mode ?? 'auto-continue';
+      const coderSends: string[] = [];
+      const reviewerSends: string[] = [];
+      const plannerSends: string[] = [];
+      let plannerDirectives = 0;
+      let chatDrivenSpawned = false;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const origCreate = (manager as any)._createSession.bind(manager);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (manager as any)._createSession = (engine: string, config: SessionConfig): ISession => {
+        const mock = origCreate(engine, config) as MockSession;
+        if (config.name.endsWith('-planner')) {
+          mock.sendImplementation = async (message) => {
+            const text = typeof message === 'string' ? message : JSON.stringify(message);
+            plannerSends.push(text);
+            const isIterDone = /\[system\] iter \d+ done\./.test(text);
+            const isAck = text.includes('directive_ack') || text.includes('[system] coder');
+            const isChat = !isIterDone && !isAck;
+
+            if (mode === 'chat-driven') {
+              // Exactly one send_directive (or spawn+initial) per chat; plain text otherwise.
+              if (isIterDone || isAck) {
+                return { text: 'chat-driven: no control on iter_done/ack', event: { type: 'result', result: 'ok' } };
+              }
+              if (isChat) {
+                if (!chatDrivenSpawned) {
+                  chatDrivenSpawned = true;
+                  plannerDirectives += 1;
+                  return {
+                    text: fence('spawn_subagents', {
+                      initial_directive: {
+                        goal: 'close iteration 0',
+                        constraints: [],
+                        success_criteria: [],
+                        max_attempts: 1,
+                      },
+                    }),
+                    event: { type: 'result', result: 'ok' },
+                  };
+                }
+                plannerDirectives += 1;
+                return {
+                  text: fence('send_directive', {
+                    goal: 'chat-driven next iteration',
+                    constraints: [],
+                    success_criteria: [],
+                    max_attempts: 1,
+                  }),
+                  event: { type: 'result', result: 'ok' },
+                };
+              }
+              return { text: 'chat-driven: plain', event: { type: 'result', result: 'ok' } };
+            }
+
+            // auto-continue mode (R1, idempotency, partial, gap, malformed, boot, workflow)
+            const done = text.match(/\[system\] iter (\d+) done\./);
+            if (done) {
+              const finished = Number(done[1]);
+              const next = finished + 1;
+              if (opts.afterClose === 'directive-only' && opts.directiveOnlyIter === next) {
+                plannerDirectives += 1;
+                return {
+                  text: fence('send_directive', {
+                    goal: `directive-only trailing iter ${next}`,
+                    constraints: [],
+                    success_criteria: [],
+                    max_attempts: 1,
+                  }),
+                  event: { type: 'result', result: 'ok' },
+                };
+              }
+              if (next < closeCount) {
+                plannerDirectives += 1;
+                return {
+                  text: fence('send_directive', {
+                    goal: `close iteration ${next}`,
+                    constraints: [],
+                    success_criteria: [],
+                    max_attempts: 1,
+                  }),
+                  event: { type: 'result', result: 'ok' },
+                };
+              }
+              return { text: 'ledger closed', event: { type: 'result', result: 'ok' } };
+            }
+            if (isAck) {
+              return { text: 'ack noted', event: { type: 'result', result: 'ok' } };
+            }
+            plannerDirectives += 1;
+            return {
+              text: fence('spawn_subagents', {
+                initial_directive: {
+                  goal: 'close iteration 0',
+                  constraints: [],
+                  success_criteria: [],
+                  max_attempts: 1,
+                },
+              }),
+              event: { type: 'result', result: 'ok' },
+            };
+          };
+        } else if (config.name.endsWith('-coder')) {
+          mock.sendImplementation = async (message) => {
+            const text = typeof message === 'string' ? message : JSON.stringify(message);
+            coderSends.push(text);
+            if (opts.afterClose === 'directive-only' && opts.directiveOnlyIter !== undefined) {
+              const m = text.match(/\[directive iter=(\d+)\]/);
+              const iter = m ? Number(m[1]) : -1;
+              if (iter === opts.directiveOnlyIter) {
+                return { text: 'need clarification on trailing directive', event: { type: 'result', result: 'ok' } };
+              }
+            }
+            const m = text.match(/\[directive iter=(\d+)\]/);
+            const iter = m ? Number(m[1]) : 0;
+            const metric = 100 + iter;
+            fs.writeFileSync(path.join(workspace, `closed-${iter}.txt`), `closed-bytes-${iter}\n`);
+            return {
+              text: fence('iter_complete', {
+                summary: `closed iter ${iter}`,
+                eval_output: { metric, gates: [] },
+              }),
+              event: { type: 'result', result: 'ok' },
+            };
+          };
+        } else if (config.name.endsWith('-reviewer')) {
+          mock.sendImplementation = async (message) => {
+            const text = typeof message === 'string' ? message : JSON.stringify(message);
+            reviewerSends.push(text);
+            const m = text.match(/\[review_request iter=(\d+)\]/);
+            const iter = m ? Number(m[1]) : 0;
+            const metric = 100 + iter;
+            return {
+              text: fence('review_complete', {
+                decision: 'advance',
+                metric,
+                audit_notes: `advance ${iter}`,
+              }),
+              event: { type: 'result', result: 'ok' },
+            };
+          };
+        }
+        return mock;
+      };
+      return {
+        coderSends,
+        reviewerSends,
+        plannerSends,
+        get plannerDirectives() {
+          return plannerDirectives;
+        },
+      };
+    };
+
+    const closeLedger = async (
+      manager: InstanceType<typeof SessionManager>,
+      runId: string,
+      workspace: string,
+      closeCount: number,
+      opts: {
+        mode?: WireMode;
+        afterClose?: 'idle' | 'directive-only';
+        directiveOnlyIter?: number;
+      } = {},
+    ) => {
+      const tracks = wireClosedLedgerSessions(manager, workspace, closeCount, opts);
+      await manager.autoloopStart({ runId, workspace });
+      if (opts.mode === 'chat-driven') {
+        for (let i = 0; i < closeCount; i++) {
+          await manager.autoloopChat(runId, `chat-driven close step ${i}`);
+          await vi.waitFor(
+            () => {
+              expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', String(i), 'verdict.json'))).toBe(true);
+            },
+            { timeout: 15_000, interval: 50 },
+          );
+        }
+      } else {
+        await manager.autoloopChat(runId, `close ${closeCount} iterations`);
+        for (let i = 0; i < closeCount; i++) {
+          await vi.waitFor(
+            () => {
+              expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', String(i), 'verdict.json'))).toBe(true);
+            },
+            { timeout: 15_000, interval: 50 },
+          );
+        }
+        if (opts.afterClose === 'directive-only' && opts.directiveOnlyIter !== undefined) {
+          await vi.waitFor(
+            () => {
+              expect(
+                fs.existsSync(
+                  path.join(workspace, 'tasks', runId, 'iter', String(opts.directiveOnlyIter), 'directive.json'),
+                ),
+              ).toBe(true);
+            },
+            { timeout: 10_000, interval: 50 },
+          );
+        }
+      }
+      return tracks;
+    };
+
+    const terminateAndReconstruct = async (runId: string): Promise<InstanceType<typeof SessionManager>> => {
+      await mgr.autoloopStop(runId, 'closed-ledger-stop');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (mgr as any).kernel.wait(runId);
+      await mgr.shutdown();
+      mgr = createManager();
+      return mgr;
+    };
+
+    const spawnClosedOwner = (runId: string, workspace: string, closeCount: number): ChildProcess =>
+      spawn(process.execPath, ['--import', 'tsx', OWNER_CHILD], {
+        env: {
+          ...process.env,
+          AUTOLOOP_MODE: 'closed-iterations',
+          AUTOLOOP_CLOSE_COUNT: String(closeCount),
+          AUTOLOOP_RUN_ID: runId,
+          AUTOLOOP_WORKSPACE: workspace,
+          CLAWO_WF_DIR: TEST_WF_DIR,
+        },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+    const waitReadyThenSigkill = async (proc: ChildProcess): Promise<void> => {
+      let stderr = '';
+      proc.stderr?.on('data', (chunk: Buffer) => {
+        stderr += chunk.toString();
+      });
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error(`owner child never READY: ${stderr.slice(0, 800)}`)), 60_000);
+        proc.stdout?.on('data', (chunk: Buffer) => {
+          if (chunk.toString().includes('READY')) {
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        proc.on('exit', (code, signal) => {
+          clearTimeout(timer);
+          reject(new Error(`owner child exited before READY code=${String(code)} signal=${String(signal)} ${stderr}`));
+        });
+        proc.on('error', reject);
+      });
+      proc.kill('SIGKILL');
+      await new Promise<void>((resolve) => {
+        proc.on('exit', () => resolve());
+      });
+    };
+
+    beforeEach(() => {
+      vi.useRealTimers();
     });
 
-    it('reports a degraded session as failed once its engine has gone away', async () => {
-      await mgr.startSession({ name: 'went-away', cwd: '/tmp', engine: 'codex-app' });
-      const mock = lastMock();
-      mock.emit(SESSION_EVENT.ERROR, new Error('mcp unreachable'));
-      expect(mgr.getStatus('went-away').health?.state).toBe('degraded');
-      mock.setReady(false);
-      expect(mgr.getStatus('went-away').health?.state).toBe('failed');
-    });
+    it('R1 two-iteration shape: closed 0..1 then stop/reconstruct/resume restores iter 2 and metrics', async () => {
+      const test = 'R1-two-iterations';
+      const runId = 'closed-two-iterations-r1';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      const expectedMetrics = [100, 101];
 
-    it('catches an error reported during start(), before the session is registered', async () => {
+      await closeLedger(mgr, runId, workspace, 2);
+      const beforeStop = recordCheckpointFact(test, 'before-stop', mgr, runId);
+      expect(beforeStop.iter).toBe(2);
+      expect(beforeStop.metric_history).toEqual(expectedMetrics);
+
+      await terminateAndReconstruct(runId);
+      const storedBeforeResume = recordCheckpointFact(test, 'after-stop-before-resume', null, runId);
+      expect(storedBeforeResume.iter).toBe(2);
+      expect(storedBeforeResume.metric_history).toEqual(expectedMetrics);
+
+      wireClosedLedgerSessions(mgr, workspace, 2);
+      const after = await mgr.autoloopResume(runId);
+      const afterResume = recordCheckpointFact(test, 'after-resume', mgr, runId);
+      // Target behaviour (expected RED on base): resume continues at K+1 with rebuilt history.
+      expect(after.iter).toBe(2);
+      expect(after.metric_history).toEqual(expectedMetrics);
+      expect(afterResume.iter).toBe(2);
+      expect(beforeStop.sha256 === afterResume.sha256).toBe(false);
+    }, 60_000);
+
+    it('R2 six-iteration shape: closed 0..5, resume bytes, second fresh manager expects iter 6 only', async () => {
+      const test = 'R2-six-iterations';
+      const runId = 'closed-six-iterations-r2';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      const expectedMetrics = [100, 101, 102, 103, 104, 105];
+
+      // Phase 1: close 0..5 via chat-driven planner (one directive per chat).
+      const closeTracks = await closeLedger(mgr, runId, workspace, 6, { mode: 'chat-driven' });
+      s1Fact({
+        test,
+        path: 'planner',
+        phase: 'after-close',
+        plannerDirectives: closeTracks.plannerDirectives,
+        coderSends: closeTracks.coderSends.length,
+        reviewerSends: closeTracks.reviewerSends.length,
+      });
+
+      // Phase 2: before any stop, assert checkpoint current; record facts + ledger shas + commits.
+      const beforeStop = recordCheckpointFact(test, 'before-stop', mgr, runId);
+      expect(beforeStop.iter).toBe(6);
+      expect(beforeStop.metric_history).toEqual(expectedMetrics);
+      const ledgerShasBefore = ledgerFileShas(workspace, runId, 6);
+      s1Fact({ test, path: 'tasks/' + runId + '/iter', phase: 'before-stop-ledger-shas', shas: ledgerShasBefore });
+      const commitsBefore = execFileSync('git', ['log', '--format=%H %s'], { cwd: workspace, encoding: 'utf8' })
+        .trim()
+        .split('\n')
+        .filter((line) => line.includes('autoloop/iter-'));
+      s1Fact({ test, path: 'git', phase: 'before-stop-iter-commits', commits: commitsBefore });
+      expect(commitsBefore.length).toBe(6);
+
+      // Phase 3: stop, reconstruct, resume once — record published checkpoint as FACT ONLY.
+      await terminateAndReconstruct(runId);
+      wireClosedLedgerSessions(mgr, workspace, 6, { mode: 'chat-driven' });
+      const firstResume = await mgr.autoloopResume(runId);
+      const firstResumeFact = recordCheckpointFact(test, 'after-first-resume-fact-only', mgr, runId);
+      const publishedBytes = firstResumeFact.bytes;
+      s1Fact({
+        test,
+        path: relCheckpoint(runId),
+        phase: 'first-resume-returned-iter',
+        returned_iter: firstResume.iter,
+        returned_metrics: firstResume.metric_history,
+      });
+
+      await mgr.autoloopStop(runId, 'capture-bytes');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (mgr as any).kernel.wait(runId);
+      await mgr.shutdown();
+
+      // Phase 4–5: plant those bytes; second fresh manager; TARGET iter 6 (expected RED on base).
+      mgr = createManager();
+      fs.writeFileSync(runJsonPath(runId), publishedBytes);
+      const tracks = wireClosedLedgerSessions(mgr, workspace, 6, { mode: 'chat-driven' });
+      const second = await mgr.autoloopResume(runId);
+      recordCheckpointFact(test, 'after-second-resume', mgr, runId);
+      expect(second.iter).toBe(6);
+      // NOT REACHED on base after the tip-reset assertion above fails:
+      // expect(second.metric_history).toEqual(expectedMetrics)
+      // one chat → only iter/6, one coder, one reviewer with 6 prior_metrics
+      // iter/0..5 byte-identical; six iteration commits still present
+      expect(second.metric_history).toEqual(expectedMetrics);
+
+      const coderBefore = tracks.coderSends.length;
+      const reviewerBefore = tracks.reviewerSends.length;
+      const plannerName = `autoloop-${runId}-planner`;
+      const planner = mockSessions.find((_, i) => createdConfigs[i]?.name === plannerName);
+      expect(planner).toBeDefined();
+      // One chat → exactly one send_directive (chat-driven already enforces this).
+      await mgr.autoloopChat(runId, 'open only the next iteration');
+      await vi.waitFor(
+        () => {
+          expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '6', 'directive.json'))).toBe(true);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+      await vi.waitFor(
+        () => {
+          expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '6', 'verdict.json'))).toBe(true);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+      expect(tracks.coderSends.length - coderBefore).toBe(1);
+      expect(tracks.reviewerSends.length - reviewerBefore).toBe(1);
+      const lastReview = tracks.reviewerSends[tracks.reviewerSends.length - 1] ?? '';
+      // prior_metrics rebuilt with six closed metrics
+      for (const m of expectedMetrics) {
+        expect(lastReview).toContain(String(m));
+      }
+      const ledgerShasAfter = ledgerFileShas(workspace, runId, 6);
+      for (const [k, v] of Object.entries(ledgerShasBefore)) {
+        expect(ledgerShasAfter[k], k).toBe(v);
+      }
+      const commitsAfter = execFileSync('git', ['log', '--format=%H %s'], { cwd: workspace, encoding: 'utf8' })
+        .trim()
+        .split('\n')
+        .filter((line) => /autoloop\/iter-[0-5]:/.test(line));
+      expect(commitsAfter.length).toBe(6);
+    }, 180_000);
+
+    it('idempotency: two consecutive resumes yield the same state and write no ledger bytes', async () => {
+      const test = 'idempotency';
+      const runId = 'closed-idempotent';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await closeLedger(mgr, runId, workspace, 2);
+      recordCheckpointFact(test, 'before-stop', mgr, runId);
+      await terminateAndReconstruct(runId);
+      wireClosedLedgerSessions(mgr, workspace, 2);
+      const ledgerBefore = snapshotLedgerIter(workspace, runId, 2);
+      const a = await mgr.autoloopResume(runId);
+      recordCheckpointFact(test, 'after-first-resume', mgr, runId);
+      const mid = snapshotLedgerIter(workspace, runId, 2);
+      const b = await mgr.autoloopResume(runId);
+      recordCheckpointFact(test, 'after-second-resume', mgr, runId);
+      expect(a.iter).toBe(2);
+      expect(b.iter).toBe(2);
+      expect(a.metric_history).toEqual([100, 101]);
+      expect(b.metric_history).toEqual(a.metric_history);
+      for (const [k, v] of Object.entries(ledgerBefore)) {
+        expect(mid[k]?.equals(v), `after first resume ${k}`).toBe(true);
+        expect(snapshotLedgerIter(workspace, runId, 2)[k]?.equals(v), `after second resume ${k}`).toBe(true);
+      }
+    }, 60_000);
+
+    it('partial trailing directive-only iter/K+1: resume expects K+1 and no Coder retry', async () => {
+      const test = 'partial-directive-only';
+      const runId = 'closed-directive-only';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      const tracks = await closeLedger(mgr, runId, workspace, 2, {
+        afterClose: 'directive-only',
+        directiveOnlyIter: 2,
+      });
+      recordCheckpointFact(test, 'before-stop', mgr, runId);
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '2', 'directive.json'))).toBe(true);
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '2', 'verdict.json'))).toBe(false);
+      const coderBefore = tracks.coderSends.length;
+
+      await terminateAndReconstruct(runId);
+      const tracks2 = wireClosedLedgerSessions(mgr, workspace, 2);
+      const after = await mgr.autoloopResume(runId);
+      recordCheckpointFact(test, 'after-resume', mgr, runId);
+      expect(after.iter).toBe(2);
+      expect(tracks2.coderSends.length).toBe(0);
+      expect(tracks.coderSends.length).toBe(coderBefore);
+    }, 60_000);
+
+    it('owner-loss path: closed iterations then SIGKILL, reconstruct + resume restores tip', async () => {
+      const test = 'owner-loss';
+      const runId = 'closed-owner-loss';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      const proc = spawnClosedOwner(runId, workspace, 2);
+      await waitReadyThenSigkill(proc);
+
+      const observer = createManager();
+      try {
+        await vi.waitFor(
+          () => {
+            expect(leaseIsStale(readLease(runId))).toBe(true);
+            expect(observer.workflowStatus(runId).state).toBe('running');
+          },
+          { timeout: 5_000, interval: 50 },
+        );
+        const beforeKill = recordCheckpointFact(test, 'before-resume-after-kill', observer, runId);
+        expect(beforeKill.iter).toBe(2);
+        expect(beforeKill.metric_history).toEqual([100, 101]);
+
+        createdConfigs = [];
+        mockSessions = [];
+        const resumeMgr = createManager();
+        try {
+          wireClosedLedgerSessions(resumeMgr, workspace, 2);
+          const after = await resumeMgr.autoloopResume(runId);
+          recordCheckpointFact(test, 'after-resume', resumeMgr, runId);
+          expect(after.iter).toBe(2);
+          expect(after.metric_history).toEqual([100, 101]);
+        } finally {
+          await resumeMgr.shutdown();
+        }
+      } finally {
+        await observer.shutdown();
+      }
+    }, 90_000);
+
+    it('workflowResume on terminal closed run records unreachable', async () => {
+      const test = 'workflowResume-unreachable';
+      const runId = 'closed-workflow-resume';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await closeLedger(mgr, runId, workspace, 2);
+      await terminateAndReconstruct(runId);
+      const before = recordCheckpointFact(test, 'before-workflowResume', null, runId);
+      const plannerStartsBefore = createdConfigs.filter((c) => c.name.endsWith('-planner')).length;
+      await mgr.workflowResume(runId);
+      const after = recordCheckpointFact(test, 'after-workflowResume', null, runId);
+      const plannerStartsAfter = createdConfigs.filter((c) => c.name.endsWith('-planner')).length;
+      s1Fact({
+        test,
+        path: 'workflowResume',
+        phase: 'reachability',
+        reachable: false,
+        planner_starts_before: plannerStartsBefore,
+        planner_starts_after: plannerStartsAfter,
+        checkpoint_unchanged: before.sha256 === after.sha256,
+      });
+      // Direct unreachability asserts (not a tip-restore success).
+      expect(plannerStartsAfter).toBe(plannerStartsBefore);
+      expect(after.sha256).toBe(before.sha256);
+      expect(before.iter).toBe(2);
+    }, 60_000);
+
+    it('gap fixture: closed 0..1 with closed iter/3 marker; no iter/2', async () => {
+      const test = 'gap-marker';
+      const runId = 'closed-gap-marker';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await closeLedger(mgr, runId, workspace, 2);
+      // Gap: no iter/2; correctly shaped closed iter/3 with marker in a string field.
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '2'))).toBe(false);
+      const iter3 = path.join(workspace, 'tasks', runId, 'iter', '3');
+      fs.mkdirSync(iter3, { recursive: true });
+      fs.writeFileSync(
+        path.join(iter3, 'directive.json'),
+        JSON.stringify({
+          schema_version: 1,
+          iter: 3,
+          goal: 'gap',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
+      );
+      fs.writeFileSync(
+        path.join(iter3, 'eval_output.json'),
+        JSON.stringify({ schema_version: 1, iter: 3, eval_output: { metric: 103, gates: [] } }),
+      );
+      fs.writeFileSync(path.join(iter3, 'coder_summary.txt'), 'gap planted\n');
+      fs.writeFileSync(path.join(iter3, 'diff.patch'), '');
+      const verdict3 = {
+        schema_version: 1,
+        iter: 3,
+        decision: 'advance',
+        metric: 103,
+        audit_notes: `gap fixture contains ${MARKER}`,
+      };
+      fs.writeFileSync(path.join(iter3, 'verdict.json'), JSON.stringify(verdict3, null, 2));
+      const markerLedgerSha = sha256Hex(fs.readFileSync(path.join(iter3, 'verdict.json')));
+      s1Fact({
+        test,
+        path: `tasks/${runId}/iter/3/verdict.json`,
+        phase: 'planted',
+        sha256: markerLedgerSha,
+        has_marker: true,
+      });
+
+      const acceptedHistoryBefore = snapshotLedgerIter(workspace, runId, 2);
+      const sessionsBeforeReset = createdConfigs.length;
+      const specPath = path.join(TEST_WF_DIR, runId, 'spec.json');
+
+      await terminateAndReconstruct(runId);
+      createdConfigs = [];
+      mockSessions = [];
+      const sessionsAfterReset = createdConfigs.length;
+      // Snapshot immediately before refusal attempt (after stop/reconstruct).
+      const ledgerAllBefore = snapshotLedgerAll(workspace, runId);
+      const progressBefore = readCheckpointProgress(runId);
+      const checkpointEnvelopeBefore = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const specBefore = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitBefore = worktreeGitSnapshot(workspace);
+      wireClosedLedgerSessions(mgr, workspace, 2);
+      const { result: resumeOutcome, logText } = await withCapturedConsoleLogs(async () => {
+        let resumeErr: unknown = null;
+        let after: { iter: number; metric_history: number[] } | null = null;
+        try {
+          after = await mgr.autoloopResume(runId);
+        } catch (err) {
+          resumeErr = err;
+        }
+        return { resumeErr, after };
+      });
+      const { resumeErr, after } = resumeOutcome;
+      const sessionsAfterResumeAttempt = createdConfigs.length;
+
+      const errMessage = resumeErr instanceof Error ? resumeErr.message : '';
+      const errText =
+        resumeErr instanceof Error ? `${resumeErr.message}\n${resumeErr.stack ?? ''}` : String(resumeErr ?? '');
+      const statusText = JSON.stringify(mgr.autoloopStatus(runId) ?? null);
+      const checkpointEnvelopeAfter = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const progressImmediate = readCheckpointProgress(runId);
+      const specAfter = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitImmediate = worktreeGitSnapshot(workspace);
+      const markerStillInLedger = fs.readFileSync(path.join(iter3, 'verdict.json'), 'utf8').includes(MARKER);
+      const markerShaUnchanged = sha256Hex(fs.readFileSync(path.join(iter3, 'verdict.json'))) === markerLedgerSha;
+
+      const markerInError = errText.includes(MARKER);
+      const markerInLogs = logText.includes(MARKER);
+      const markerInStatus = statusText.includes(MARKER);
+      const markerInCheckpoint = checkpointEnvelopeAfter.toString('utf8').includes(MARKER);
+      s1Fact({
+        test,
+        path: 'marker-checks',
+        phase: 'after-resume',
+        resumeThrew: Boolean(resumeErr),
+        markerInError,
+        markerInLogs,
+        markerInStatus,
+        markerInCheckpoint,
+        markerStillInLedger,
+        markerShaUnchanged,
+        captured_console_log: true,
+        returned_iter: after?.iter ?? null,
+        sessions_before_reset: sessionsBeforeReset,
+        sessions_after_reset: sessionsAfterReset,
+        sessions_after_resume_attempt: sessionsAfterResumeAttempt,
+      });
+      expect(markerInError).toBe(false);
+      expect(markerInLogs).toBe(false);
+      expect(markerInStatus).toBe(false);
+      expect(markerInCheckpoint).toBe(false);
+      expect(markerStillInLedger).toBe(true);
+      expect(markerShaUnchanged).toBe(true);
+
+      expect(resumeErr).toBeInstanceOf(Error);
+      expect(errMessage).toBe(CLOSED_LEDGER_REFUSAL_MSG);
+      expect(sessionsAfterReset).toBe(0);
+      expect(sessionsAfterResumeAttempt).toBe(0);
+      expect(createdConfigs.length).toBe(0);
+      expect(specAfter.equals(specBefore)).toBe(true);
+      expect(gitImmediate).toEqual(gitBefore);
+      assertLedgerInventoryEqual(ledgerAllBefore, workspace, runId);
+      // Checkpoint PROGRESS preserved (envelope lifecycle may rewrite run.json).
+      expect(progressImmediate).toEqual(progressBefore);
+      s1Fact({
+        test,
+        path: 'preservation',
+        phase: 'immediate-after-refusal',
+        progress_before: progressBefore,
+        progress_immediate: progressImmediate,
+        progress_equal: JSON.stringify(progressImmediate) === JSON.stringify(progressBefore),
+        envelope_bytes_equal: checkpointEnvelopeAfter.equals(checkpointEnvelopeBefore),
+        envelope_lifecycle_rewrite_without_progress_loss:
+          !checkpointEnvelopeAfter.equals(checkpointEnvelopeBefore) &&
+          JSON.stringify(progressImmediate) === JSON.stringify(progressBefore),
+        spec_bytes_equal: specAfter.equals(specBefore),
+        worktree_git_equal: gitImmediate.head === gitBefore.head && gitImmediate.porcelain === gitBefore.porcelain,
+        sessions_after_resume_attempt: sessionsAfterResumeAttempt,
+      });
+
+      await vi.waitFor(
+        () => {
+          expect(['failed', 'cancelled', 'succeeded']).toContain(mgr.workflowStatus(runId).state);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+      const settled = mgr.workflowStatus(runId);
+      const progressSettled = readCheckpointProgress(runId);
+      const checkpointEnvelopeSettled = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const specSettled = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitSettled = worktreeGitSnapshot(workspace);
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'settled-after-refusal',
+        record_state: settled.state,
+        main_node_state: settled.nodes?.main?.state,
+        progress_before: progressBefore,
+        progress_settled: progressSettled,
+        progress_equal: JSON.stringify(progressSettled) === JSON.stringify(progressBefore),
+        envelope_bytes_equal: checkpointEnvelopeSettled.equals(checkpointEnvelopeBefore),
+        envelope_lifecycle_rewrite_without_progress_loss:
+          !checkpointEnvelopeSettled.equals(checkpointEnvelopeBefore) &&
+          JSON.stringify(progressSettled) === JSON.stringify(progressBefore),
+        spec_unchanged: specBefore.equals(specSettled),
+      });
+      expect(settled.state).toBe('failed');
+      expect(settled.nodes?.main?.state).toBe('failed');
+      expect(progressSettled).toEqual(progressBefore);
+      expect(specSettled.equals(specBefore)).toBe(true);
+      expect(gitSettled).toEqual(gitBefore);
+      assertLedgerInventoryEqual(ledgerAllBefore, workspace, runId);
+
+      // Temp-fixture repair only: remove gapped iter/3, then fresh-manager retry restores tip.
+      fs.rmSync(path.join(workspace, 'tasks', runId, 'iter', '3'), { recursive: true, force: true });
+      const acceptedAfterRepairPlant = snapshotLedgerIter(workspace, runId, 2);
+      expect(Object.keys(acceptedAfterRepairPlant).sort()).toEqual(Object.keys(acceptedHistoryBefore).sort());
+      for (const [k, v] of Object.entries(acceptedHistoryBefore)) {
+        expect(acceptedAfterRepairPlant[k]?.equals(v)).toBe(true);
+      }
+      await mgr.shutdown();
+      mgr = createManager();
+      createdConfigs = [];
+      mockSessions = [];
+      const tracks = wireClosedLedgerSessions(mgr, workspace, 2);
+      const repaired = await mgr.autoloopResume(runId);
+      await new Promise((r) => setTimeout(r, 300));
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'after-repaired-retry',
+        resumed_iter: repaired.iter,
+        resumed_metrics: repaired.metric_history,
+        coder_sends: tracks.coderSends.length,
+        reviewer_sends: tracks.reviewerSends.length,
+        planner_directives: tracks.plannerDirectives,
+      });
+      expect(repaired.iter).toBe(2);
+      expect(repaired.metric_history).toEqual([100, 101]);
+      expect(tracks.coderSends).toEqual([]);
+      expect(tracks.reviewerSends).toEqual([]);
+      expect(tracks.plannerDirectives).toBe(0);
+      const acceptedAfterRetry = snapshotLedgerIter(workspace, runId, 2);
+      for (const [k, v] of Object.entries(acceptedHistoryBefore)) {
+        expect(acceptedAfterRetry[k]?.equals(v)).toBe(true);
+      }
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '2'))).toBe(false);
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '3'))).toBe(false);
+    }, 90_000);
+
+    it('malformed fixture: closed 0..1 with invalid JSON verdict marker at iter/2', async () => {
+      const test = 'malformed-marker';
+      const runId = 'closed-malformed-marker';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await closeLedger(mgr, runId, workspace, 2);
+      const badDir = path.join(workspace, 'tasks', runId, 'iter', '2');
+      fs.mkdirSync(badDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(badDir, 'directive.json'),
+        JSON.stringify({
+          schema_version: 1,
+          iter: 2,
+          goal: 'malformed',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
+      );
+      const badVerdict = `{not-json ${MARKER}`;
+      fs.writeFileSync(path.join(badDir, 'verdict.json'), badVerdict);
+      const markerLedgerSha = sha256Hex(Buffer.from(badVerdict));
+      s1Fact({ test, path: `tasks/${runId}/iter/2/verdict.json`, phase: 'planted', sha256: markerLedgerSha });
+
+      const acceptedHistoryBefore = snapshotLedgerIter(workspace, runId, 2);
+      const sessionsBeforeReset = createdConfigs.length;
+      const specPath = path.join(TEST_WF_DIR, runId, 'spec.json');
+
+      await terminateAndReconstruct(runId);
+      createdConfigs = [];
+      mockSessions = [];
+      const sessionsAfterReset = createdConfigs.length;
+      const ledgerAllBefore = snapshotLedgerAll(workspace, runId);
+      const progressBefore = readCheckpointProgress(runId);
+      const checkpointEnvelopeBefore = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const specBefore = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitBefore = worktreeGitSnapshot(workspace);
+      wireClosedLedgerSessions(mgr, workspace, 2);
+      const { result: resumeOutcome, logText } = await withCapturedConsoleLogs(async () => {
+        let resumeErr: unknown = null;
+        let after: { iter: number; metric_history: number[] } | null = null;
+        try {
+          after = await mgr.autoloopResume(runId);
+        } catch (err) {
+          resumeErr = err;
+        }
+        return { resumeErr, after };
+      });
+      const { resumeErr, after } = resumeOutcome;
+      const sessionsAfterResumeAttempt = createdConfigs.length;
+
+      const errMessage = resumeErr instanceof Error ? resumeErr.message : '';
+      const errText =
+        resumeErr instanceof Error ? `${resumeErr.message}\n${resumeErr.stack ?? ''}` : String(resumeErr ?? '');
+      const statusText = JSON.stringify(mgr.autoloopStatus(runId) ?? null);
+      const checkpointEnvelopeAfter = fs.existsSync(runJsonPath(runId))
+        ? fs.readFileSync(runJsonPath(runId))
+        : Buffer.alloc(0);
+      const progressImmediate = readCheckpointProgress(runId);
+      const specAfter = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitImmediate = worktreeGitSnapshot(workspace);
+      const markerStillInLedger = fs.readFileSync(path.join(badDir, 'verdict.json'), 'utf8').includes(MARKER);
+      const markerShaUnchanged = sha256Hex(fs.readFileSync(path.join(badDir, 'verdict.json'))) === markerLedgerSha;
+
+      const markerInError = errText.includes(MARKER);
+      const markerInLogs = logText.includes(MARKER);
+      const markerInStatus = statusText.includes(MARKER);
+      const markerInCheckpoint = checkpointEnvelopeAfter.toString('utf8').includes(MARKER);
+      s1Fact({
+        test,
+        path: 'marker-checks',
+        phase: 'after-resume',
+        resumeThrew: Boolean(resumeErr),
+        markerInError,
+        markerInLogs,
+        markerInStatus,
+        markerInCheckpoint,
+        markerStillInLedger,
+        markerShaUnchanged,
+        captured_console_log: true,
+        returned_iter: after?.iter ?? null,
+        sessions_before_reset: sessionsBeforeReset,
+        sessions_after_reset: sessionsAfterReset,
+        sessions_after_resume_attempt: sessionsAfterResumeAttempt,
+      });
+      expect(markerInError).toBe(false);
+      expect(markerInLogs).toBe(false);
+      expect(markerInStatus).toBe(false);
+      expect(markerInCheckpoint).toBe(false);
+      expect(markerStillInLedger).toBe(true);
+      expect(markerShaUnchanged).toBe(true);
+
+      // Independent early-refusal evidence for the malformed fixture (not inferred from gap).
+      expect(resumeErr).toBeInstanceOf(Error);
+      expect(errMessage).toBe(CLOSED_LEDGER_REFUSAL_MSG);
+      expect(sessionsAfterReset).toBe(0);
+      expect(sessionsAfterResumeAttempt).toBe(0);
+      expect(createdConfigs.length).toBe(0);
+      expect(specAfter.equals(specBefore)).toBe(true);
+      expect(gitImmediate).toEqual(gitBefore);
+      assertLedgerInventoryEqual(ledgerAllBefore, workspace, runId);
+      expect(fs.readFileSync(path.join(badDir, 'verdict.json'), 'utf8')).toBe(badVerdict);
+      expect(progressImmediate).toEqual(progressBefore);
+      s1Fact({
+        test,
+        path: 'preservation',
+        phase: 'immediate-after-refusal',
+        progress_before: progressBefore,
+        progress_immediate: progressImmediate,
+        progress_equal: JSON.stringify(progressImmediate) === JSON.stringify(progressBefore),
+        envelope_bytes_equal: checkpointEnvelopeAfter.equals(checkpointEnvelopeBefore),
+        envelope_lifecycle_rewrite_without_progress_loss:
+          !checkpointEnvelopeAfter.equals(checkpointEnvelopeBefore) &&
+          JSON.stringify(progressImmediate) === JSON.stringify(progressBefore),
+        spec_bytes_equal: specAfter.equals(specBefore),
+        worktree_git_equal: gitImmediate.head === gitBefore.head && gitImmediate.porcelain === gitBefore.porcelain,
+        sessions_after_resume_attempt: sessionsAfterResumeAttempt,
+      });
+
+      await vi.waitFor(
+        () => {
+          expect(['failed', 'cancelled', 'succeeded']).toContain(mgr.workflowStatus(runId).state);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+      const settled = mgr.workflowStatus(runId);
+      const progressSettled = readCheckpointProgress(runId);
+      const checkpointEnvelopeSettled = fs.readFileSync(runJsonPath(runId));
+      const specSettled = fs.existsSync(specPath) ? fs.readFileSync(specPath) : Buffer.alloc(0);
+      const gitSettled = worktreeGitSnapshot(workspace);
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'settled-after-refusal',
+        record_state: settled.state,
+        main_node_state: settled.nodes?.main?.state,
+        progress_before: progressBefore,
+        progress_settled: progressSettled,
+        progress_equal: JSON.stringify(progressSettled) === JSON.stringify(progressBefore),
+        envelope_bytes_equal: checkpointEnvelopeSettled.equals(checkpointEnvelopeBefore),
+        envelope_lifecycle_rewrite_without_progress_loss:
+          !checkpointEnvelopeSettled.equals(checkpointEnvelopeBefore) &&
+          JSON.stringify(progressSettled) === JSON.stringify(progressBefore),
+        spec_unchanged: specBefore.equals(specSettled),
+      });
+      expect(settled.state).toBe('failed');
+      expect(settled.nodes?.main?.state).toBe('failed');
+      expect(progressSettled).toEqual(progressBefore);
+      expect(specSettled.equals(specBefore)).toBe(true);
+      expect(gitSettled).toEqual(gitBefore);
+      assertLedgerInventoryEqual(ledgerAllBefore, workspace, runId);
+
+      // Temp-fixture repair: remove malformed iter/2, fresh-manager retry restores tip.
+      fs.rmSync(badDir, { recursive: true, force: true });
+      const acceptedAfterRepairPlant = snapshotLedgerIter(workspace, runId, 2);
+      for (const [k, v] of Object.entries(acceptedHistoryBefore)) {
+        expect(acceptedAfterRepairPlant[k]?.equals(v)).toBe(true);
+      }
+      await mgr.shutdown();
+      mgr = createManager();
+      createdConfigs = [];
+      mockSessions = [];
+      const tracks = wireClosedLedgerSessions(mgr, workspace, 2);
+      const repaired = await mgr.autoloopResume(runId);
+      await new Promise((r) => setTimeout(r, 300));
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'after-repaired-retry',
+        resumed_iter: repaired.iter,
+        resumed_metrics: repaired.metric_history,
+        coder_sends: tracks.coderSends.length,
+        reviewer_sends: tracks.reviewerSends.length,
+        planner_directives: tracks.plannerDirectives,
+      });
+      expect(repaired.iter).toBe(2);
+      expect(repaired.metric_history).toEqual([100, 101]);
+      expect(tracks.coderSends).toEqual([]);
+      expect(tracks.reviewerSends).toEqual([]);
+      expect(tracks.plannerDirectives).toBe(0);
+      const acceptedAfterRetry = snapshotLedgerIter(workspace, runId, 2);
+      for (const [k, v] of Object.entries(acceptedHistoryBefore)) {
+        expect(acceptedAfterRetry[k]?.equals(v)).toBe(true);
+      }
+      expect(fs.existsSync(badDir)).toBe(false);
+    }, 90_000);
+
+    // K=-1 / no-valid-closed-prefix: missing or open (or malformed) iter/0 plus a
+    // later canonical dir must Planner-only resume — same as exact base — before
+    // any gap refusal. Valid-prefix gap/malformed fixtures above stay refuse.
+    for (const mode of ['missing-zero', 'open-zero', 'malformed-zero'] as const) {
+      it(`prefixless ${mode} with later iter/1: no restore no refusal (Planner-only)`, async () => {
+        const runId = `closed-prefixless-${mode}-later1`;
+        const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+        initGitWorkspace(workspace);
+        await mgr.autoloopStart({ runId, workspace });
+        const iterRoot = path.join(workspace, 'tasks', runId, 'iter');
+        fs.mkdirSync(path.join(iterRoot, '1'), { recursive: true });
+        if (mode !== 'missing-zero') {
+          fs.mkdirSync(path.join(iterRoot, '0'), { recursive: true });
+          fs.writeFileSync(
+            path.join(iterRoot, '0', 'directive.json'),
+            JSON.stringify({
+              schema_version: 1,
+              iter: 0,
+              goal: mode,
+              constraints: [],
+              success_criteria: [],
+              max_attempts: 1,
+            }),
+          );
+          if (mode === 'malformed-zero') {
+            fs.writeFileSync(path.join(iterRoot, '0', 'verdict.json'), `{not-json ${MARKER}`);
+          }
+        }
+        await terminateAndReconstruct(runId);
+        createdConfigs = [];
+        mockSessions = [];
+        wireClosedLedgerSessions(mgr, workspace, 0);
+        let resumeErr: unknown = null;
+        let after: { iter: number; metric_history: number[] } | null = null;
+        try {
+          after = await mgr.autoloopResume(runId);
+        } catch (err) {
+          resumeErr = err;
+        }
+        expect(resumeErr).toBeNull();
+        expect(after?.iter).toBe(0);
+        expect(after?.metric_history).toEqual([]);
+        expect(createdConfigs.map((c) => c.name)).toEqual([`autoloop-${runId}-planner`]);
+      }, 60_000);
+    }
+
+    it('boot throw on resume: records base RunRecord state via existing planner-start failure', async () => {
+      const test = 'boot-throw';
+      const runId = 'closed-boot-throw';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await closeLedger(mgr, runId, workspace, 2);
+      await terminateAndReconstruct(runId);
+      const before = mgr.workflowStatus(runId);
+      const beforeFact = recordCheckpointFact(test, 'before-failed-resume', null, runId);
+
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (mgr as any)._createSession = (): ISession => {
         const mock = new MockSession();
-        mock.start = async function (this: MockSession) {
-          // What a codex-app handshake does when the server reports an MCP failure.
-          this.emit(SESSION_EVENT.ERROR, new Error('startup notification'));
-          this.sessionId = 'started';
-          return this;
+        mock.start = async () => {
+          throw new Error('closed-ledger boot throw');
         };
-        mockSessions.push(mock);
         return mock;
       };
-      await expect(mgr.startSession({ name: 'handshake', cwd: '/tmp', engine: 'codex-app' })).resolves.toBeTruthy();
-      // The session was ready by the time start() resolved, so the error was survivable.
-      expect(mgr.getStatus('handshake').health).toMatchObject({
-        state: 'degraded',
-        errorCount: 1,
-        lastError: 'startup notification',
-      });
-    });
-
-    it('redacts secrets and caps the recorded message', async () => {
-      await mgr.startSession({ name: 'redact', cwd: '/tmp', engine: 'codex-app' });
-      lastMock().emit(SESSION_EVENT.ERROR, new Error(`auth failed: Bearer abc.def-123 ${'x'.repeat(2000)}`));
-      const msg = mgr.getStatus('redact').health?.lastError ?? '';
-      expect(msg).toContain('Bearer ***');
-      expect(msg).not.toContain('abc.def-123');
-      expect(msg.length).toBeLessThanOrEqual(500);
-    });
-
-    it('guards every engine, not only codex-app', async () => {
-      await mgr.shutdown();
-      mgr = createManager({ maxConcurrentSessions: 20 });
-      for (const engine of ['claude', 'codex', 'opencode', 'cursor', 'grok', 'agy', 'gemini'] as const) {
-        await mgr.startSession({ name: `g-${engine}`, cwd: '/tmp', engine });
-        expect(() => lastMock().emit(SESSION_EVENT.ERROR, new Error(`${engine} boom`))).not.toThrow();
-        expect(mgr.getStatus(`g-${engine}`).health?.errorCount).toBe(1);
+      let rejectText = '';
+      try {
+        await mgr.autoloopResume(runId);
+      } catch (err) {
+        rejectText = err instanceof Error ? err.message : String(err);
       }
+
+      // Immediate observation: base may still show running/running while failure settles async.
+      const immediate = mgr.workflowStatus(runId);
+      const immediateFact = recordCheckpointFact(test, 'immediate-after-boot-throw', null, runId);
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'immediate-after-boot-throw',
+        rejectText,
+        record_state: immediate?.state,
+        main_node_state: immediate?.nodes?.main?.state,
+        tip_iter: immediateFact.iter,
+        tip_metrics: immediateFact.metric_history,
+      });
+
+      // Deterministic settled-state observation (do not race a retry against running).
+      await vi.waitFor(
+        () => {
+          const st = mgr.workflowStatus(runId);
+          expect(['failed', 'cancelled', 'succeeded']).toContain(st.state);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+      const settled = mgr.workflowStatus(runId);
+      const settledFact = recordCheckpointFact(test, 'settled-after-boot-throw', null, runId);
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'settled-after-boot-throw',
+        record_state: settled?.state,
+        main_node_state: settled?.nodes?.main?.state,
+        tip_iter: settledFact.iter,
+        tip_metrics: settledFact.metric_history,
+      });
+
+      // Later resume after settlement, on a fresh manager (optional but clearer isolation).
+      await mgr.shutdown();
+      mgr = createManager();
+      wireClosedLedgerSessions(mgr, workspace, 2);
+      let laterErr: unknown = null;
+      let later: { iter: number; metric_history: number[] } | null = null;
+      try {
+        later = await mgr.autoloopResume(runId);
+      } catch (err) {
+        laterErr = err;
+      }
+      const laterFact = recordCheckpointFact(test, 'after-settled-resume-attempt', mgr, runId);
+      const laterStatus = mgr.workflowStatus(runId);
+      s1Fact({
+        test,
+        path: 'record',
+        phase: 'after-settled-resume-attempt',
+        resumed: !laterErr,
+        resumed_iter: later?.iter ?? null,
+        resumed_metrics: later?.metric_history ?? null,
+        later_error: laterErr instanceof Error ? laterErr.message : laterErr ? String(laterErr) : null,
+        record_state: laterStatus?.state,
+        main_node_state: laterStatus?.nodes?.main?.state,
+        checkpoint_iter: laterFact.iter,
+        checkpoint_metrics: laterFact.metric_history,
+        tip_reset_on_later_resume: !laterErr && typeof later?.iter === 'number' ? later.iter === 0 : null,
+      });
+
+      // Tip at throw / settlement is not lost; later resume after settlement restores tip.
+      expect(rejectText).toContain('closed-ledger boot throw');
+      expect(immediate).toBeDefined();
+      expect(settled).toBeDefined();
+      expect(settled.spec).toEqual(before.spec);
+      expect(beforeFact.iter).toBe(2);
+      expect(beforeFact.metric_history).toEqual([100, 101]);
+      expect(immediateFact.iter).toBe(2);
+      expect(immediateFact.metric_history).toEqual([100, 101]);
+      expect(settledFact.iter).toBe(2);
+      expect(settledFact.metric_history).toEqual([100, 101]);
+      expect(laterErr).toBeNull();
+      expect(later?.iter).toBe(2);
+      expect(later?.metric_history).toEqual([100, 101]);
+      expect(laterFact.iter).toBe(2);
+    }, 90_000);
+
+    it('ordered finite metrics restore caps at MAX_METRIC_HISTORY (20) via public resume', async () => {
+      const test = 'cap20-metrics';
+      const runId = 'closed-cap20';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      // Provenance: public autoloopStart creates the durable run; contiguous closed
+      // prefix 0..21 is written as real ledger bytes (directive+verdict, metric=100+i)
+      // after stop — not invented runner state. Live auto-continue close of 22 hits
+      // default maxDispatchDepth before the tip; public autoloopResume is still the
+      // sole restore path under test (reader → runner.state before runner.start).
+      await mgr.autoloopStart({ runId, workspace });
+      await terminateAndReconstruct(runId);
+      for (let i = 0; i < 22; i++) {
+        const iterDir = path.join(workspace, 'tasks', runId, 'iter', String(i));
+        fs.mkdirSync(iterDir, { recursive: true });
+        fs.writeFileSync(
+          path.join(iterDir, 'directive.json'),
+          JSON.stringify({
+            schema_version: 1,
+            iter: i,
+            goal: `cap20 ${i}`,
+            constraints: [],
+            success_criteria: [],
+            max_attempts: 1,
+          }),
+        );
+        fs.writeFileSync(
+          path.join(iterDir, 'verdict.json'),
+          JSON.stringify(
+            {
+              schema_version: 1,
+              iter: i,
+              decision: 'advance',
+              metric: 100 + i,
+              audit_notes: `cap20 ${i}`,
+            },
+            null,
+            2,
+          ),
+        );
+      }
+      s1Fact({
+        test,
+        path: `tasks/${runId}/iter`,
+        phase: 'planted-closed-prefix',
+        closed_count: 22,
+        metric_first: 100,
+        metric_last: 121,
+        provenance: 'ledger-bytes-after-public-start-stop',
+      });
+      wireClosedLedgerSessions(mgr, workspace, 22);
+      const after = await mgr.autoloopResume(runId);
+      recordCheckpointFact(test, 'after-resume', mgr, runId);
+      expect(after.iter).toBe(22);
+      expect(after.metric_history).toEqual(Array.from({ length: 20 }, (_, i) => 100 + (22 - 20 + i)));
+    }, 90_000);
+  });
+
+  describe('closed-ledger-preserve', () => {
+    const fence = (tool: string, args: Record<string, unknown>): string =>
+      `\`\`\`autoloop\n${JSON.stringify({ tool, args })}\n\`\`\``;
+
+    const initGitWorkspace = (workspace: string): void => {
+      fs.mkdirSync(workspace, { recursive: true });
+      execFileSync('git', ['init', '-b', 'main'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.email', 'autoloop-test@example.com'], { cwd: workspace });
+      execFileSync('git', ['config', 'user.name', 'autoloop-test'], { cwd: workspace });
+      execFileSync('git', ['config', 'commit.gpgsign', 'false'], { cwd: workspace });
+      fs.writeFileSync(path.join(workspace, 'README.md'), 'workspace\n');
+      execFileSync('git', ['add', 'README.md'], { cwd: workspace });
+      execFileSync('git', ['commit', '-m', 'init'], { cwd: workspace });
+    };
+
+    beforeEach(() => {
+      vi.useRealTimers();
     });
 
-    it('guards a session started by switchModel', async () => {
-      await mgr.startSession({ name: 'switched', cwd: '/tmp', engine: 'cursor' });
-      lastMock().cursorChatId = NATIVE_CURSOR_ID;
-      await mgr.switchModel('switched', 'composer-2.5');
-      expect(() => lastMock().emit(SESSION_EVENT.ERROR, new Error('after switch'))).not.toThrow();
-      expect(mgr.getStatus('switched').health?.lastError).toBe('after switch');
+    it('legacy lone iter/0/verdict.json does not crash resume and stays Planner-only', async () => {
+      const runId = 'preserve-lone-verdict';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await mgr.autoloopStart({ runId, workspace });
+      const iter0 = path.join(workspace, 'tasks', runId, 'iter', '0');
+      fs.mkdirSync(iter0, { recursive: true });
+      fs.writeFileSync(
+        path.join(iter0, 'verdict.json'),
+        JSON.stringify({ schema_version: 1, iter: 0, decision: 'hold', metric: null, audit_notes: 'legacy' }, null, 2),
+      );
+      await mgr.autoloopStop(runId, 'plant-lone-verdict');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (mgr as any).kernel.wait(runId);
+      await mgr.shutdown();
+      mgr = createManager();
+      createdConfigs = [];
+      mockSessions = [];
+      await mgr.autoloopResume(runId);
+      await new Promise((r) => setTimeout(r, 300));
+      expect(createdConfigs.map((c) => c.name)).toEqual([`autoloop-${runId}-planner`]);
+      expect(fs.existsSync(path.join(iter0, 'verdict.json'))).toBe(true);
+    }, 60_000);
+
+    it('empty or missing ledger fresh start still boots at iter 0', async () => {
+      const runId = 'preserve-empty-ledger';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      expect(handle.runner.state.iter).toBe(0);
+      expect(handle.runner.state.metric_history).toEqual([]);
+      expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter'))).toBe(false);
+    }, 30_000);
+
+    it('#132 pending_dispatch resume retains pause without replaying Planner', async () => {
+      const runId = 'preserve-pending-dispatch';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      fs.mkdirSync(workspace, { recursive: true });
+      await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 600_000 });
+      const handle = mgr.getAutoloop(runId)!;
+      const pending = {
+        status: 'awaiting_resume' as const,
+        dispatch_id: 'dispatch-preserve-planner-0',
+        agent: 'planner' as const,
+        message_id: 'message-preserve',
+        message_type: 'chat' as const,
+        iter: 0,
+        timeout_ms: 600_000,
+        error: 'Timed out after 600000ms',
+      };
+      await handle.runner.send(AutoloopMsg.sendTimeout(0, pending));
+      expect(handle.runner.state).toMatchObject({ status: 'paused', pending_dispatch: pending });
+      const sendsBefore = mockSessions[0].sendCalls.length;
+      await expect(mgr.autoloopResume(runId)).resolves.toBe(handle.runner.state);
+      expect(handle.runner.state).toMatchObject({ status: 'paused', pending_dispatch: pending });
+      expect(mockSessions[0].sendCalls).toHaveLength(sendsBefore);
+    }, 30_000);
+
+    it('#134/#138 closed prefix plus open committed K+1 is Reviewer-only once', async () => {
+      const runId = 'preserve-open-committed';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      initGitWorkspace(workspace);
+
+      // Reuse the closed-ledger harness helpers from the sibling describe via local mirrors.
+      const wire = (manager: InstanceType<typeof SessionManager>, closeCount: number): void => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const origCreate = (manager as any)._createSession.bind(manager);
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        (manager as any)._createSession = (engine: string, config: SessionConfig): ISession => {
+          const mock = origCreate(engine, config) as MockSession;
+          if (config.name.endsWith('-planner')) {
+            mock.sendImplementation = async (message) => {
+              const text = typeof message === 'string' ? message : JSON.stringify(message);
+              const done = text.match(/\[system\] iter (\d+) done\./);
+              if (done) {
+                const next = Number(done[1]) + 1;
+                if (next < closeCount) {
+                  return {
+                    text: fence('send_directive', {
+                      goal: `close ${next}`,
+                      constraints: [],
+                      success_criteria: [],
+                      max_attempts: 1,
+                    }),
+                    event: { type: 'result', result: 'ok' },
+                  };
+                }
+                return { text: 'done', event: { type: 'result', result: 'ok' } };
+              }
+              return {
+                text: fence('spawn_subagents', {
+                  initial_directive: {
+                    goal: 'close 0',
+                    constraints: [],
+                    success_criteria: [],
+                    max_attempts: 1,
+                  },
+                }),
+                event: { type: 'result', result: 'ok' },
+              };
+            };
+          } else if (config.name.endsWith('-coder')) {
+            mock.sendImplementation = async (message) => {
+              const text = typeof message === 'string' ? message : JSON.stringify(message);
+              const m = text.match(/\[directive iter=(\d+)\]/);
+              const iter = m ? Number(m[1]) : 0;
+              fs.writeFileSync(path.join(workspace, `preserve-${iter}.txt`), `p-${iter}\n`);
+              return {
+                text: fence('iter_complete', {
+                  summary: `preserve ${iter}`,
+                  eval_output: { metric: 10 + iter, gates: [] },
+                }),
+                event: { type: 'result', result: 'ok' },
+              };
+            };
+          } else if (config.name.endsWith('-reviewer')) {
+            mock.sendImplementation = async (message) => {
+              const text = typeof message === 'string' ? message : JSON.stringify(message);
+              const m = text.match(/\[review_request iter=(\d+)\]/);
+              const iter = m ? Number(m[1]) : 0;
+              return {
+                text: fence('review_complete', {
+                  decision: 'advance',
+                  metric: 10 + iter,
+                  audit_notes: `advance ${iter}`,
+                }),
+                event: { type: 'result', result: 'ok' },
+              };
+            };
+          }
+          return mock;
+        };
+      };
+
+      wire(mgr, 1);
+      await mgr.autoloopStart({ runId, workspace });
+      await mgr.autoloopChat(runId, 'close only iter 0');
+      await vi.waitFor(
+        () => {
+          expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '0', 'verdict.json'))).toBe(true);
+        },
+        { timeout: 15_000, interval: 50 },
+      );
+
+      // Plant open committed iter 1 (artifacts + git subject) without verdict.
+      const iter1 = path.join(workspace, 'tasks', runId, 'iter', '1');
+      fs.mkdirSync(iter1, { recursive: true });
+      fs.writeFileSync(
+        path.join(iter1, 'directive.json'),
+        JSON.stringify({
+          schema_version: 1,
+          iter: 1,
+          goal: 'open',
+          constraints: [],
+          success_criteria: [],
+          max_attempts: 1,
+        }),
+      );
+      fs.writeFileSync(
+        path.join(iter1, 'eval_output.json'),
+        JSON.stringify({ schema_version: 1, iter: 1, eval_output: { metric: 11, gates: [] } }),
+      );
+      fs.writeFileSync(path.join(iter1, 'coder_summary.txt'), 'planted open committed\n');
+      fs.writeFileSync(path.join(iter1, 'diff.patch'), '');
+      fs.writeFileSync(path.join(workspace, 'preserve-1.txt'), 'p-1\n');
+      execFileSync('git', ['add', '-A'], { cwd: workspace });
+      execFileSync('git', ['commit', '-m', 'autoloop/iter-1: planted open committed'], { cwd: workspace });
+
+      await mgr.autoloopStop(runId, 'preserve-open-stop');
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (mgr as any).kernel.wait(runId);
+      await mgr.shutdown();
+
+      createdConfigs = [];
+      mockSessions = [];
+      mgr = createManager();
+      let resumeReviewerSends = 0;
+      let resumeCoderSends = 0;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const orig2 = (mgr as any)._createSession.bind(mgr);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (mgr as any)._createSession = (engine: string, config: SessionConfig): ISession => {
+        const mock = orig2(engine, config) as MockSession;
+        if (config.name.endsWith('-reviewer')) {
+          mock.sendImplementation = async (message) => {
+            const text = typeof message === 'string' ? message : JSON.stringify(message);
+            resumeReviewerSends += 1;
+            expect(text).toContain('[review_request iter=1]');
+            return {
+              text: fence('review_complete', {
+                decision: 'hold',
+                metric: null,
+                audit_notes: 'recovered open committed',
+              }),
+              event: { type: 'result', result: 'ok' },
+            };
+          };
+        } else if (config.name.endsWith('-coder')) {
+          mock.sendImplementation = async () => {
+            resumeCoderSends += 1;
+            return { text: 'should not run', event: { type: 'result', result: 'ok' } };
+          };
+        }
+        return mock;
+      };
+
+      await mgr.autoloopResume(runId);
+      await vi.waitFor(
+        () => {
+          expect(fs.existsSync(path.join(workspace, 'tasks', runId, 'iter', '1', 'verdict.json'))).toBe(true);
+        },
+        { timeout: 10_000, interval: 50 },
+      );
+      expect(resumeReviewerSends).toBe(1);
+      expect(resumeCoderSends).toBe(0);
+      // After a hold on recovered iter 1 the runner advances the tip to 2 —
+      // the preserve contract is Reviewer-only once with no Coder replay.
+      expect(mgr.getAutoloop(runId)!.runner.state.iter).toBe(2);
+      expect(createdConfigs.some((c) => c.name.endsWith('-coder'))).toBe(false);
+    }, 90_000);
+  });
+
+  describe('Autoloop live pause resume', () => {
+    const fence = (tool: string, args: Record<string, unknown>): string =>
+      `\`\`\`autoloop\n${JSON.stringify({ tool, args })}\n\`\`\``;
+
+    const workspaceFor = (runId: string): string => {
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      fs.mkdirSync(workspace, { recursive: true });
+      return workspace;
+    };
+
+    const messageText = (message: string | unknown[]): string =>
+      typeof message === 'string' ? message : JSON.stringify(message);
+
+    const advanceTo = async (absoluteMs: number): Promise<void> => {
+      const delta = absoluteMs - Date.now();
+      if (delta > 0) await vi.advanceTimersByTimeAsync(delta);
+    };
+
+    it('R1 ordinary pause resumes parked planner input in order', async () => {
+      const runId = 'live-ordinary-pause-resume';
+      const workspace = workspaceFor(runId);
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const planner = mockSessions[0];
+      let replies = 0;
+      planner.sendImplementation = async () => {
+        replies += 1;
+        if (replies === 1) {
+          return {
+            text: fence('pause_loop', { reason: 'operator-hold' }),
+            event: { type: 'result', result: 'ok' },
+          };
+        }
+        return { text: 'ack', event: { type: 'result', result: 'ok' } };
+      };
+
+      await mgr.autoloopChat(runId, 'pause-trigger');
+      expect(handle.runner.state).toMatchObject({
+        status: 'paused',
+        status_reason: 'operator-hold',
+        pending_dispatch: null,
+      });
+      const parkedAt = planner.sendCalls.length;
+
+      await mgr.autoloopChat(runId, 'U1');
+      await mgr.autoloopChat(runId, 'U2');
+      expect(planner.sendCalls).toHaveLength(parkedAt);
+      expect(planner.sendCalls.map((call) => messageText(call.message)).some((text) => text.includes('U1'))).toBe(
+        false,
+      );
+      expect(planner.sendCalls.map((call) => messageText(call.message)).some((text) => text.includes('U2'))).toBe(
+        false,
+      );
+
+      const resumed = await mgr.autoloopResume(runId);
+      expect(resumed).toBe(handle.runner.state);
+      expect(resumed).toMatchObject({
+        status: 'planning',
+        status_reason: null,
+        pending_dispatch: null,
+      });
+      // Parked delivery continues after the sync resume return (same as C2).
+      await vi.waitFor(() => {
+        const delivered = planner.sendCalls.map((call) => messageText(call.message));
+        const u1 = delivered.flatMap((text, index) => (text.includes('U1') ? [index] : []));
+        const u2 = delivered.flatMap((text, index) => (text.includes('U2') ? [index] : []));
+        expect(u1).toHaveLength(1);
+        expect(u2).toHaveLength(1);
+        expect(u1[0]).toBeLessThan(u2[0]);
+      });
+      expect(createdConfigs.map((config) => config.name)).toEqual([`autoloop-${runId}-planner`]);
+      expect(mockSessions).toHaveLength(1);
+    });
+
+    it('R2 activity expiry resumes, re-arms, and keeps the original hard deadline', async () => {
+      const runId = 'live-activity-lease-resume';
+      const workspace = workspaceFor(runId);
+      const activityLeaseMs = 60_000;
+      const hardTimeoutMs = 600_000;
+      await mgr.autoloopStart({
+        runId,
+        workspace,
+        activityLeaseMs,
+        autoloopHardTimeoutMs: hardTimeoutMs,
+      });
+      const handle = mgr.getAutoloop(runId)!;
+      const planner = mockSessions[0];
+      const startedAt = Date.parse(handle.runner.state.started_at);
+      const timeouts: string[] = [];
+      handle.runner.on('timeout', (event: { kind: string }) => {
+        timeouts.push(event.kind);
+      });
+
+      await advanceTo(handle.runner.state.last_activity_at + activityLeaseMs);
+      expect(handle.runner.state).toMatchObject({
+        status: 'paused',
+        status_reason: 'activity_lease_expired',
+        pending_dispatch: null,
+      });
+      expect(timeouts).toEqual(['activity_lease_expired']);
+
+      await mgr.autoloopChat(runId, 'U1');
+      expect(planner.sendCalls.map((call) => messageText(call.message)).some((text) => text.includes('U1'))).toBe(
+        false,
+      );
+
+      // deliverToPlanner emits planner_reply (~1071-1073) only after the reply is
+      // parsed and its tool calls applied. A no-fenced-block reply returns no
+      // messages (~1055-1077), so handleOne (~464-472) records no agent_progress
+      // after the signal; last_activity_at is final once planner_reply fires.
+      const plannerReplies: Array<{ reply: unknown; sendCallsAtEvent: string[] }> = [];
+      const onPlannerReply = (...args: unknown[]) => {
+        plannerReplies.push({
+          reply: args[0],
+          sendCallsAtEvent: planner.sendCalls.map((call) => messageText(call.message)),
+        });
+      };
+      handle.dispatcher.on('planner_reply', onPlannerReply);
+      try {
+        const resumed = await mgr.autoloopResume(runId);
+        expect(resumed).toMatchObject({
+          status: 'planning',
+          status_reason: null,
+          pending_dispatch: null,
+        });
+        await vi.waitFor(() => {
+          expect(plannerReplies).toHaveLength(1);
+        });
+        expect(plannerReplies[0]!.sendCallsAtEvent.some((text) => text.includes('U1'))).toBe(true);
+        expect(
+          planner.sendCalls.map((call) => messageText(call.message)).filter((text) => text.includes('U1')),
+        ).toEqual(['U1']);
+      } finally {
+        handle.dispatcher.off('planner_reply', onPlannerReply);
+      }
+
+      const renewedDeadline = handle.runner.state.last_activity_at + activityLeaseMs;
+      // Synchronous move. advanceTo() awaits advanceTimersByTimeAsync, and the
+      // parent beforeEach keeps shouldAdvanceTime on, so its real 20ms interval
+      // can tick the clock past this 1ms boundary before the assertion runs.
+      vi.advanceTimersByTime(renewedDeadline - 1 - Date.now());
+      expect(Date.now()).toBe(renewedDeadline - 1);
+      expect(handle.runner.state.status).toBe('planning');
+      expect(handle.runner.state.status_reason).toBeNull();
+      expect(timeouts).toEqual(['activity_lease_expired']);
+      vi.advanceTimersByTime(renewedDeadline - Date.now());
+      expect(Date.now()).toBe(renewedDeadline);
+      expect(handle.runner.state).toMatchObject({
+        status: 'paused',
+        status_reason: 'activity_lease_expired',
+      });
+      expect(timeouts).toEqual(['activity_lease_expired', 'activity_lease_expired']);
+
+      const second = await mgr.autoloopResume(runId);
+      expect(second).toMatchObject({ status: 'planning', status_reason: null, pending_dispatch: null });
+
+      await advanceTo(startedAt + hardTimeoutMs);
+      expect(handle.runner.state).toMatchObject({
+        status: 'terminated',
+        status_reason: 'hard_timeout_exceeded',
+      });
+      expect(createdConfigs.map((config) => config.name)).toEqual([`autoloop-${runId}-planner`]);
+    });
+
+    it('C1 an un-paused chat is delivered once and a chat after pause_loop is parked', async () => {
+      const runId = 'live-pause-fixture-control';
+      const workspace = workspaceFor(runId);
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const planner = mockSessions[0];
+      planner.sendImplementation = async (message) => {
+        const text = messageText(message);
+        if (text.includes('pause-now')) {
+          return {
+            text: fence('pause_loop', { reason: 'operator-hold' }),
+            event: { type: 'result', result: 'ok' },
+          };
+        }
+        return { text: 'ack', event: { type: 'result', result: 'ok' } };
+      };
+
+      await mgr.autoloopChat(runId, 'live-once');
+      const live = planner.sendCalls
+        .map((call) => messageText(call.message))
+        .filter((text) => text.includes('live-once'));
+      expect(live).toEqual(['live-once']);
+
+      await mgr.autoloopChat(runId, 'pause-now');
+      expect(handle.runner.state).toMatchObject({
+        status: 'paused',
+        status_reason: 'operator-hold',
+        pending_dispatch: null,
+      });
+      const parkedAt = planner.sendCalls.length;
+      await mgr.autoloopChat(runId, 'parked-after');
+      expect(planner.sendCalls).toHaveLength(parkedAt);
+      expect(
+        planner.sendCalls.map((call) => messageText(call.message)).some((text) => text.includes('parked-after')),
+      ).toBe(false);
+    });
+
+    it('C2 pending-dispatch no-option resume keeps the pause and an exact-id increase delivers parked input once', async () => {
+      const runId = 'live-pending-dispatch-control';
+      const workspace = workspaceFor(runId);
+      await mgr.autoloopStart({ runId, workspace, sendTimeoutMs: 600_000 });
+      const handle = mgr.getAutoloop(runId)!;
+      const planner = mockSessions[0];
+      planner.sendImplementation = async () => {
+        planner.sendImplementation = undefined;
+        throw new Error('Timeout waiting for response');
+      };
+
+      await mgr.autoloopChat(runId, 'timed-out-turn');
+      expect(handle.runner.state.status).toBe('paused');
+      const pending = handle.runner.state.pending_dispatch;
+      expect(pending?.status).toBe('awaiting_resume');
+      expect(handle.runner.state.status_reason).toBe(`awaiting_resume:send_timeout:planner:${pending?.dispatch_id}`);
+      const sendsAtPause = planner.sendCalls.length;
+      expect(
+        planner.sendCalls.map((call) => messageText(call.message)).filter((text) => text.includes('timed-out-turn')),
+      ).toEqual(['timed-out-turn']);
+
+      await mgr.autoloopChat(runId, 'U1');
+      expect(planner.sendCalls).toHaveLength(sendsAtPause);
+
+      const before = handle.runner.state;
+      const observed = await mgr.autoloopResume(runId);
+      expect(observed).toBe(before);
+      expect(observed).toBe(handle.runner.state);
+      expect(observed).toMatchObject({ status: 'paused', pending_dispatch: pending });
+      expect(planner.sendCalls).toHaveLength(sendsAtPause);
+
+      const increased = await mgr.autoloopResume(runId, {
+        sendTimeoutMs: 700_000,
+        pendingDispatchId: pending!.dispatch_id,
+      });
+      expect(increased).toMatchObject({
+        status: 'running',
+        status_reason: null,
+        pending_dispatch: null,
+      });
+      await vi.waitFor(() => {
+        const delivered = planner.sendCalls.map((call) => messageText(call.message));
+        expect(delivered.filter((text) => text.includes('timed-out-turn'))).toEqual(['timed-out-turn']);
+        expect(delivered.filter((text) => text.includes('U1'))).toEqual(['U1']);
+      });
     });
   });
 
-  describe('codexMcpServers validation', () => {
-    it('refuses a selection on an engine that would ignore it', async () => {
-      await expect(
-        mgr.startSession({
-          name: 'sel-claude',
-          cwd: '/tmp',
-          engine: 'claude',
-          ignoreUserConfig: true,
-          codexMcpServers: ['a'],
-        }),
-      ).rejects.toThrow(/only supported by the 'codex' and 'codex-app' engines/);
-      expect(mgr.hasSession('sel-claude')).toBe(false);
-    });
+  describe('planner-control-feedback', () => {
+    const fence = (tool: string, args: Record<string, unknown>): string =>
+      `\`\`\`autoloop\n${JSON.stringify({ tool, args })}\n\`\`\``;
 
-    it('refuses a selection without ignoreUserConfig', async () => {
-      await expect(
-        mgr.startSession({ name: 'sel-noignore', cwd: '/tmp', engine: 'codex-app', codexMcpServers: ['a'] }),
-      ).rejects.toThrow(/requires ignoreUserConfig/);
-    });
-
-    it('passes a valid selection through to the engine config', async () => {
-      await mgr.startSession({
-        name: 'sel-ok',
-        cwd: '/tmp',
-        engine: 'codex-app',
-        ignoreUserConfig: true,
-        codexMcpServers: ['docs'],
+    it('autoloopChat returns combined notice/prose with zero Coder dispatch', async () => {
+      const runId = 'planner-control-feedback-t17';
+      const workspace = path.join(TEST_WF_DIR, 'workspaces', runId);
+      fs.mkdirSync(workspace, { recursive: true });
+      await mgr.autoloopStart({ runId, workspace });
+      const handle = mgr.getAutoloop(runId)!;
+      const planner = mockSessions[0]!;
+      planner.sendImplementation = async () => ({
+        text: [
+          'Submitting the small fixture task.',
+          fence('send_directive', {
+            goal: 'Update a synthetic README fixture',
+            constraints: 'Only README.md',
+            success_criteria: ['The fixture heading is present'],
+            max_attempts: 1,
+          }),
+        ].join('\n'),
+        event: { type: 'result', result: 'ok' },
       });
-      expect(createdConfigs.at(-1)).toMatchObject({ ignoreUserConfig: true, codexMcpServers: ['docs'] });
+
+      const result = await mgr.autoloopChat(runId, 'submit fixture via manager');
+
+      expect(result).toEqual({ reply: expect.any(String) });
+      expect(result.reply).toContain('Planner control error');
+      expect(result.reply).toContain('Submitting the small fixture task.');
+      expect(result.reply).toContain('send_directive constraints must be an array of strings');
+      expect(createdConfigs.some((config) => config.name.endsWith('-coder'))).toBe(false);
+      expect(handle.runner.state.iter).toBe(0);
     });
   });
 });

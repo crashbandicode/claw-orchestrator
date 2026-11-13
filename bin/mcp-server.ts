@@ -18,8 +18,6 @@
  *   CLAWO_MCP_TOOLS         comma-separated allowlist of tool names. Unlisted
  *                            tools are not exposed. Useful when the host has a
  *                            tight tool budget (default: expose everything).
- *   CLAWO_MAX_CONCURRENT_SESSIONS non-negative integer open-session limit per
- *                            MCP process (default 5; 0 = unlimited).
  *   CLAWO_NO_EMBEDDED_SERVER set automatically; suppresses the plugin's HTTP
  *                            control-plane (port 18796) which is dead weight
  *                            for MCP-only deployments.
@@ -29,6 +27,8 @@ import { createRequire } from 'node:module';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+
+import { TOOL_ANNOTATIONS } from '../src/mcp-annotations.js';
 
 // The plugin lazily starts EmbeddedServer on first tool call unless this is
 // set. Set before importing so the env is seen on the very first invocation.
@@ -53,74 +53,6 @@ type ToolDef = {
   execute: (toolCallId: string, params: Record<string, unknown>) => Promise<AgentToolResult>;
 };
 
-type Annotation = {
-  readOnlyHint?: boolean;
-  destructiveHint?: boolean;
-  idempotentHint?: boolean;
-  openWorldHint?: boolean;
-};
-
-// Hand-curated hints. MCP hosts surface these to the model so it can pick
-// safer tools first (Hermes / Cursor / Claude Desktop all read them).
-//
-//   readOnly      — does not mutate workspace, sessions, files, or branches
-//   destructive   — irreversible side-effects (delete worktree, drop branch, kill process)
-//   openWorld     — touches things outside the local machine (model APIs)
-const ANNOTATIONS: Record<string, Annotation> = {
-  // pure reads
-  session_list: { readOnlyHint: true, idempotentHint: true },
-  sessions_overview: { readOnlyHint: true, idempotentHint: true },
-  coding_session_status: { readOnlyHint: true, idempotentHint: true },
-  session_grep: { readOnlyHint: true, idempotentHint: true },
-  session_inbox: { readOnlyHint: true, idempotentHint: true },
-  coding_agents_list: { readOnlyHint: true, idempotentHint: true },
-  team_list: { readOnlyHint: true, idempotentHint: true },
-  council_status: { readOnlyHint: true, idempotentHint: true },
-  council_review: { readOnlyHint: true, idempotentHint: true },
-  ultraplan_status: { readOnlyHint: true, idempotentHint: true },
-  ultrareview_status: { readOnlyHint: true, idempotentHint: true },
-  autoloop_status: { readOnlyHint: true, idempotentHint: true },
-  autoloop_list: { readOnlyHint: true, idempotentHint: true },
-  codex_goal_get: { readOnlyHint: true, idempotentHint: true },
-  // destructive
-  session_stop: { destructiveHint: true },
-  council_abort: { destructiveHint: true },
-  council_accept: { destructiveHint: true },
-  council_reject: { destructiveHint: true },
-  autoloop_stop: { destructiveHint: true },
-  project_purge: { destructiveHint: true },
-  // mutating + open-world (call external model APIs)
-  session_start: { openWorldHint: true },
-  session_send: { openWorldHint: true },
-  session_handoff: { openWorldHint: true },
-  team_send: { openWorldHint: true },
-  session_send_to: { openWorldHint: true },
-  session_deliver_inbox: { openWorldHint: true },
-  thread_register: {},
-  thread_mailbox_send: {},
-  thread_mailbox_read: { readOnlyHint: true, idempotentHint: true },
-  thread_mailbox_ack: { idempotentHint: true },
-  thread_mailbox_wait: { readOnlyHint: true },
-  council_start: { openWorldHint: true },
-  council_inject: { openWorldHint: true },
-  ultraplan_start: { openWorldHint: true },
-  ultrareview_start: { openWorldHint: true },
-  autoloop_start: { openWorldHint: true },
-  autoloop_chat: { openWorldHint: true },
-  autoloop_reset_agent: {},
-  codex_resume: { openWorldHint: true },
-  codex_review: { openWorldHint: true },
-  codex_goal_set: { openWorldHint: true },
-  cursor_goal_set: { openWorldHint: true },
-  codex_goal_pause: {},
-  codex_goal_resume: { openWorldHint: true },
-  codex_goal_clear: {},
-  codex_side: { openWorldHint: true },
-  session_compact: { openWorldHint: true },
-  session_update_tools: {},
-  session_switch_model: {},
-};
-
 const log = {
   info: (...args: unknown[]) => console.error('[clawo-mcp]', ...args),
   warn: (...args: unknown[]) => console.error('[clawo-mcp]', ...args),
@@ -137,12 +69,8 @@ const shim = {
   },
   on: () => {},
   registerHttpRoute: () => {},
-  registerService: (def: { stop?: () => void | Promise<void> }) => {
-    serviceStop = def.stop;
-  },
+  registerService: () => {},
 };
-
-let serviceStop: (() => void | Promise<void>) | undefined;
 
 plugin.register(shim as unknown as Parameters<typeof plugin.register>[0]);
 
@@ -189,7 +117,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     name: t.name,
     description: t.description,
     inputSchema: t.parameters as { type: 'object'; properties?: Record<string, unknown>; required?: string[] },
-    ...(ANNOTATIONS[t.name] ? { annotations: ANNOTATIONS[t.name] } : {}),
+    ...(TOOL_ANNOTATIONS[t.name] ? { annotations: TOOL_ANNOTATIONS[t.name] } : {}),
   })),
 }));
 
@@ -221,20 +149,3 @@ const transport = new StdioServerTransport();
 await server.connect(transport);
 
 log.info(`mcp server ready — exposing ${tools.length} of ${captured.length} tools over stdio`);
-
-let clientClosed = false;
-async function closeClientTransports(): Promise<void> {
-  if (clientClosed) return;
-  clientClosed = true;
-  await serviceStop?.();
-}
-
-process.stdin.on('end', () => {
-  void closeClientTransports();
-});
-process.once('SIGINT', () => {
-  void closeClientTransports().finally(() => process.exit(0));
-});
-process.once('SIGTERM', () => {
-  void closeClientTransports().finally(() => process.exit(0));
-});

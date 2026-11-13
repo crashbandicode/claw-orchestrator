@@ -10,15 +10,24 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
-import type { SessionConfig } from '../types.js';
 
 // Mock child_process before importing the session
 const mockSpawn = vi.fn();
-vi.mock('node:child_process', () => ({
-  spawn: (...args: unknown[]) => mockSpawn(...args),
+// `opencode --version`, keyed by binary — the session checks it once at start.
+const versions: Record<string, string | Error> = {};
+vi.mock('../engine-spawn.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../engine-spawn.js')>()),
+  spawnEngine: (...args: unknown[]) => mockSpawn(...args),
+  execEngine: async (bin: string) => {
+    const v = versions[bin] ?? '1.19.0';
+    if (v instanceof Error) throw v;
+    return { stdout: `${v}\n`, stderr: '' };
+  },
 }));
 
-const { PersistentOpencodeSession } = await import('../persistent-opencode-session.js');
+const { PersistentOpencodeSession, isOpencodeV2, opencodeGoalArguments, opencodeModelRef } = await import(
+  '../persistent-opencode-session.js'
+);
 
 // ─── Mock Process Helper ────────────────────────────────────────────────────
 
@@ -26,7 +35,7 @@ function createMockProcess() {
   const proc = new EventEmitter() as EventEmitter & {
     stdout: Readable & { destroy: ReturnType<typeof vi.fn> };
     stderr: EventEmitter & { destroy: ReturnType<typeof vi.fn> };
-    stdin: { end: ReturnType<typeof vi.fn> };
+    stdin: { end: ReturnType<typeof vi.fn>; on: ReturnType<typeof vi.fn> };
     kill: ReturnType<typeof vi.fn>;
     pid: number;
     exitCode: null;
@@ -36,7 +45,7 @@ function createMockProcess() {
   const stderrEmitter = new EventEmitter() as EventEmitter & { destroy: ReturnType<typeof vi.fn> };
   stderrEmitter.destroy = vi.fn();
   proc.stderr = stderrEmitter;
-  proc.stdin = { end: vi.fn() };
+  proc.stdin = { end: vi.fn(), on: vi.fn() };
   proc.kill = vi.fn();
   proc.pid = 23456;
   proc.exitCode = null;
@@ -184,67 +193,6 @@ describe('PersistentOpencodeSession', () => {
   });
 
   describe('spawn flags', () => {
-    it.each<{ label: string; config: Partial<SessionConfig>; auto: boolean }>([
-      { label: 'auto mode', config: { permissionMode: 'auto' }, auto: true },
-      { label: 'bypass mode', config: { permissionMode: 'bypassPermissions' }, auto: true },
-      {
-        label: 'legacy skip setting',
-        config: { permissionMode: 'acceptEdits', dangerouslySkipPermissions: true },
-        auto: true,
-      },
-      {
-        label: 'explicit legacy skip overrides manual',
-        config: { permissionMode: 'manual', dangerouslySkipPermissions: true },
-        auto: true,
-      },
-      {
-        label: 'plan overrides legacy skip',
-        config: { permissionMode: 'plan', dangerouslySkipPermissions: true },
-        auto: false,
-      },
-      { label: 'explicit auto setting', config: { permissionMode: 'acceptEdits', enableAutoMode: true }, auto: true },
-      { label: 'inherited bypass default', config: {}, auto: true },
-      { label: 'manual mode', config: { permissionMode: 'manual' }, auto: false },
-      { label: 'legacy manual alias', config: { permissionMode: 'default' }, auto: false },
-      { label: 'edit approval only', config: { permissionMode: 'acceptEdits' }, auto: false },
-      { label: 'dontAsk mode', config: { permissionMode: 'dontAsk' }, auto: false },
-      {
-        label: 'plan mode overrides auto setting',
-        config: { permissionMode: 'plan', enableAutoMode: true },
-        auto: false,
-      },
-      {
-        label: 'read-only overrides bypass',
-        config: { permissionMode: 'bypassPermissions', dangerouslySkipPermissions: true, sandboxMode: 'read-only' },
-        auto: false,
-      },
-      {
-        label: 'read-only overrides both auto settings',
-        config: { permissionMode: 'auto', enableAutoMode: true, sandboxMode: 'read-only' },
-        auto: false,
-      },
-    ])('preserves permission intent for $label', async ({ config, auto }) => {
-      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp', ...config });
-      await session.start();
-      const pending = session.send('hello', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await pending;
-
-      const args = mockSpawn.mock.calls[0][1] as string[];
-      expect(args.includes('--auto')).toBe(auto);
-      expect(args).not.toContain('--yolo');
-      expect(args).not.toContain('--dangerously-skip-permissions');
-      if (config.sandboxMode === 'read-only') {
-        expect(args).toContain('clawo-readonly');
-        const { env } = mockSpawn.mock.calls[0][2] as { env: Record<string, string> };
-        expect(JSON.parse(env.OPENCODE_CONFIG_CONTENT).agent['clawo-readonly'].permission).toMatchObject({
-          edit: 'deny',
-          bash: 'deny',
-          task: 'deny',
-        });
-      }
-    });
-
     it('uses run --format json', async () => {
       const session = new PersistentOpencodeSession({
         name: 'test',
@@ -259,14 +207,15 @@ describe('PersistentOpencodeSession', () => {
 
       const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
       expect(spawnArgs[0]).toBe('run');
-      expect(spawnArgs[1]).toBe('hello');
+      // The message goes on stdin: on Windows `opencode` is an npm .cmd shim,
+      // and cmd.exe would cut an argv message at its first newline.
+      expect(spawnArgs).not.toContain('hello');
+      expect(mockProc.stdin.end).toHaveBeenCalledWith('hello');
       expect(spawnArgs).toContain('--format');
       expect(spawnArgs).toContain('json');
-      // Use the documented --auto flag; it keeps explicit denials intact.
+      // 1.1.40 does not have / does not need --dangerously-skip-permissions.
+      // Adding it would trigger yargs strict mode and print the help screen.
       expect(spawnArgs).not.toContain('--dangerously-skip-permissions');
-      // Omitted session effort must not invent a variant (opencode 1.18.32 uses
-      // the provider default when --variant is absent).
-      expect(spawnArgs).not.toContain('--variant');
     });
 
     // Regression guard: `opencode run` opens a NEW session unless --session names
@@ -274,7 +223,7 @@ describe('PersistentOpencodeSession', () => {
     // 1.18.18: without the flag turn 2 answers "you never asked me to remember
     // anything"; with it, turn 2 recalls turn 1.
     it('passes --session with the harvested id on the second turn', async () => {
-      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp', permissionMode: 'auto' });
+      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp' });
       await session.start();
 
       const p1 = session.send('first', { waitForComplete: true });
@@ -296,8 +245,6 @@ describe('PersistentOpencodeSession', () => {
       expect(args1).not.toContain('--session');
       expect(args2).toContain('--session');
       expect(args2[args2.indexOf('--session') + 1]).toBe('ses_abc123');
-      expect(args1).toContain('--auto');
-      expect(args2).toContain('--auto');
       // --continue means "the last session on this machine" and would collide
       // across concurrent sessions, so it must not be used.
       expect(args2).not.toContain('--continue');
@@ -322,8 +269,8 @@ describe('PersistentOpencodeSession', () => {
       setTimeout(() => closeProc(proc2, 0), 10);
       await p2;
 
-      expect((mockSpawn.mock.calls[0][1] as string[])[1]).toBe('SEAT RULES\n\n---\n\nfirst');
-      expect((mockSpawn.mock.calls[1][1] as string[])[1]).toBe('second');
+      expect(mockProc.stdin.end).toHaveBeenCalledWith('SEAT RULES\n\n---\n\nfirst');
+      expect(proc2.stdin.end).toHaveBeenCalledWith('second');
     });
 
     it('resumes a persisted opencode session id from config', async () => {
@@ -477,157 +424,6 @@ describe('PersistentOpencodeSession', () => {
       const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
       expect(spawnArgs).not.toContain('--model');
     });
-
-    it.each(['none', 'minimal', 'default', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const)(
-      'forwards session effort %s exactly as --variant',
-      async (effort) => {
-        const session = new PersistentOpencodeSession({
-          name: 'test',
-          cwd: '/tmp',
-          permissionMode: 'bypassPermissions',
-          effort,
-        });
-        await session.start();
-
-        const sendPromise = session.send('hello', { waitForComplete: true });
-        setTimeout(() => closeProc(mockProc, 0), 10);
-        await sendPromise;
-
-        const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-        const idx = spawnArgs.indexOf('--variant');
-        expect(idx).toBeGreaterThan(-1);
-        expect(spawnArgs[idx + 1]).toBe(effort);
-        expect(spawnArgs.filter((arg) => arg === '--variant')).toHaveLength(1);
-      },
-    );
-
-    it('omits --variant when session effort is auto', async () => {
-      const session = new PersistentOpencodeSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'bypassPermissions',
-        effort: 'auto',
-      });
-      await session.start();
-
-      const sendPromise = session.send('hello', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await sendPromise;
-
-      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-      expect(spawnArgs).not.toContain('--variant');
-    });
-
-    it('lets a per-turn effort override the session default without sticking', async () => {
-      const session = new PersistentOpencodeSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'bypassPermissions',
-        effort: 'high',
-      });
-      await session.start();
-
-      const p1 = session.send('first', { waitForComplete: true, effort: 'medium' });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await p1;
-
-      const proc2 = createMockProcess();
-      mockSpawn.mockReturnValue(proc2);
-      const p2 = session.send('second', { waitForComplete: true });
-      setTimeout(() => closeProc(proc2, 0), 10);
-      await p2;
-
-      const args1 = mockSpawn.mock.calls[0][1] as string[];
-      const args2 = mockSpawn.mock.calls[1][1] as string[];
-      expect(args1[args1.indexOf('--variant') + 1]).toBe('medium');
-      expect(args2[args2.indexOf('--variant') + 1]).toBe('high');
-      expect(session.getEffort()).toBe('high');
-    });
-
-    it('omits --variant for a per-turn auto override and restores session effort next turn', async () => {
-      const session = new PersistentOpencodeSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'bypassPermissions',
-        effort: 'high',
-      });
-      await session.start();
-
-      const p1 = session.send('first', { waitForComplete: true, effort: 'auto' });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await p1;
-
-      const proc2 = createMockProcess();
-      mockSpawn.mockReturnValue(proc2);
-      const p2 = session.send('second', { waitForComplete: true });
-      setTimeout(() => closeProc(proc2, 0), 10);
-      await p2;
-
-      const args1 = mockSpawn.mock.calls[0][1] as string[];
-      const args2 = mockSpawn.mock.calls[1][1] as string[];
-      expect(args1).not.toContain('--variant');
-      expect(args2[args2.indexOf('--variant') + 1]).toBe('high');
-      expect(session.getEffort()).toBe('high');
-    });
-
-    it('honors setEffort on the next spawn', async () => {
-      const session = new PersistentOpencodeSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'bypassPermissions',
-      });
-      await session.start();
-      session.setEffort('high');
-
-      const sendPromise = session.send('hello', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await sendPromise;
-
-      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-      expect(spawnArgs[spawnArgs.indexOf('--variant') + 1]).toBe('high');
-    });
-
-    it('passes --variant alongside --session on a resumed turn', async () => {
-      const session = new PersistentOpencodeSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'bypassPermissions',
-        effort: 'high',
-        resumeSessionId: 'opencode-live-ses_persisted',
-      });
-      await session.start();
-
-      const p = session.send('hello', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await p;
-
-      const args = mockSpawn.mock.calls[0][1] as string[];
-      expect(args[args.indexOf('--session') + 1]).toBe('ses_persisted');
-      expect(args[args.indexOf('--variant') + 1]).toBe('high');
-      expect(args).not.toContain('--continue');
-    });
-
-    it('keeps read-only spawn flags when session effort is set', async () => {
-      const session = new PersistentOpencodeSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'manual',
-        sandboxMode: 'read-only',
-        effort: 'high',
-      });
-      await session.start();
-
-      const sendPromise = session.send('hello', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await sendPromise;
-
-      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-      expect(spawnArgs).toContain('--agent');
-      expect(spawnArgs).toContain('clawo-readonly');
-      expect(spawnArgs[spawnArgs.indexOf('--variant') + 1]).toBe('high');
-      const spawnOptions = mockSpawn.mock.calls[0][2] as { env: Record<string, string> };
-      expect(spawnOptions.env.OPENCODE_CONFIG_CONTENT).toBeTruthy();
-    });
   });
 
   describe('text event parsing', () => {
@@ -766,6 +562,52 @@ describe('PersistentOpencodeSession', () => {
       expect(stats.tokensOut).toBe(80);
       expect(stats.cachedTokens).toBe(50);
     });
+
+    // The model opencode chose is not in its JSON, so the registry priced every
+    // turn as Sonnet — a free default model showed up in the ledger at $0.15 a turn.
+    it('bills what opencode reported, a free model at zero', async () => {
+      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp', permissionMode: 'bypassPermissions' });
+      await session.start();
+      const sendPromise = session.send('hi', { waitForComplete: true });
+      setTimeout(() => {
+        feedLines(mockProc, [
+          envelope('step_finish', { part: { type: 'step-finish', tokens: { input: 90000, output: 2000 }, cost: 0 } }),
+          envelope('step_finish', { part: { type: 'step-finish', tokens: { input: 1000, output: 100 }, cost: 0 } }),
+        ]);
+        closeProc(mockProc, 0);
+      }, 10);
+      await sendPromise;
+      expect(session.getStats().costUsd).toBe(0);
+    });
+
+    it('sums reported cost across steps', async () => {
+      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp', permissionMode: 'bypassPermissions' });
+      await session.start();
+      const sendPromise = session.send('hi', { waitForComplete: true });
+      setTimeout(() => {
+        feedLines(mockProc, [
+          envelope('step_finish', { part: { type: 'step-finish', tokens: { input: 10, output: 5 }, cost: 0.0125 } }),
+          envelope('step_finish', { part: { type: 'step-finish', tokens: { input: 10, output: 5 }, cost: 0.0075 } }),
+        ]);
+        closeProc(mockProc, 0);
+      }, 10);
+      await sendPromise;
+      expect(session.getStats().costUsd).toBeCloseTo(0.02, 6);
+    });
+
+    it('still estimates when opencode reports no cost', async () => {
+      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp', permissionMode: 'bypassPermissions' });
+      await session.start();
+      const sendPromise = session.send('hi', { waitForComplete: true });
+      setTimeout(() => {
+        feedLines(mockProc, [
+          envelope('step_finish', { part: { type: 'step-finish', tokens: { input: 1_000_000, output: 0 } } }),
+        ]);
+        closeProc(mockProc, 0);
+      }, 10);
+      await sendPromise;
+      expect(session.getStats().costUsd).toBeGreaterThan(0);
+    });
   });
 
   describe('fallback estimation', () => {
@@ -793,25 +635,6 @@ describe('PersistentOpencodeSession', () => {
   });
 
   describe('session id capture', () => {
-    it('announces identity on the first stream envelope before completion, only once', async () => {
-      const session = new PersistentOpencodeSession({ name: 'test', cwd: '/tmp', permissionMode: 'bypassPermissions' });
-      await session.start();
-      const identities = vi.fn();
-      session.on('native_identity', identities);
-      let completed = false;
-      const send = session.send('hi', { waitForComplete: true }).then(() => {
-        completed = true;
-      });
-      const identity = new Promise<void>((resolve) => session.once('native_identity', () => resolve()));
-      feedLines(mockProc, [envelope('step_start', {}), envelope('step_start', {})]);
-      await identity;
-      expect(completed).toBe(false);
-      expect(identities).toHaveBeenCalledExactlyOnceWith(SID);
-      expect(session.getStats().opencodeSessionId).toBe(SID);
-      closeProc(mockProc, 0);
-      await send;
-    });
-
     it('captures sessionID from event envelope', async () => {
       const session = new PersistentOpencodeSession({
         name: 'test',
@@ -934,5 +757,74 @@ describe('PersistentOpencodeSession', () => {
       expect(logs.some((l) => l.includes('ANTHROPIC_API_KEY=***'))).toBe(true);
       expect(logs.some((l) => l.includes('sk-abcdef'))).toBe(false);
     });
+  });
+});
+
+describe('OpenCode 2', () => {
+  it('recognizes OpenCode 2 builds and nothing else', () => {
+    expect(isOpencodeV2('opencode2 v0.0.0-beta-17823')).toBe(true);
+    expect(isOpencodeV2('0.0.0-beta-19271')).toBe(true);
+    expect(isOpencodeV2('2.0.0')).toBe(true);
+    expect(isOpencodeV2('opencode v2.2.5')).toBe(true);
+    expect(isOpencodeV2('opencode v2.2.5')).toBe(true);
+    expect(isOpencodeV2('1.19.0')).toBe(false);
+    expect(isOpencodeV2('1.18.35')).toBe(false);
+    expect(isOpencodeV2(undefined)).toBe(false);
+  });
+
+  it('starts OpenCode 2 and folds effort into provider/model#variant', async () => {
+    versions['opencode-v2-effort'] = 'opencode v2.2.5';
+    const session = new PersistentOpencodeSession(
+      { name: 't', cwd: '/tmp', permissionMode: 'bypassPermissions', model: 'nvidia/nemotron', effort: 'high' },
+      'opencode-v2-effort',
+    );
+    const proc = createMockProcess();
+    mockSpawn.mockReset();
+    mockSpawn.mockReturnValue(proc);
+    await session.start();
+    const sendPromise = session.send('hi', { waitForComplete: true });
+    setTimeout(() => closeProc(proc, 0), 10);
+    await sendPromise;
+    const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+    expect(spawnArgs).not.toContain('--variant');
+    expect(spawnArgs[spawnArgs.indexOf('--model') + 1]).toBe('nvidia/nemotron#high');
+  });
+
+  it('recognizes an OpenCode 2 /goal command and leaves 1.x text as a prompt', () => {
+    expect(opencodeGoalArguments('/goal write DONE', 2)).toBe('write DONE');
+    expect(opencodeGoalArguments('/goal', 2)).toBe('');
+    expect(opencodeGoalArguments('/goal pause', 2)).toBe('pause');
+    expect(opencodeGoalArguments('please /goal later', 2)).toBeUndefined();
+    expect(opencodeGoalArguments('/goal write DONE', 1)).toBeUndefined();
+    expect(opencodeModelRef('nvidia/openai/openai/gpt-5.4-nano', 'high')).toEqual({
+      providerID: 'nvidia',
+      id: 'openai/openai/gpt-5.4-nano',
+      variant: 'high',
+    });
+    expect(opencodeModelRef('nvidia/openai/openai/gpt-5.4-nano', 'auto')?.variant).toBeUndefined();
+  });
+
+  it('omits a 2.x variant when no provider/model is selected', async () => {
+    versions['opencode-v2-no-model'] = '2.2.5';
+    const session = new PersistentOpencodeSession(
+      { name: 't', cwd: '/tmp', permissionMode: 'bypassPermissions', effort: 'high' },
+      'opencode-v2-no-model',
+    );
+    const proc = createMockProcess();
+    mockSpawn.mockReset();
+    mockSpawn.mockReturnValue(proc);
+    await session.start();
+    const sendPromise = session.send('hi', { waitForComplete: true });
+    setTimeout(() => closeProc(proc, 0), 10);
+    await sendPromise;
+    const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+    expect(spawnArgs).not.toContain('--variant');
+    expect(spawnArgs).not.toContain('--model');
+  });
+
+  it('starts when the version cannot be read', async () => {
+    versions['opencode-noversion-test'] = new Error('spawn ENOENT');
+    const s = new PersistentOpencodeSession({ name: 't', cwd: '/tmp' }, 'opencode-noversion-test');
+    await expect(s.start()).resolves.toBe(s);
   });
 });

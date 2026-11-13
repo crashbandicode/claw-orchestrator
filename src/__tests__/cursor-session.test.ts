@@ -5,31 +5,21 @@
  * Uses vitest mocks for child_process.spawn to avoid spawning real processes.
  */
 
-import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { SESSION_EVENT } from '../constants.js';
 
 // Mock child_process before importing the session
 const mockSpawn = vi.fn();
-const mockSpawnSync = vi.fn(() => {
-  throw new Error('cursor --list-models must be injected via setCursorModelCatalogForTests in unit tests');
-});
-const mockParameterizedCatalog = vi.fn();
-vi.mock('../cursor-parameterized-catalog.js', () => ({
-  loadCursorParameterizedCatalog: (...args: unknown[]) => mockParameterizedCatalog(...args),
-}));
-vi.mock('node:child_process', () => ({
-  spawn: (...args: unknown[]) => mockSpawn(...args),
-  spawnSync: (...args: unknown[]) => mockSpawnSync(...args),
+vi.mock('../engine-spawn.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../engine-spawn.js')>()),
+  spawnEngine: (...args: unknown[]) => mockSpawn(...args),
 }));
 
 // Import after mocking
-const { PersistentCursorSession, resolveCursorInvocation } = await import('../persistent-cursor-session.js');
-const { setCursorModelCatalogForTests } = await import('../cursor-model-effort.js');
+const { PersistentCursorSession } = await import('../persistent-cursor-session.js');
 
 // ─── Mock Process Helper ────────────────────────────────────────────────────
 
@@ -74,14 +64,6 @@ describe('PersistentCursorSession', () => {
     mockProc = createMockProcess();
     mockSpawn.mockReset();
     mockSpawn.mockReturnValue(mockProc);
-    mockSpawnSync.mockClear();
-    mockParameterizedCatalog.mockReset();
-    mockParameterizedCatalog.mockResolvedValue([]);
-    setCursorModelCatalogForTests(undefined);
-  });
-
-  afterEach(() => {
-    setCursorModelCatalogForTests(undefined);
   });
 
   // ─── start() ────────────────────────────────────────────────────────────
@@ -103,62 +85,6 @@ describe('PersistentCursorSession', () => {
   // ─── spawn flags ────────────────────────────────────────────────────────
 
   describe('spawn flags', () => {
-    it('unwraps the Windows Cursor launcher without shell or cmd indirection', () => {
-      const root = mkdtempSync(join(tmpdir(), 'claw-cursor-launcher-'));
-      try {
-        const runtime = join(root, 'versions', '2026.08.11-e8db854');
-        mkdirSync(runtime, { recursive: true });
-        writeFileSync(join(runtime, 'node.exe'), 'test');
-        writeFileSync(join(runtime, 'index.js'), 'test');
-        const launcher = join(root, 'cursor-agent.cmd');
-        writeFileSync(launcher, '@echo off');
-
-        const invocation = resolveCursorInvocation(launcher, 'win32');
-        expect(invocation.command).toBe(join(runtime, 'node.exe'));
-        expect(invocation.prefixArgs).toEqual([join(runtime, 'index.js')]);
-        expect(invocation.env.CURSOR_INVOKED_AS).toBe('cursor-agent.cmd');
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    });
-
-    it('launches the newest installed Cursor version through the agent.cmd alias, resolved at call time', () => {
-      const root = mkdtempSync(join(tmpdir(), 'claw-cursor-alias-'));
-      try {
-        const install = (name: string) => {
-          const runtime = join(root, 'versions', name);
-          mkdirSync(runtime, { recursive: true });
-          writeFileSync(join(runtime, 'node.exe'), 'test');
-          writeFileSync(join(runtime, 'index.js'), 'test');
-          return runtime;
-        };
-        const older = install('2026.10.01-e373342');
-        const launcher = join(root, 'agent.cmd');
-        writeFileSync(launcher, '@echo off\r\nset "CURSOR_INVOKED_AS=%~nx0"\r\n');
-
-        expect(resolveCursorInvocation(launcher, 'win32').command).toBe(join(older, 'node.exe'));
-        const newer = install('2026.10.20-1234abc');
-        const invocation = resolveCursorInvocation(launcher, 'win32');
-        expect(invocation.command).toBe(join(newer, 'node.exe'));
-        expect(invocation.prefixArgs).toEqual([join(newer, 'index.js')]);
-        expect(invocation.env.CURSOR_INVOKED_AS).toBe('agent.cmd');
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    });
-
-    it('fails a Cursor launcher with no runtime instead of spawning the wrapper', () => {
-      const root = mkdtempSync(join(tmpdir(), 'claw-cursor-empty-'));
-      try {
-        mkdirSync(join(root, 'versions', '2026.10.01-e373342'), { recursive: true });
-        const launcher = join(root, 'cursor-agent.cmd');
-        writeFileSync(launcher, '@echo off');
-        expect(() => resolveCursorInvocation(launcher, 'win32')).toThrow(/no usable node\.exe\/index\.js runtime/);
-      } finally {
-        rmSync(root, { recursive: true, force: true });
-      }
-    });
-
     it('uses -p --force --trust --output-format stream-json', async () => {
       const session = new PersistentCursorSession({
         name: 'test',
@@ -182,30 +108,11 @@ describe('PersistentCursorSession', () => {
       expect(spawnArgs).toContain('sonnet-4');
     });
 
-    // Cursor continues a goal inside this process only when --single-turn is
-    // absent. cursor_goal_set sends the same text the TUI submits.
-    it('passes /goal through as the prompt and does not force a single turn', async () => {
-      const session = new PersistentCursorSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'bypassPermissions',
-      });
-      await session.start();
-
-      const sendPromise = session.send('/goal ship the fix', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await sendPromise;
-
-      const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
-      expect(spawnArgs[spawnArgs.indexOf('-p') + 1]).toBe('/goal ship the fix');
-      expect(spawnArgs).not.toContain('--single-turn');
-    });
-
     // Regression guard: `agent -p` opens a NEW chat unless --resume names one, so
     // omitting it made every turn amnesiac. Verified against 2026.08.11: without
     // the flag turn 2 has no memory of turn 1; with it, turn 2 recalls it.
     it('passes --resume with the harvested chat id on the second turn', async () => {
-      const session = new PersistentCursorSession({ permissionMode: 'bypassPermissions', name: 'test', cwd: '/tmp' });
+      const session = new PersistentCursorSession({ name: 'test', cwd: '/tmp' });
       await session.start();
 
       const p1 = session.send('first', { waitForComplete: true });
@@ -232,7 +139,6 @@ describe('PersistentCursorSession', () => {
 
     it('resumes a persisted cursor chat id from config', async () => {
       const session = new PersistentCursorSession({
-        permissionMode: 'bypassPermissions',
         name: 'test',
         cwd: '/tmp',
         resumeSessionId: 'cursor-live-chat-persisted',
@@ -569,249 +475,6 @@ describe('PersistentCursorSession', () => {
       const stats = session.getStats();
       expect(stats.turns).toBe(2);
       expect(stats.turnsSucceeded).toBe(1);
-    });
-  });
-
-  describe('model effort resolution', () => {
-    const catalog = [
-      'cursor-grok-4.6-low',
-      'cursor-grok-4.6-medium',
-      'cursor-grok-4.6-high',
-      'cursor-grok-4.6-xhigh',
-      'composer-2.5',
-      'claude-opus-5-5-high',
-      'claude-opus-5-5-xhigh',
-    ];
-
-    beforeEach(() => setCursorModelCatalogForTests(catalog));
-
-    function modelArg(args: string[]): string | undefined {
-      const i = args.indexOf('--model');
-      return i >= 0 ? args[i + 1] : undefined;
-    }
-
-    it('passes the effort-qualified catalog id for session xhigh', async () => {
-      const session = new PersistentCursorSession({
-        permissionMode: 'bypassPermissions',
-        name: 'test',
-        cwd: '/tmp',
-        model: 'cursor-grok-4.6-high',
-        effort: 'xhigh',
-      });
-      await session.start();
-      const p = session.send('hello', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await p;
-      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe('cursor-grok-4.6-xhigh');
-      expect(mockSpawnSync).not.toHaveBeenCalled();
-    });
-
-    it('applies a per-turn override without mutating session model or sticking', async () => {
-      const session = new PersistentCursorSession({
-        permissionMode: 'bypassPermissions',
-        name: 'test',
-        cwd: '/tmp',
-        model: 'cursor-grok-4.6-xhigh',
-        effort: 'xhigh',
-      });
-      await session.start();
-
-      const p1 = session.send('first', { waitForComplete: true, effort: 'low' });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await p1;
-
-      const proc2 = createMockProcess();
-      mockSpawn.mockReturnValue(proc2);
-      const p2 = session.send('second', { waitForComplete: true });
-      setTimeout(() => closeProc(proc2, 0), 10);
-      await p2;
-
-      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe('cursor-grok-4.6-low');
-      expect(modelArg(mockSpawn.mock.calls[1][1] as string[])).toBe('cursor-grok-4.6-xhigh');
-      expect(session.getEffort()).toBe('xhigh');
-    });
-
-    it('omits catalog lookup when effort is auto and passes the configured model through', async () => {
-      const session = new PersistentCursorSession({
-        permissionMode: 'bypassPermissions',
-        name: 'test',
-        cwd: '/tmp',
-        model: 'grok-4.7',
-        effort: 'auto',
-      });
-      await session.start();
-      const p = session.send('hello', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await p;
-      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe('grok-4.7');
-      expect(mockSpawnSync).not.toHaveBeenCalled();
-    });
-
-    it('rejects an unsupported effort instead of ignoring it', async () => {
-      const session = new PersistentCursorSession({
-        permissionMode: 'bypassPermissions',
-        name: 'test',
-        cwd: '/tmp',
-        model: 'composer-2.5',
-        effort: 'xhigh',
-      });
-      await session.start();
-      await expect(session.send('hello', { waitForComplete: true })).rejects.toThrow(/composer-2\.5/);
-      expect(mockSpawn).not.toHaveBeenCalled();
-    });
-
-    it('rejects grok-4.7 + xhigh instead of switching to cursor-grok-4.6-xhigh', async () => {
-      const session = new PersistentCursorSession({
-        permissionMode: 'bypassPermissions',
-        name: 'test',
-        cwd: '/tmp',
-        model: 'grok-4.7',
-        effort: 'xhigh',
-      });
-      await session.start();
-      await expect(session.send('hello', { waitForComplete: true })).rejects.toThrow(/grok-4\.7/);
-      expect(mockSpawn).not.toHaveBeenCalled();
-    });
-
-    it('launches the exact parameterized Grok 4.7 effort when the legacy listing omits it', async () => {
-      mockParameterizedCatalog.mockResolvedValue([
-        {
-          value: 'grok-4.7',
-          configOptions: [
-            { id: 'context', currentValue: '256k', options: [{ value: '256k' }] },
-            {
-              id: 'reasoning_effort',
-              category: 'thought_level',
-              currentValue: 'high',
-              options: [{ value: 'high' }, { value: 'xhigh' }],
-            },
-            { id: 'fast', currentValue: 'false', options: [{ value: 'false' }, { value: 'true' }] },
-          ],
-        },
-      ]);
-      const session = new PersistentCursorSession({ name: 'test', cwd: '/tmp', model: 'grok-4.7', effort: 'xhigh' });
-      await session.start();
-      const pending = session.send('hello', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await pending;
-      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe(
-        'grok-4.7[context=256k,reasoning_effort=xhigh,fast=false]',
-      );
-      expect(mockParameterizedCatalog).toHaveBeenCalledOnce();
-    });
-
-    it('does not launch inference if the session is stopped during discovery', async () => {
-      let finish!: (value: unknown[]) => void;
-      mockParameterizedCatalog.mockReturnValue(
-        new Promise((resolve) => {
-          finish = resolve;
-        }),
-      );
-      const session = new PersistentCursorSession({ name: 'test', cwd: '/tmp', model: 'grok-4.7', effort: 'xhigh' });
-      await session.start();
-      const pending = session.send('hello', { waitForComplete: true });
-      session.stop();
-      finish([]);
-      await expect(pending).rejects.toThrow(/stopped during model discovery/);
-      expect(mockSpawn).not.toHaveBeenCalled();
-    });
-
-    it('parameterizes a listed unsuffixed base instead of requiring catalog effort suffixes', async () => {
-      setCursorModelCatalogForTests(['claude-opus-4-8', 'composer-2.5']);
-      const session = new PersistentCursorSession({
-        permissionMode: 'bypassPermissions',
-        name: 'test',
-        cwd: '/tmp',
-        model: 'claude-opus-4-8[context=1m]',
-        effort: 'high',
-      });
-      await session.start();
-      const p = session.send('hello', { waitForComplete: true });
-      setTimeout(() => closeProc(mockProc, 0), 10);
-      await p;
-      expect(modelArg(mockSpawn.mock.calls[0][1] as string[])).toBe('claude-opus-4-8[context=1m,effort=high]');
-      expect(mockSpawnSync).not.toHaveBeenCalled();
-    });
-  });
-
-  describe('native identity', () => {
-    const nativeId = 'd9133160-dd01-402e-8dbb-8166263fff40';
-
-    it('emits native_identity with the exact chat id before the turn completes', async () => {
-      const session = new PersistentCursorSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'bypassPermissions',
-      });
-      await session.start();
-
-      const seen = new Promise<string>((resolve) => {
-        session.once(SESSION_EVENT.NATIVE_IDENTITY, (id: unknown) => resolve(String(id)));
-      });
-      const sendPromise = session.send('hello', { waitForComplete: true });
-      await vi.waitFor(() => expect(mockSpawn).toHaveBeenCalled());
-      feedLines(mockProc, [JSON.stringify({ type: 'system', subtype: 'init', session_id: nativeId })]);
-
-      await expect(seen).resolves.toBe(nativeId);
-      expect(session.getStats().cursorChatId).toBe(nativeId);
-
-      let finished = false;
-      const done = sendPromise.then((result) => {
-        finished = true;
-        return result;
-      });
-      await Promise.resolve();
-      expect(finished).toBe(false);
-
-      closeProc(mockProc, 0);
-      await done;
-      expect(finished).toBe(true);
-    });
-
-    it('emits a single native identity across repeated system init events', async () => {
-      const session = new PersistentCursorSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'bypassPermissions',
-      });
-      await session.start();
-
-      const ids: string[] = [];
-      session.on(SESSION_EVENT.NATIVE_IDENTITY, (id: unknown) => ids.push(String(id)));
-      const sendPromise = session.send('hello', { waitForComplete: true });
-      await vi.waitFor(() => expect(mockSpawn).toHaveBeenCalled());
-      feedLines(mockProc, [
-        JSON.stringify({ type: 'system', subtype: 'init', session_id: nativeId }),
-        JSON.stringify({ type: 'system', subtype: 'init', session_id: nativeId }),
-        JSON.stringify({ type: 'system', session_id: nativeId }),
-      ]);
-      await vi.waitFor(() => expect(ids).toEqual([nativeId]));
-      closeProc(mockProc, 0);
-      await sendPromise;
-      expect(ids).toEqual([nativeId]);
-      expect(session.getStats().cursorChatId).toBe(nativeId);
-    });
-
-    it('does not re-emit native identity when resuming the same Cursor thread', async () => {
-      const session = new PersistentCursorSession({
-        name: 'test',
-        cwd: '/tmp',
-        permissionMode: 'bypassPermissions',
-        resumeSessionId: `cursor-live-${nativeId}`,
-      });
-      await session.start();
-      expect(session.getStats().cursorChatId).toBe(nativeId);
-
-      const ids: string[] = [];
-      session.on(SESSION_EVENT.NATIVE_IDENTITY, (id: unknown) => ids.push(String(id)));
-      const sendPromise = session.send('hello', { waitForComplete: true });
-      await vi.waitFor(() => expect(mockSpawn).toHaveBeenCalled());
-      feedLines(mockProc, [JSON.stringify({ type: 'system', subtype: 'init', session_id: nativeId })]);
-      await vi.waitFor(() => expect(session.getStats().cursorChatId).toBe(nativeId));
-      expect(ids).toEqual([]);
-      closeProc(mockProc, 0);
-      await sendPromise;
-      expect(ids).toEqual([]);
     });
   });
 });

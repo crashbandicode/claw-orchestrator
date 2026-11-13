@@ -124,11 +124,7 @@ export const SESSION_EVENT = {
   USER_ECHO: 'user_echo',
   ASSISTANT: 'assistant',
   EVENT: 'event',
-  /**
-   * Engine-neutral: a resumable native thread/chat id became known.
-   * Payload is the id string. SessionManager binds orchestration identity
-   * immediately; do not wait for turn completion.
-   */
+  /** The engine published the native session id it can resume. */
   NATIVE_IDENTITY: 'native_identity',
 } as const;
 
@@ -140,6 +136,14 @@ export type SessionEventName = (typeof SESSION_EVENT)[keyof typeof SESSION_EVENT
 export const OPENAI_COMPAT_DEFAULT_MODEL = 'claude-sonnet-4-6';
 /** Context utilization % threshold for auto-compact */
 export const OPENAI_COMPAT_AUTO_COMPACT_THRESHOLD = 80;
+/**
+ * Turn timeout for OpenAI-compat requests. A gateway agent can spend well over
+ * TURN_TIMEOUT_MS on one reply (a nightly job writing a long log in a single
+ * tool call), and cutting it off only makes the gateway retry the same slow
+ * turn. The HTTP client's own timeout decides when to give up; this is just a
+ * ceiling. Override with OPENAI_COMPAT_TURN_TIMEOUT_MS.
+ */
+export const OPENAI_COMPAT_TURN_TIMEOUT_MS = 1_800_000;
 /** Session name prefix for OpenAI-compat sessions */
 export const OPENAI_COMPAT_SESSION_PREFIX = 'openai-';
 /** Session name prefix for ACP sessions. Also the prefix of the ACP session id itself. */

@@ -14,8 +14,7 @@
  *   metadata, hostStop kills the recorded pid + child group.
  */
 
-import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { guardChildStreams } from '../child-process-guard.js';
+import { spawn, type ChildProcess } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -29,11 +28,7 @@ interface HostProcEntry {
   cwd: string;
   env: Record<string, string>;
   since: string;
-  headless?: boolean;
 }
-
-const STATE_LOCK_FILE = `${STATE_FILE}.lock`;
-const STATE_LOCK_STALE_MS = 30_000;
 
 function readState(): Record<string, HostProcEntry> {
   try {
@@ -45,40 +40,7 @@ function readState(): Record<string, HostProcEntry> {
 
 function writeState(state: Record<string, HostProcEntry>): void {
   fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-  const temporary = `${STATE_FILE}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(state, null, 2));
-  fs.renameSync(temporary, STATE_FILE);
-}
-
-async function withStateLock<T>(action: () => T): Promise<T> {
-  fs.mkdirSync(path.dirname(STATE_FILE), { recursive: true });
-  for (let attempt = 0; attempt < 200; attempt += 1) {
-    let handle: number;
-    try {
-      handle = fs.openSync(STATE_LOCK_FILE, 'wx');
-    } catch (err) {
-      const code = (err as NodeJS.ErrnoException).code;
-      if (code !== 'EEXIST') throw err;
-      try {
-        const age = Date.now() - fs.statSync(STATE_LOCK_FILE).mtimeMs;
-        if (age > STATE_LOCK_STALE_MS) {
-          fs.rmSync(STATE_LOCK_FILE, { force: true });
-          continue;
-        }
-      } catch {
-        continue;
-      }
-      await new Promise((resolve) => setTimeout(resolve, 25));
-      continue;
-    }
-    try {
-      return action();
-    } finally {
-      fs.closeSync(handle);
-      fs.rmSync(STATE_LOCK_FILE, { force: true });
-    }
-  }
-  throw new Error(`timed out acquiring host process state lock: ${STATE_LOCK_FILE}`);
+  fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
 }
 
 function isAlive(pid: number): boolean {
@@ -105,7 +67,7 @@ export async function hostBuild(args: HostBuildArgs): Promise<BuildResult> {
   if (!fs.existsSync(path.join(args.cwd, 'package.json'))) {
     return { ok: false, error: `no package.json at ${args.cwd}` };
   }
-  const install = await runNpm(['install'], { cwd: args.cwd, env: args.buildArgs });
+  const install = await runCmd('npm', ['install'], { cwd: args.cwd, env: args.buildArgs });
   if (!install.ok) return { ok: false, error: `npm install failed: ${install.stderr.slice(0, 500)}` };
 
   // Only run build if the script exists.
@@ -113,7 +75,7 @@ export async function hostBuild(args: HostBuildArgs): Promise<BuildResult> {
     scripts?: Record<string, string>;
   };
   if (pkg.scripts?.build) {
-    const build = await runNpm(['run', 'build'], { cwd: args.cwd, env: args.buildArgs });
+    const build = await runCmd('npm', ['run', 'build'], { cwd: args.cwd, env: args.buildArgs });
     if (!build.ok) return { ok: false, error: `npm run build failed: ${build.stderr.slice(0, 500)}` };
   }
   return { ok: true, imageId: `host:${args.tag}` };
@@ -126,8 +88,6 @@ export interface HostRunArgs {
   env: Record<string, string>;
   // volumes: ignored in host mode (we run in-place)
   volumes?: Record<string, string>;
-  /** Hide the detached process window on Windows. Defaults to true. */
-  headless?: boolean;
 }
 
 /**
@@ -149,7 +109,6 @@ export async function hostRun(args: HostRunArgs): Promise<DockerRunResult> {
   const childEnv: Record<string, string> = { ...(process.env as Record<string, string>), ...args.env };
   delete childEnv.HOST_CWD;
   childEnv.PORT = String(args.hostPort);
-  const headless = args.headless ?? process.env.CLAWO_HOST_HEADED !== '1';
 
   const pkg = JSON.parse(fs.readFileSync(path.join(cwd, 'package.json'), 'utf8')) as {
     scripts?: Record<string, string>;
@@ -158,7 +117,8 @@ export async function hostRun(args: HostRunArgs): Promise<DockerRunResult> {
   let cmd: string;
   let cmdArgs: string[];
   if (pkg.scripts?.start) {
-    [cmd, cmdArgs] = npmInvocation(['start']);
+    cmd = 'npm';
+    cmdArgs = ['start'];
   } else if (pkg.main) {
     cmd = 'node';
     cmdArgs = [pkg.main];
@@ -171,30 +131,33 @@ export async function hostRun(args: HostRunArgs): Promise<DockerRunResult> {
     env: childEnv,
     detached: true,
     stdio: 'ignore',
-    windowsHide: process.platform === 'win32' && headless,
   });
+  // A failed spawn (npm or node not on PATH, the directory gone) reports on a
+  // later tick as 'error', which with no listener would end the server; wait
+  // for it or for 'spawn' before recording anything.
+  const failed = await new Promise<Error | undefined>((resolve) => {
+    child.once('spawn', () => resolve(undefined));
+    child.once('error', resolve);
+  });
+  child.on('error', () => {
+    /* the app is detached and on its own; later errors are not the server's */
+  });
+  if (failed) return { ok: false, error: `could not start ${cmd}: ${failed.message}` };
   child.unref();
-  // A command that cannot be spawned (ENOENT) reports through 'error' after this
-  // function has returned; unlistened it ends the host. The missing pid below is
-  // what the caller sees.
-  child.on('error', () => undefined);
   const pid = child.pid;
   if (typeof pid !== 'number') {
     return { ok: false, error: 'spawn returned no pid' };
   }
 
-  await withStateLock(() => {
-    const state = readState();
-    state[args.name] = {
-      pid,
-      port: args.hostPort,
-      cwd,
-      env: args.env,
-      since: new Date().toISOString(),
-      headless,
-    };
-    writeState(state);
-  });
+  const state = readState();
+  state[args.name] = {
+    pid,
+    port: args.hostPort,
+    cwd,
+    env: args.env,
+    since: new Date().toISOString(),
+  };
+  writeState(state);
   return { ok: true, containerName: args.name };
 }
 
@@ -203,29 +166,19 @@ export async function hostStop(name: string): Promise<{ ok: boolean; error?: str
   const entry = state[name];
   if (!entry) return { ok: false, error: `no host proc named ${name}` };
   if (isAlive(entry.pid)) {
-    if (process.platform === 'win32') {
-      // Node's process.kill() only terminates the npm launcher on Windows and
-      // leaves its server child alive. Kill the exact recorded process tree;
-      // no shell is involved, so names and arguments cannot be reinterpreted.
-      spawnSync('taskkill.exe', ['/PID', String(entry.pid), '/T', '/F'], {
-        windowsHide: true,
-        stdio: 'ignore',
-      });
-    } else {
+    try {
+      // Kill the process group (child + grandchildren via npm)
+      process.kill(-entry.pid, 'SIGTERM');
+    } catch {
       try {
-        // Kill the process group (child + grandchildren via npm)
-        process.kill(-entry.pid, 'SIGTERM');
+        process.kill(entry.pid, 'SIGTERM');
       } catch {
-        try {
-          process.kill(entry.pid, 'SIGTERM');
-        } catch {
-          /* already dead */
-        }
+        /* already dead */
       }
     }
     // Give it a beat then SIGKILL if still alive
     await new Promise((r) => setTimeout(r, 250));
-    if (process.platform !== 'win32' && isAlive(entry.pid)) {
+    if (isAlive(entry.pid)) {
       try {
         process.kill(-entry.pid, 'SIGKILL');
       } catch {
@@ -251,18 +204,15 @@ export async function hostStart(name: string): Promise<{ ok: boolean; error?: st
     name,
     hostPort: entry.port,
     env: { ...entry.env, HOST_CWD: entry.cwd },
-    headless: entry.headless !== false,
   });
   return r.ok ? { ok: true } : { ok: false, error: r.error };
 }
 
 export async function hostRm(name: string): Promise<{ ok: boolean; error?: string }> {
   await hostStop(name).catch(() => ({ ok: true }));
-  await withStateLock(() => {
-    const state = readState();
-    delete state[name];
-    writeState(state);
-  });
+  const state = readState();
+  delete state[name];
+  writeState(state);
   return { ok: true };
 }
 
@@ -287,40 +237,15 @@ interface CmdResult {
   stderr: string;
 }
 
-function npmInvocation(args: string[]): [string, string[]] {
-  if (process.platform !== 'win32') return ['npm', args];
-
-  // Windows does not expose `npm` as a directly executable PE file. Spawning
-  // the npm.cmd shim with shell:false fails with ENOENT/EINVAL in Node. Invoke
-  // npm-cli.js through the current Node executable instead, which also avoids
-  // shell quoting differences for paths containing spaces.
-  const candidates = [
-    process.env.npm_execpath,
-    path.join(path.dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js'),
-  ];
-  const npmCli = candidates.find((candidate): candidate is string => Boolean(candidate && fs.existsSync(candidate)));
-  if (npmCli) return [process.execPath, [npmCli, ...args]];
-
-  // Last-resort compatibility for unusual portable Node installations.
-  return ['npm.cmd', args];
-}
-
-function runNpm(args: string[], opts: { cwd: string; env?: Record<string, string> }): Promise<CmdResult> {
-  const [cmd, cmdArgs] = npmInvocation(args);
-  return runCmd(cmd, cmdArgs, opts);
-}
-
 function runCmd(cmd: string, args: string[], opts: { cwd: string; env?: Record<string, string> }): Promise<CmdResult> {
   return new Promise((resolve) => {
     const child: ChildProcess = spawn(cmd, args, {
       cwd: opts.cwd,
       env: { ...(process.env as Record<string, string>), ...(opts.env ?? {}) },
       stdio: ['ignore', 'pipe', 'pipe'],
-      windowsHide: process.platform === 'win32',
     });
     let stdout = '';
     let stderr = '';
-    guardChildStreams(child);
     child.stdout?.on('data', (d: Buffer) => (stdout += d.toString()));
     child.stderr?.on('data', (d: Buffer) => (stderr += d.toString()));
     child.on('close', (code) => resolve({ ok: code === 0, stdout, stderr }));

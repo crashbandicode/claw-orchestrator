@@ -6,6 +6,7 @@ export function sessionManagerHost(manager: SessionManager): RemoteBrokerHost {
     startSession: (config) => manager.startSession(config),
     sendMessage: (name, message, options) => manager.sendMessage(name, message, options),
     stopSession: (name) => manager.stopSession(name),
+    codexSide: (name, prompt, timeoutMs) => manager.codexSide(name, prompt, timeoutMs),
     listSessions: () => manager.listSessions(),
     listPersistedSessions: () => manager.listPersistedSessions(),
     getStatus: (name) => manager.getStatus(name),

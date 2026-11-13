@@ -7,6 +7,7 @@ export const BROKER_METHODS = [
   'session.list',
   'session.status',
   'session.overview',
+  'session.side',
   'inbox.send',
   'inbox.read',
   'inbox.deliver',

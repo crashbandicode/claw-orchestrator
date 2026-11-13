@@ -8,12 +8,18 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
+import * as os from 'node:os';
 import { EventEmitter } from 'node:events';
 import { Readable } from 'node:stream';
 
 const mockSpawn = vi.fn();
-vi.mock('node:child_process', () => ({
-  spawn: (...args: unknown[]) => mockSpawn(...args),
+const mockKillTree = vi.fn();
+vi.mock('../engine-spawn.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../engine-spawn.js')>()),
+  spawnEngine: (...args: unknown[]) => mockSpawn(...args),
+  // The real one signals the pid's process group — the mock's pid is a real
+  // number on this machine.
+  killEngineTree: (...args: unknown[]) => mockKillTree(...args),
 }));
 
 const { PersistentGrokSession } = await import('../persistent-grok-session.js');
@@ -36,8 +42,26 @@ function createMockProcess() {
 
 let mockProc: ReturnType<typeof createMockProcess>;
 
-function reply(body: Record<string, unknown>, code = 0) {
-  mockProc.stdout.push(JSON.stringify(body));
+/**
+ * Print `body` the way `--output-format streaming-json` does: the reply as
+ * `text` events, one `usage` event per request, then an `end` event carrying
+ * the rest. A refusal is a single `error` line in either format.
+ */
+function reply(body: Record<string, unknown>, code = 0, requests?: Array<Record<string, number>>) {
+  const lines: Array<Record<string, unknown>> = [];
+  if (body.type === 'error') {
+    lines.push(body);
+  } else {
+    const { text, ...rest } = body;
+    if (typeof text === 'string') {
+      for (const data of text.match(/[\s\S]{1,3}/g) ?? []) lines.push({ type: 'text', data });
+    }
+    for (const usage of requests ?? (body.usage ? [body.usage as Record<string, number>] : [])) {
+      lines.push({ type: 'usage', usage });
+    }
+    lines.push({ type: 'end', ...rest });
+  }
+  mockProc.stdout.push(lines.map((l) => JSON.stringify(l) + '\n').join(''));
   mockProc.stdout.push(null);
   mockProc.emit('close', code);
 }
@@ -53,6 +77,7 @@ const OK_RESULT = {
 beforeEach(() => {
   mockProc = createMockProcess();
   mockSpawn.mockReset();
+  mockKillTree.mockReset();
   mockSpawn.mockReturnValue(mockProc);
 });
 
@@ -70,16 +95,47 @@ describe('PersistentGrokSession — flags', () => {
     expect(mockSpawn.mock.calls[0][0]).toBe('grok');
   });
 
-  it('asks for single-turn JSON and passes the cwd', async () => {
+  it('asks for streaming JSON and passes the cwd', async () => {
     const s = new PersistentGrokSession({ name: 't', cwd: '/tmp', permissionMode: 'bypassPermissions' });
     await s.start();
     const p = s.send('hi', { waitForComplete: true });
     setTimeout(() => reply(OK_RESULT), 5);
-    await p;
+    const r = (await p) as { text: string };
     const args = spawnArgs();
     expect(args.slice(0, 2)).toEqual(['-p', 'hi']);
-    expect(args[args.indexOf('--output-format') + 1]).toBe('json');
+    expect(args[args.indexOf('--output-format') + 1]).toBe('streaming-json');
     expect(args[args.indexOf('--cwd') + 1]).toBe('/tmp');
+    // The reply arrives in pieces and is joined back together.
+    expect(r.text).toBe('PING');
+  });
+
+  it("measures the context by the turn's last request, not the turn's summed usage", async () => {
+    // A turn makes one request per tool round; the `end` event's usage sums
+    // them (four requests of ~35k reported 141k on 1.0.77). Each request has
+    // its own `usage` event, and the last one is the context.
+    const s = new PersistentGrokSession({ name: 't', cwd: '/tmp', model: 'grok-4.6' });
+    await s.start();
+    const p = s.send('hi', { waitForComplete: true });
+    const request = (cached: number) => ({ input_tokens: 1_000, output_tokens: 30, cache_read_input_tokens: cached });
+    setTimeout(
+      () =>
+        reply(
+          {
+            ...OK_RESULT,
+            usage: { input_tokens: 4_000, output_tokens: 120, cache_read_input_tokens: 398_000 },
+          },
+          0,
+          [request(98_000), request(99_000), request(100_000), request(101_000)],
+        ),
+      5,
+    );
+    await p;
+    const stats = s.getStats();
+    // Spend is still the whole turn's.
+    expect(stats.tokensIn).toBe(4_000);
+    expect(stats.cachedTokens).toBe(398_000);
+    // grok-4.6's 500K window: 102,000 is 20%, where the sum read 80%.
+    expect(stats.contextPercent).toBe(20);
   });
 
   it("maps our `manual` permission mode onto grok's `default`", async () => {
@@ -142,10 +198,20 @@ describe('PersistentGrokSession — flags', () => {
     const stats = s.getStats();
     expect(stats.tokensIn).toBe(19_393);
     expect(stats.cachedTokens).toBe(230_590);
-    // 249,983 of grok-4.6's 500K window. `input_tokens` alone would say 4%.
+    // 249,983 of grok-4.7's 500K window. `input_tokens` alone would say 4%.
     expect(stats.contextPercent).toBe(50);
     // Spend still comes from the engine, untouched by the registry.
     expect(stats.costUsd).toBeCloseTo(0.0442, 10);
+  });
+
+  it('bills as the model grok reports when none was configured', async () => {
+    const s = new PersistentGrokSession({ name: 't', cwd: '/tmp', permissionMode: 'bypassPermissions' });
+    await s.start();
+    expect(s.getCost().model).toBe('grok-4.7');
+    const p = s.send('hi', { waitForComplete: true });
+    setTimeout(() => reply({ ...OK_RESULT, modelUsage: { 'grok-4.6': { modelCalls: 1, costUSD: 0.0125 } } }), 5);
+    await p;
+    expect(s.getCost().model).toBe('grok-4.6');
   });
 
   // grok 1.0.13 grew a programmatic surface for options this project already
@@ -226,15 +292,30 @@ describe('PersistentGrokSession — flags', () => {
   // plan mode refused a direct write and a shell write, then lost to the third
   // prompt — the session spawned a subagent and the file appeared. Until that
   // is closed and proven, read-only stays refused rather than approximated.
-  it('refuses read-only, and says what was measured', async () => {
+  // Read-only is grok's OS sandbox profile, not a tool allowlist: the allowlist
+  // was measured losing to a delegated subagent on 1.0.13.
+  it("runs read-only inside grok's read-only sandbox profile", async () => {
     const s = new PersistentGrokSession({
       name: 't',
-      cwd: '/tmp',
+      cwd: process.cwd(),
       permissionMode: 'bypassPermissions',
       sandboxMode: 'read-only',
     });
     await s.start();
-    await expect(s.send('hi', { waitForComplete: true })).rejects.toThrow(/subagent still wrote to disk/);
+    const p = s.send('hi', { waitForComplete: true });
+    setTimeout(() => reply(OK_RESULT), 5);
+    await p;
+    const args = spawnArgs();
+    expect(args[args.indexOf('--sandbox') + 1]).toBe('read-only');
+  });
+
+  it('passes no sandbox profile when the session is not read-only', async () => {
+    const s = new PersistentGrokSession({ name: 't', cwd: process.cwd(), permissionMode: 'bypassPermissions' });
+    await s.start();
+    const p = s.send('hi', { waitForComplete: true });
+    setTimeout(() => reply(OK_RESULT), 5);
+    await p;
+    expect(spawnArgs()).not.toContain('--sandbox');
   });
 
   it('omits --effort for auto', async () => {
@@ -376,15 +457,74 @@ describe('PersistentGrokSession — failure handling', () => {
     await expect(p).rejects.toThrow('model unavailable');
   });
 
-  it('refuses read-only rather than running writable under a read-only label', async () => {
+  // grok 1.0.46 answers a refused turn (free-tier usage limit, auth) with an
+  // error object, not a result. Reading only `error` resolved the turn as an
+  // empty reply, and the caller saw "did not report the turn as succeeded".
+  it('surfaces the message of a type:error object', async () => {
+    const s = new PersistentGrokSession({ name: 't', cwd: '/tmp', permissionMode: 'bypassPermissions' });
+    await s.start();
+    const p = s.send('hi', { waitForComplete: true });
+    setTimeout(() => reply({ type: 'error', message: 'You have reached your usage limit for now.' }, 1), 5);
+    await expect(p).rejects.toThrow('You have reached your usage limit for now.');
+  });
+
+  // A plain kill ends only the direct child: under a launcher, or behind a
+  // Windows shim, the engine itself would keep running past the deadline.
+  it('ends the whole process tree when a turn times out', async () => {
+    const s = new PersistentGrokSession({ name: 't', cwd: '/tmp', permissionMode: 'bypassPermissions' });
+    await s.start();
+    await expect(s.send('hi', { waitForComplete: true, timeout: 10 })).rejects.toThrow(/Timeout waiting for Grok/);
+    expect(mockKillTree).toHaveBeenCalledWith(mockProc);
+    expect(mockProc.kill).not.toHaveBeenCalled();
+  });
+
+  // grok's read-only profile leaves the temp directory writable, so a project
+  // there would be writable under a read-only label.
+  it('refuses read-only for a project under the temp directory', async () => {
     const s = new PersistentGrokSession({
       name: 't',
-      cwd: '/tmp',
+      cwd: os.tmpdir(),
       permissionMode: 'bypassPermissions',
       sandboxMode: 'read-only',
     });
     await s.start();
-    await expect(s.send('hi', { waitForComplete: true })).rejects.toThrow(/do not support sandboxMode: read-only/);
+    await expect(s.send('hi', { waitForComplete: true })).rejects.toThrow(/temp directory/);
     expect(mockSpawn).not.toHaveBeenCalled();
+  });
+
+  // grok 1.0.50 warns and runs unsandboxed when a profile cannot be applied.
+  it('stops the turn when grok says the sandbox could not be applied', async () => {
+    const s = new PersistentGrokSession({
+      name: 't',
+      cwd: process.cwd(),
+      permissionMode: 'bypassPermissions',
+      sandboxMode: 'read-only',
+    });
+    await s.start();
+    const p = s.send('hi', { waitForComplete: true });
+    setTimeout(
+      () => mockProc.stderr.emit('data', Buffer.from('warning: sandbox could not be applied: Landlock unavailable\n')),
+      5,
+    );
+    await expect(p).rejects.toThrow(/could not apply its read-only sandbox/);
+    expect(mockKillTree).toHaveBeenCalledWith(mockProc);
+  });
+
+  it('refuses read-only on a platform without an OS sandbox', async () => {
+    const original = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32' });
+    try {
+      const s = new PersistentGrokSession({
+        name: 't',
+        cwd: process.cwd(),
+        permissionMode: 'bypassPermissions',
+        sandboxMode: 'read-only',
+      });
+      await s.start();
+      await expect(s.send('hi', { waitForComplete: true })).rejects.toThrow(/Seatbelt or Landlock/);
+      expect(mockSpawn).not.toHaveBeenCalled();
+    } finally {
+      Object.defineProperty(process, 'platform', { value: original });
+    }
   });
 });

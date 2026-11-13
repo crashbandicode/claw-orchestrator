@@ -1,6 +1,6 @@
 # MCP integration
 
-Claw Orchestrator ships a Model Context Protocol (MCP) server (`clawo-mcp`) so any MCP-compatible host can drive its 85 tools.
+Claw Orchestrator ships a Model Context Protocol (MCP) server (`clawo-mcp`) so any MCP-compatible host can drive its 79 tools.
 
 This document covers:
 
@@ -8,6 +8,7 @@ This document covers:
 - [Host configuration](#host-configuration)
   - [Hermes Agent](#hermes-agent)
   - [Claude Desktop / Claude Code](#claude-desktop--claude-code)
+  - [Codex CLI](#codex-cli)
   - [Cursor](#cursor)
   - [Cline (VS Code)](#cline-vs-code)
   - [Continue](#continue)
@@ -32,15 +33,14 @@ Tools fall into a few groups:
 | Group                   | Examples                                                                                                                                                              |
 | ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Session lifecycle       | `session_start`, `session_send`, `session_handoff`, `session_stop`, `session_list`, `session_grep`, `session_compact`, `session_update_tools`, `session_switch_model` |
-| Cross-session messaging | `session_send_to`, `session_inbox`, `session_deliver_inbox`, `thread_register`, `thread_mailbox_send`, `thread_mailbox_read`, `thread_mailbox_ack`, `thread_mailbox_wait` |
+| Cross-session messaging | `session_send_to`, `session_inbox`, `session_deliver_inbox`                                                                                                           |
 | Status / introspection  | `sessions_overview`, `coding_session_status`, `coding_agents_list`                                                                                                    |
 | Multi-agent council     | `council_start`, `council_status`, `council_abort`, `council_inject`, `council_review`, `council_accept`, `council_reject`                                            |
 | Ultraplan / ultrareview | `ultraplan_start`, `ultraplan_status`, `ultrareview_start`, `ultrareview_status`                                                                                      |
-| Autoloop                | `autoloop_start`, `autoloop_chat`, `autoloop_status`, `autoloop_list`, `autoloop_reset_agent`, `autoloop_stop`                                                        |
-| Codex specifics         | `codex_resume`, `codex_review`, `codex_goal_set`, `codex_goal_get`, `codex_goal_pause`, `codex_goal_resume`, `codex_goal_clear`, `codex_side`                         |
+| Autoloop                | `autoloop_start`, `autoloop_chat`, `autoloop_status`, `autoloop_list`, `autoloop_reset_agent`, `autoloop_stop`, `autoloop_resume`                                     |
+| Codex specifics         | `codex_resume`, `codex_review`, `codex_goal_set`, `codex_goal_get`, `codex_goal_pause`, `codex_goal_resume`, `codex_goal_clear`                                       |
 | Codex app-server        | `codex_interrupt`, `codex_steer`, `codex_fork`, `codex_rollback`, `codex_models`, `codex_thread_list`                                                                 |
 | Claude specifics        | `claude_goal_set`, `claude_goal_status`, `claude_goal_clear`, `claude_agents_list`, `plugin_details`                                                                  |
-| Cursor specifics        | `cursor_goal_set`                                                                                                                                                     |
 | Fan-out                 | `fanout_start`, `fanout_status`, `fanout_abort`                                                                                                                       |
 | Workflow & verification | `workflow_start`, `workflow_status`, `workflow_list`, `workflow_resume`, `workflow_cancel`, `workflow_steer`, `workflow_approve`, `verify_run`                        |
 | Ultraapp                | `ultraapp_*` (14 tools) — see [`ultraapp.md`](./ultraapp.md)                                                                                                          |
@@ -58,9 +58,11 @@ npm install -g @enderfga/claw-orchestrator
 
 When invoked, `clawo-mcp`:
 
-1. Sets `CLAWO_NO_EMBEDDED_SERVER=1` so the orchestrator does not bind its HTTP control plane (port 18796) — MCP-only deployments do not need it.
+1. Sets `CLAWO_NO_EMBEDDED_SERVER=1` (unless the variable is already set) so the orchestrator does not bind its HTTP control plane (port 18796) — MCP-only deployments do not need it.
 2. Captures the plugin's registered tools via an in-memory shim.
 3. Speaks MCP over stdio. All log lines go to stderr; stdout is reserved for the protocol.
+
+A `tools/call` returns the tool's result as text content blocks. A tool that throws, or a name that is not advertised, comes back as a result with `isError: true` and the message as text.
 
 ---
 
@@ -115,7 +117,26 @@ Hermes prefixes tool names with `mcp_<server>_`. The model sees the prefixed nam
 }
 ```
 
-For Claude Code (`~/.claude.json` or per-project `.mcp.json`), use the same shape under `mcpServers`.
+For Claude Code, run `claude mcp add clawo -- clawo-mcp` (add `-e KEY=value` for each variable), or
+write the same shape under `mcpServers` in `~/.claude.json` or a per-project `.mcp.json`.
+
+### Codex CLI
+
+```bash
+codex mcp add clawo -- clawo-mcp
+```
+
+or in `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.clawo]
+command = "clawo-mcp"
+```
+
+Codex then offers the tools in every local session — `codex exec`, the TUI and `codex app-server`. For a
+one-off run without touching the config, pass `-c 'mcp_servers.clawo.command="clawo-mcp"'`. Each Codex
+session starts its own `clawo-mcp` process, so the sessions one Codex session starts through it are not
+visible from another.
 
 ### Cursor
 
@@ -227,15 +248,15 @@ Hosts deliberately do not forward your full shell environment to MCP subprocesse
 | `GEMINI_API_KEY`             | Multi-model proxy (Gemini models)                                          |
 | `GATEWAY_URL`, `GATEWAY_KEY` | Routing through an OpenClaw / Anthropic-style gateway                      |
 | `CLAWO_MCP_TOOLS`            | Comma-separated allowlist of tool names; unlisted tools are not advertised |
-| `CLAWO_NO_EMBEDDED_SERVER`   | Suppresses port 18796 binding. `clawo-mcp` sets this automatically         |
+| `CLAWO_NO_EMBEDDED_SERVER`   | `1` suppresses port 18796 binding. `clawo-mcp` sets it when it is unset    |
 
-The engines themselves (`claude`, `codex`, `agy`, `grok`, `opencode`) must also be installed and authenticated on the host machine — `clawo-mcp` spawns them as subprocesses, it does not bundle them.
+The engines themselves (`claude`, `codex`, `agy`, `grok`, `opencode`, and any ACP agent you start with `engine: 'acp'`, such as `kimi` or `dsh`) must also be installed and authenticated on the host machine — `clawo-mcp` spawns them as subprocesses, it does not bundle them.
 
 ---
 
 ## Tool filtering
 
-85 tools is a lot for a small context window. Reduce noise either at the host level (most hosts have an `include` / `exclude` filter — see Hermes example above) or at the server level via `CLAWO_MCP_TOOLS`:
+79 tools is a lot for a small context window. Reduce noise either at the host level (most hosts have an `include` / `exclude` filter — see Hermes example above) or at the server level via `CLAWO_MCP_TOOLS`:
 
 ```bash
 CLAWO_MCP_TOOLS="session_start,session_send,session_stop,council_start,council_status" clawo-mcp
@@ -261,11 +282,14 @@ For "let the model commission an ultrareview before merging":
 
 `clawo-mcp` advertises [tool annotations](https://modelcontextprotocol.io/specification/server/tools#annotations) so hosts can prefer safer tools when reasoning:
 
-| Annotation                        | Tools                                                                                                                                                                                                                                                                |
-| --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `readOnlyHint` + `idempotentHint` | `session_list`, `sessions_overview`, `coding_session_status`, `session_grep`, `session_inbox`, `coding_agents_list`, `team_list`, `council_status`, `council_review`, `ultraplan_status`, `ultrareview_status`, `autoloop_status`, `autoloop_list`, `codex_goal_get` |
-| `destructiveHint`                 | `session_stop`, `council_abort`, `council_accept`, `council_reject`, `autoloop_stop`, `project_purge`                                                                                                                                                                |
-| `openWorldHint`                   | All tools that make outbound model API calls (most session / council / ultraplan / autoloop tools)                                                                                                                                                                   |
+| Annotation                        | Tools                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| --------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `readOnlyHint` + `idempotentHint` | `session_list`, `sessions_overview`, `coding_session_status`, `session_grep`, `session_inbox`, `coding_agents_list`, `team_list`, `council_status`, `council_review`, `ultraplan_status`, `ultrareview_status`, `autoloop_status`, `autoloop_list`, `codex_goal_get`, `claude_goal_status`, `claude_agents_list`, `plugin_details`, `codex_models`, `codex_thread_list`, `fanout_status`, `workflow_status`, `workflow_list`, `ultraapp_list`, `ultraapp_get`, `ultraapp_status`                                                                                        |
+| `destructiveHint`                 | `session_stop`, `council_abort`, `council_accept`, `council_reject`, `autoloop_stop`, `project_purge`, `codex_interrupt`, `codex_rollback`, `fanout_abort`, `workflow_cancel`, `ultraapp_build_cancel`, `ultraapp_promote_version`, `ultraapp_stop_container`, `ultraapp_delete`                                                                                                                                                                                                                                                                                        |
+| `openWorldHint`                   | `session_start`, `session_send`, `session_handoff`, `team_send`, `session_send_to`, `session_deliver_inbox`, `council_start`, `council_inject`, `ultraplan_start`, `ultrareview_start`, `autoloop_start`, `autoloop_chat`, `autoloop_resume`, `codex_resume`, `codex_review`, `codex_goal_set`, `codex_goal_resume`, `session_compact`, `claude_goal_set`, `codex_steer`, `fanout_start`, `workflow_start`, `workflow_resume`, `workflow_approve`, `verify_run`, `ultraapp_new`, `ultraapp_answer`, `ultraapp_add_file`, `ultraapp_spec_edit`, `ultraapp_build_start`, `ultraapp_feedback` |
+| none                              | `autoloop_reset_agent`, `codex_goal_pause`, `codex_goal_clear`, `session_update_tools`, `session_switch_model`, `claude_goal_clear`, `codex_fork`, `workflow_steer`, `ultraapp_start_container`                                                                                                                                                                                                                                                                                                                                                                         |
+
+Every registered tool has an entry. A hint that is not set takes the MCP default — not read-only, destructive, open-world — so the tools in the last row are advertised at the defaults, and so is each unset hint in the other rows.
 
 ---
 
@@ -274,7 +298,7 @@ For "let the model commission an ultrareview before merging":
 **The host shows no tools after restart**
 
 - Confirm `clawo-mcp` resolves on PATH: `which clawo-mcp`. If you used a non-global install, use the absolute path in `command`.
-- Confirm the host logs (Hermes: `~/.hermes/logs/`, Claude Desktop: View → Open Logs Folder). Look for the `[clawo-mcp]` lines.
+- Confirm the host logs (Hermes: `~/.hermes/logs/`, Claude Desktop: View → Open Logs Folder). Look for the `[clawo-mcp]` lines; a server that started prints `mcp server ready — exposing N of M tools over stdio`.
 
 **Engine starts but fails with `command not found`**
 
@@ -286,7 +310,7 @@ For "let the model commission an ultrareview before merging":
 
 **Tool list comes back empty**
 
-- `CLAWO_MCP_TOOLS` filter is set to names that don't exist. Drop it and check `tools/list` again, then add back the correct names. Stderr will print a warning.
+- `CLAWO_MCP_TOOLS` filter is set to names that don't exist. Stderr prints a warning that lists every available tool name; correct the filter from that list, or drop it to expose everything.
 
 **Port 18796 in use error**
 
@@ -296,14 +320,12 @@ For "let the model commission an ultrareview before merging":
 
 ## MCP vs OpenClaw plugin: when to use which
 
-| Use case                                                                                                                              | Recommended form                  |
-| ------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------- |
-| You already run OpenClaw and want the tools available to every OpenClaw agent                                                         | OpenClaw plugin                   |
-| You want to drive coding agents from Hermes Agent, Claude Desktop, Cursor, Cline, Continue, Zed, Windsurf, Goose, or another MCP host | MCP server                        |
-| You want to call the orchestrator from a non-MCP custom runtime (Python, Go, …)                                                       | Standalone `clawo serve` HTTP API |
+| Use case                                                                                                                              | Recommended form                                                                       |
+| ------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| You already run OpenClaw and want the tools available to every OpenClaw agent                                                         | OpenClaw plugin                                                                        |
+| You want to drive coding agents from Hermes Agent, Claude Desktop, Cursor, Cline, Continue, Zed, Windsurf, Goose, or another MCP host | MCP server                                                                             |
+| You want to call the orchestrator from a non-MCP custom runtime (Python, Go, …)                                                       | Standalone `clawo serve` HTTP API                                                      |
+| You want an OpenAI-compatible client (a webchat, a gateway) to talk to a coding session                                               | `/v1/chat/completions` on `clawo serve` — see [`openai-compat.md`](./openai-compat.md) |
+| You want an editor (Zed, JetBrains, Neovim, Emacs, VS Code) to use the orchestrator as its coding agent                               | ACP agent (`clawo acp`) — see [`acp.md`](./acp.md)                                     |
 
-The same package supports all three — they share the SessionManager and tool definitions. Pick whichever entry point matches your host.
-
-## Open-session capacity
-
-Add `"CLAWO_MAX_CONCURRENT_SESSIONS": "32"` to the MCP registration's `env` object to allow 32 open sessions per MCP process, or use `"0"` for unlimited. OpenCode registrations call this object `environment`. The default remains five. Idle sessions count until stopped or expired; this is independent of provider rate limits and the host harness's native delegation limit. Reconnect an idle MCP server to apply changes without interrupting active workers.
+The same package supports all of these — they share the SessionManager, and the MCP server and the OpenClaw plugin share the tool definitions. Pick whichever entry point matches your host.

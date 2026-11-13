@@ -29,7 +29,6 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { execFileSync, spawn } from 'node:child_process';
 import type { ISession, SessionConfig } from '../types.js';
-import { defaultOrchestrationOutboxFile, type OrchestrationLifecycleEvent } from '../orchestration-events.js';
 
 const HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-inv-home-'));
 process.env.HOME = HOME;
@@ -45,6 +44,8 @@ interface Observed {
 }
 
 let observed: Observed[] = [];
+/** What each fake turn costs; tests that measure spend set it, the rest leave it at 0. */
+let fakeTurnCostUsd = 0;
 let mgr: SessionManager;
 let wfDir: string;
 
@@ -58,9 +59,6 @@ let wfDir: string;
  */
 class FakeSession extends EventEmitter implements Partial<ISession> {
   sessionId = `fake-${Math.random().toString(36).slice(2, 8)}`;
-  get threadId(): string {
-    return this.sessionId;
-  }
   private stats = {
     turns: 0,
     turnsSucceeded: 0,
@@ -85,6 +83,7 @@ class FakeSession extends EventEmitter implements Partial<ISession> {
   async send(message: string): Promise<{ output: string; events: never[] }> {
     this.stats.turns++;
     this.stats.turnsSucceeded++;
+    this.stats.costUsd += fakeTurnCostUsd;
     const record = observed.find((o) => o.config.name === this.config.name);
     record?.messages.push(message);
     // An agent that is allowed to write, writes. What stops it is engine-specific,
@@ -107,7 +106,7 @@ class FakeSession extends EventEmitter implements Partial<ISession> {
     return { ...this.stats };
   }
   getCost(): { totalCostUsd: number; totalUsd: number } {
-    return { totalCostUsd: 0, totalUsd: 0 };
+    return { totalCostUsd: this.stats.costUsd, totalUsd: this.stats.costUsd };
   }
   getHistory(): never[] {
     return [];
@@ -236,6 +235,7 @@ function holdLock(
 
 beforeEach(() => {
   observed = [];
+  fakeTurnCostUsd = 0;
   wfDir = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-inv-wf-'));
   process.env.CLAWO_WF_DIR = wfDir;
   mgr = makeManager();
@@ -285,6 +285,28 @@ describe('the legacy API contract survives the adapter', () => {
     // The per-agent prompt, not the shared task.
     expect(alpha.messages[0]).toBe('ALPHA PROMPT');
     expect(beta.messages[0]).toBe('BETA PROMPT');
+
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('fan-out status tells a synthesis that failed apart from one never requested', async () => {
+    const cwd = gitRepo();
+    const start = mgr.startSession.bind(mgr);
+    mgr.startSession = async (config) => {
+      if (config.name?.endsWith('-synthesis')) throw new Error('synthesis engine unavailable');
+      return start(config);
+    };
+    const fan = await mgr.fanoutStart({
+      task: 't',
+      projectDir: cwd,
+      agents: [{ name: 'a' }, { name: 'b' }],
+      synthesize: true,
+    });
+    await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(fan.id);
+
+    const status = mgr.fanoutStatus(fan.id);
+    expect(status.synthesis).toBeUndefined();
+    expect(status.synthesisError).toBe('synthesis engine unavailable');
 
     fs.rmSync(cwd, { recursive: true, force: true });
   });
@@ -349,6 +371,100 @@ describe('the legacy API contract survives the adapter', () => {
     fs.rmSync(cwd, { recursive: true, force: true });
   });
 
+  it('fan-out forwards per-agent sandboxMode read-only for agy, codex, cursor, and claude', async () => {
+    const cwd = gitRepo();
+    const agents = [
+      { name: 'agy-ro', engine: 'agy' as const, sandboxMode: 'read-only' as const },
+      { name: 'codex-ro', engine: 'codex' as const, sandboxMode: 'read-only' as const },
+      { name: 'cursor-ro', engine: 'cursor' as const, sandboxMode: 'read-only' as const },
+      { name: 'claude-ro', engine: 'claude' as const, sandboxMode: 'read-only' as const },
+    ];
+    const fan = await mgr.fanoutStart({
+      task: 'SHARED TASK',
+      projectDir: cwd,
+      agents,
+    });
+    await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(fan.id);
+
+    for (const agent of agents) {
+      const started = observed.find((o) => o.config.name?.endsWith(`-${agent.name}`))!;
+      expect(started.config).toMatchObject({
+        engine: agent.engine,
+        sandboxMode: 'read-only',
+      });
+    }
+
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('fan-out keeps bypassPermissions and omits sandboxMode when both fields are omitted', async () => {
+    const cwd = gitRepo();
+    const fan = await mgr.fanoutStart({
+      task: 'SHARED TASK',
+      projectDir: cwd,
+      agents: [
+        { name: 'agy-def', engine: 'agy' },
+        { name: 'codex-def', engine: 'codex' },
+        { name: 'cursor-def', engine: 'cursor' },
+        { name: 'claude-def', engine: 'claude' },
+      ],
+    });
+    await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(fan.id);
+
+    for (const suffix of ['agy-def', 'codex-def', 'cursor-def', 'claude-def']) {
+      const started = observed.find((o) => o.config.name?.endsWith(`-${suffix}`))!;
+      expect(started.config.permissionMode).toBe('bypassPermissions');
+      expect(started.config.sandboxMode).toBeUndefined();
+    }
+
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('a resumed fan-out replays per-agent sandboxMode and permissionMode from its stored spec', async () => {
+    const cwd = gitRepo();
+    const fan = await mgr.fanoutStart({
+      task: 'SHARED TASK',
+      projectDir: cwd,
+      agents: [
+        {
+          name: 'ro-agent',
+          engine: 'codex',
+          permissionMode: 'plan',
+          sandboxMode: 'read-only',
+        },
+      ],
+    });
+    const kernel = (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel;
+    await kernel.wait(fan.id);
+
+    const first = observed.find((o) => o.config.name?.endsWith('-ro-agent'))!;
+    expect(first.config).toMatchObject({ permissionMode: 'plan', sandboxMode: 'read-only' });
+
+    const { acquireLease, commit, loadRun, releaseLease } = await import('../kernel/store.js');
+    const record = loadRun(fan.id)!;
+    const nodeId = Object.keys(record.nodes)[0]!;
+    record.state = 'running';
+    record.endedAt = undefined;
+    record.currentNode = nodeId;
+    record.nodes[nodeId]!.state = 'running';
+    record.nodes[nodeId]!.output = undefined;
+    record.nodes[nodeId]!.data = undefined;
+    const crashed = acquireLease(fan.id, 'crashed-process');
+    expect(commit(crashed, { record }).outcome).toBe('committed');
+    expect(releaseLease(crashed)).toBe('released');
+
+    await mgr.shutdown();
+    mgr = makeManager();
+    await mgr.workflowResume(fan.id);
+    await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(fan.id);
+
+    const replays = observed.filter((o) => o.config.name?.endsWith('-ro-agent'));
+    expect(replays).toHaveLength(2);
+    expect(replays[1]!.config).toMatchObject({ permissionMode: 'plan', sandboxMode: 'read-only' });
+
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
   it('council delivers persona, engine, model, effort, and budget', { timeout: 60_000 }, async () => {
     const cwd = gitRepo();
     const council = await mgr.councilStart('build it', {
@@ -369,65 +485,137 @@ describe('the legacy API contract survives the adapter', () => {
 
     fs.rmSync(cwd, { recursive: true, force: true });
   });
-});
 
-describe('Memento lifecycle through the durable kernel', () => {
-  function events(runId: string): OrchestrationLifecycleEvent[] {
-    return fs
-      .readFileSync(defaultOrchestrationOutboxFile(), 'utf8')
-      .trim()
-      .split('\n')
-      .map((line) => JSON.parse(line) as OrchestrationLifecycleEvent)
-      .filter((e) => e.run_id === runId);
-  }
-
-  it.each(['fanout', 'council'] as const)(
-    'preserves %s child identity and terminal completion',
+  it(
+    'council sandboxMode: councilStart forwards each mode and keeps permissionMode independent',
     { timeout: 60_000 },
-    async (kind) => {
+    async () => {
       const cwd = gitRepo();
-      const config = {
-        projectDir: cwd,
-        agents: [{ name: 'reviewer', emoji: '', persona: 'Review', engine: 'codex' as const }],
+      const seats = [
+        { name: 'ro', emoji: '', persona: 'P', engine: 'codex' as const, sandboxMode: 'read-only' as const },
+        {
+          name: 'ww',
+          emoji: '',
+          persona: 'P',
+          engine: 'agy' as const,
+          sandboxMode: 'workspace-write' as const,
+        },
+        {
+          name: 'dfa',
+          emoji: '',
+          persona: 'P',
+          engine: 'claude' as const,
+          sandboxMode: 'danger-full-access' as const,
+          permissionMode: 'plan' as const,
+        },
+      ];
+      const council = await mgr.councilStart('build it', {
+        agents: seats,
         maxRounds: 1,
-      };
-      const run =
-        kind === 'fanout'
-          ? await mgr.fanoutStart({ ...config, task: 'Review' })
-          : await mgr.councilStart('Review', config);
-      await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(run.id);
-      const emitted = events(run.id);
-      expect(emitted.filter((e) => e.event === 'run.started')).toHaveLength(1);
-      expect(emitted.some((e) => e.event === 'agent.identity_bound' && e.native_session_id?.startsWith('fake-'))).toBe(
-        true,
-      );
-      expect(emitted.filter((e) => e.event === 'run.status').map((e) => e.run_status)).toEqual(['completed']);
-      expect(emitted.every((e) => e.run_kind === kind)).toBe(true);
+        projectDir: cwd,
+      });
+      await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(council.id);
+
+      const ro = observed.find((o) => o.config.name?.includes('-ro-r'))!;
+      const ww = observed.find((o) => o.config.name?.includes('-ww-r'))!;
+      const dfa = observed.find((o) => o.config.name?.includes('-dfa-r'))!;
+      // Assert sandboxMode alone so a RED AssertionError names the key (vitest
+      // abbreviates multi-key toMatchObject diffs and can hide it).
+      expect(ro.config).toMatchObject({ sandboxMode: 'read-only' });
+      expect(ro.config).toMatchObject({ engine: 'codex', permissionMode: 'bypassPermissions' });
+      expect(ww.config).toMatchObject({ sandboxMode: 'workspace-write' });
+      expect(ww.config).toMatchObject({ engine: 'agy', permissionMode: 'bypassPermissions' });
+      expect(dfa.config).toMatchObject({ sandboxMode: 'danger-full-access' });
+      expect(dfa.config).toMatchObject({ engine: 'claude', permissionMode: 'plan' });
+
       fs.rmSync(cwd, { recursive: true, force: true });
     },
   );
 
-  it('allows more than five fanout children with an unlimited capacity', async () => {
-    await mgr.shutdown();
-    mgr = makeManager();
-    (mgr as unknown as { pluginConfig: { maxConcurrentSessions: number } }).pluginConfig.maxConcurrentSessions = 0;
-    expect(mgr.freeSessionSlots()).toBe(Infinity);
-    const cwd = gitRepo();
-    const run = await mgr.fanoutStart({
-      task: 'Review',
-      projectDir: cwd,
-      agents: Array.from({ length: 8 }, (_, i) => ({ name: `a${i}` })),
-    });
-    await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(run.id);
-    expect(observed).toHaveLength(8);
-    expect(mgr.fanoutStatus(run.id).results).toHaveLength(8);
-    expect(
-      events(run.id)
-        .filter((e) => e.event === 'run.status')
-        .map((e) => e.run_status),
-    ).toEqual(['completed']);
-    fs.rmSync(cwd, { recursive: true, force: true });
-  });
+  it(
+    'council sandboxMode: an omitted seat sandboxMode stays omitted and defaults are unchanged',
+    { timeout: 60_000 },
+    async () => {
+      const cwd = gitRepo();
+      const council = await mgr.councilStart('build it', {
+        agents: [
+          { name: 'codex-def', emoji: '', persona: 'P', engine: 'codex' },
+          { name: 'claude-def', emoji: '', persona: 'P', engine: 'claude' },
+        ],
+        maxRounds: 1,
+        projectDir: cwd,
+      });
+      await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(council.id);
+
+      for (const suffix of ['codex-def', 'claude-def']) {
+        const started = observed.find((o) => o.config.name?.includes(`-${suffix}-r`))!;
+        expect(started.config.permissionMode).toBe('bypassPermissions');
+        expect(started.config.sandboxMode).toBeUndefined();
+      }
+
+      observed = [];
+      const withDefault = await mgr.councilStart('build it', {
+        agents: [{ name: 'def-pm', emoji: '', persona: 'P', engine: 'codex' }],
+        maxRounds: 1,
+        projectDir: cwd,
+        defaultPermissionMode: 'acceptEdits',
+      });
+      await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(withDefault.id);
+      const defPm = observed.find((o) => o.config.name?.includes('-def-pm-r'))!;
+      expect(defPm.config.permissionMode).toBe('acceptEdits');
+      expect(defPm.config.sandboxMode).toBeUndefined();
+
+      fs.rmSync(cwd, { recursive: true, force: true });
+    },
+  );
+
+  it(
+    'council sandboxMode: a kernel council node forwards sandboxMode through workflowStart',
+    { timeout: 60_000 },
+    async () => {
+      const cwd = gitRepo();
+      const record = await mgr.workflowStart({
+        name: 'council-sandbox',
+        cwd,
+        nodes: [
+          {
+            id: 'c',
+            kind: 'council',
+            task: 'build it',
+            maxRounds: 1,
+            projectDir: cwd,
+            agents: [
+              {
+                name: 'ro',
+                emoji: '',
+                persona: 'P',
+                engine: 'codex',
+                sandboxMode: 'read-only',
+                permissionMode: 'plan',
+              },
+              {
+                name: 'ww',
+                emoji: '',
+                persona: 'P',
+                engine: 'agy',
+                sandboxMode: 'workspace-write',
+              },
+            ],
+          },
+        ],
+      } as never);
+      await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(record.runId);
+
+      const ro = observed.find((o) => o.config.name?.includes('-ro-r'))!;
+      const ww = observed.find((o) => o.config.name?.includes('-ww-r'))!;
+      expect(ro.config).toMatchObject({ sandboxMode: 'read-only' });
+      expect(ro.config).toMatchObject({ engine: 'codex', permissionMode: 'plan' });
+      expect(ww.config).toMatchObject({ sandboxMode: 'workspace-write' });
+      expect(ww.config).toMatchObject({ engine: 'agy' });
+
+      fs.rmSync(cwd, { recursive: true, force: true });
+    },
+  );
 });
 
 // ─── 2. Read-only really is read-only ───────────────────────────────────────
@@ -489,9 +677,132 @@ describe('ultrareview is read-only', () => {
     fs.rmSync(cwd, { recursive: true, force: true });
   });
 
-  it('refuses engines that cannot run a read-only reviewer', async () => {
-    await expect(mgr.ultrareviewStart('/tmp', { engines: ['claude', 'grok'] })).rejects.toThrow(/grok/);
+  it('refuses an engine that cannot run a read-only reviewer', async () => {
     await expect(mgr.ultrareviewStart('/tmp', { engines: ['custom'] })).rejects.toThrow(/custom/);
+  });
+
+  // grok was refused here until its read-only mode moved onto grok's OS
+  // sandbox; a grok reviewer is now started read-only like the others.
+  it('starts a grok reviewer read-only', async () => {
+    const cwd = gitRepo();
+    const review = await mgr.ultrareviewStart(cwd, { agentCount: 1, engines: ['grok'] });
+    await (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(review.id);
+
+    const reviewers = observed.filter((o) => !o.config.name?.endsWith('-synthesis'));
+    expect(reviewers.map((r) => r.config.engine)).toEqual(['grok']);
+    expect(reviewers.every((r) => r.config.sandboxMode === 'read-only')).toBe(true);
+
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+});
+
+// ─── 2b. An ACP agent reaches every surface that starts one ─────────────────
+
+describe('an ACP agent is named on every surface that can start one', () => {
+  const wait = (id: string) => (mgr as unknown as { kernel: { wait(id: string): Promise<unknown> } }).kernel.wait(id);
+
+  it('fan-out starts each worker and the synthesis pass with its own ACP agent', async () => {
+    const cwd = gitRepo();
+    const fan = await mgr.fanoutStart({
+      task: 'SHARED TASK',
+      projectDir: cwd,
+      agents: [
+        { name: 'kimi', engine: 'acp', acpAgent: 'kimi-code' },
+        { name: 'dsh', engine: 'acp', acpAgent: 'dsh' },
+      ],
+      synthesize: true,
+      synthesisEngine: 'acp',
+      synthesisAcpAgent: 'kimi-code',
+    });
+    await wait(fan.id);
+
+    expect(observed.find((o) => o.config.name?.endsWith('-kimi'))!.config).toMatchObject({
+      engine: 'acp',
+      acpAgent: 'kimi-code',
+    });
+    expect(observed.find((o) => o.config.name?.endsWith('-dsh'))!.config).toMatchObject({
+      engine: 'acp',
+      acpAgent: 'dsh',
+    });
+    expect(observed.find((o) => o.config.name?.endsWith('-synthesis'))!.config).toMatchObject({
+      engine: 'acp',
+      acpAgent: 'kimi-code',
+    });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('a council agent starts its ACP agent', { timeout: 60_000 }, async () => {
+    const cwd = gitRepo();
+    const council = await mgr.councilStart('build it', {
+      agents: [{ name: 'kimi', emoji: '', persona: 'P', engine: 'acp', acpAgent: 'kimi-code' }],
+      maxRounds: 1,
+      projectDir: cwd,
+    });
+    await wait(council.id);
+    expect(observed.find((o) => o.config.name?.includes('kimi'))!.config).toMatchObject({
+      engine: 'acp',
+      acpAgent: 'kimi-code',
+    });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('a workflow agent node starts its ACP agent', async () => {
+    const cwd = gitRepo();
+    const record = await mgr.workflowStart({
+      name: 'acp-node',
+      cwd,
+      nodes: [{ id: 'work', kind: 'agent', prompt: 'do it', engine: 'acp', acpAgent: 'dsh' }],
+    } as never);
+    await wait(record.runId);
+    expect(observed.find((o) => o.config.name?.includes('-work-'))!.config).toMatchObject({
+      engine: 'acp',
+      acpAgent: 'dsh',
+    });
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it("solve's implementer carries its ACP agent into the implement node", async () => {
+    const { solveWorkflow } = await import('../kernel/templates/index.js');
+    const spec = solveWorkflow({
+      task: 't',
+      cwd: os.tmpdir(),
+      scouts: [{ name: 's', engine: 'acp', acpAgent: 'kimi-code' }],
+      implementer: { engine: 'acp', acpAgent: 'dsh' },
+    } as never);
+    const nodes = spec.nodes as Array<{ id: string; acpAgent?: string; agents?: Array<{ acpAgent?: string }> }>;
+    expect(nodes.find((n) => n.id === 'implement')!.acpAgent).toBe('dsh');
+    expect(nodes.find((n) => n.id === 'triage')!.agents![0]!.acpAgent).toBe('kimi-code');
+  });
+
+  it("counts a fan-out's and a council's agent spend in the run's cost", { timeout: 60_000 }, async () => {
+    fakeTurnCostUsd = 0.25;
+    const cwd = gitRepo();
+    const fan = await mgr.fanoutStart({
+      task: 'T',
+      projectDir: cwd,
+      agents: [{ name: 'a' }, { name: 'b' }],
+      synthesize: true,
+    });
+    await wait(fan.id);
+    const { loadRun } = await import('../kernel/store.js');
+    // two agents and the synthesis pass
+    expect(loadRun(fan.id)!.costUsd).toBeCloseTo(0.75);
+
+    const council = await mgr.councilStart('build it', {
+      agents: [{ name: 'solo', emoji: '', persona: 'P' }],
+      maxRounds: 1,
+      projectDir: cwd,
+    });
+    await wait(council.id);
+    expect(loadRun(council.id)!.costUsd).toBeGreaterThanOrEqual(0.25);
+    fs.rmSync(cwd, { recursive: true, force: true });
+  });
+
+  it('ultrareview refuses acp before starting any reviewer', async () => {
+    const cwd = gitRepo();
+    await expect(mgr.ultrareviewStart(cwd, { engines: ['acp'] })).rejects.toThrow(/cannot use acp/);
+    expect(observed).toHaveLength(0);
+    fs.rmSync(cwd, { recursive: true, force: true });
   });
 });
 

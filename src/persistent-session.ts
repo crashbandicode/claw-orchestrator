@@ -5,7 +5,8 @@
  * Enables multi-turn agent loops, continuous conversation, and real-time streaming.
  */
 
-import { spawn, ChildProcess } from 'node:child_process';
+import { ChildProcess } from 'node:child_process';
+import { spawnEngine } from './engine-spawn.js';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import * as readline from 'node:readline';
@@ -25,9 +26,9 @@ import {
   type CostBreakdown,
   getModelPricing,
 } from './types.js';
-import { resolveAlias, getContextWindow, isClaudeModel } from './models.js';
+import { resolveAlias, getContextWindow, isClaudeModel, claudeGatewayMode, gatewayModelPricing } from './models.js';
 import { sanitizeSecrets } from './sanitize.js';
-import { createStdinErrorReporter, guardChildStreams, reportSessionError } from './child-process-guard.js';
+import { removeAccountSettings, writeAccountSettings, type AccountUsage } from './claude-accounts.js';
 
 import {
   CONTEXT_HIGH_THRESHOLD,
@@ -100,16 +101,24 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
   private _engineCostUsd = 0;
   /** Set when the process was spawned with `--resume`: its first total is inherited, not ours. */
   private _costBaselinePending = false;
+  private _refusalFallbacks = 0;
+  private _lastRefusalFallback: { from: string; to: string; category?: string } | undefined;
   /** Context window the engine reported for the model it actually used. */
   private _engineContextWindow: number | null = null;
   /** Model id the CLI reported in its init event — what answers when no `model` was set. */
   private _engineModel: string | undefined;
   /** Ids of messages this session wrote whose result has not arrived yet. */
   private _unanswered = new Set<string>();
-  /** One session error per stdin fault, whether it arrives by write callback or by 'error' event. */
-  private _stdinFault = createStdinErrorReporter((err) => reportSessionError(this, err, '[claude]'));
-  /** Full prompt size of the last turn: input + cached reads + cache writes. */
+  /** Context size after the last turn: the prompt of its last request (input + cached reads + cache writes). */
   private _lastTurnPromptTokens = 0;
+  /** Prompt of the current turn's latest request on this conversation (0 until one arrives). */
+  private _turnRequestPromptTokens = 0;
+  /** Credential environment of the Claude account this session runs under; see setAccountEnv(). */
+  private _accountEnv: Record<string, string> | undefined;
+  /** Private directory holding the settings file that carries the account's credential. */
+  private _accountSettingsDir: string | undefined;
+  /** The account's usage as the current turn reported it. */
+  private _turnUsage: AccountUsage | undefined;
 
   public sessionId?: string;
   public stats: InternalStats;
@@ -157,6 +166,20 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
   }
 
   /**
+   * Run under a Claude account: the environment its credential needs. Set by the
+   * session manager before start(), never taken from a session config, so a
+   * secret is not persisted or reported anywhere a config is.
+   */
+  setAccountEnv(env: Record<string, string> | undefined): void {
+    this._accountEnv = env && Object.keys(env).length ? { ...env } : undefined;
+  }
+
+  /** What the last turn reported about the account's usage, if anything. */
+  get accountUsage(): AccountUsage | undefined {
+    return this._turnUsage;
+  }
+
+  /**
    * Build the `--settings` argv fragment, merging in the session options that are
    * expressed as settings keys rather than flags.
    *
@@ -178,6 +201,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     if (this.options.crossSessionInbound) injected.crossSessionInbound = this.options.crossSessionInbound;
 
     const settings = this.options.settings;
+    if (this._accountEnv) return this.buildAccountSettingsArgs(injected, settings);
     if (!Object.keys(injected).length) return settings ? ['--settings', settings] : [];
     if (!settings) return ['--settings', JSON.stringify(injected)];
 
@@ -191,6 +215,55 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       // Couldn't parse/read to merge — keep the user's settings and add ours separately.
       return ['--settings', settings, '--settings', JSON.stringify(injected)];
     }
+  }
+
+  /**
+   * `--settings` for a session that runs under a Claude account.
+   *
+   * The credential has to travel in `--settings`: the CLI applies the `env` of
+   * the user's settings file over its own process environment, so a token in
+   * the process environment loses to one written there by another tool, and a
+   * `--settings` value outranks both (measured on 2.1.322). It goes in a 0600
+   * file in a private directory rather than inline JSON, which any process could
+   * read off the command line; stop() removes it, and so does the server's
+   * exit or, after a crash, the next server.
+   */
+  private buildAccountSettingsArgs(injected: Record<string, unknown>, settings: string | undefined): string[] {
+    let merged: Record<string, unknown> | undefined;
+    if (settings) {
+      const trimmed = settings.trim();
+      try {
+        const raw = trimmed.startsWith('{') ? trimmed : fs.readFileSync(trimmed, 'utf8');
+        merged = JSON.parse(raw) as Record<string, unknown>;
+      } catch {
+        merged = undefined;
+      }
+    }
+    const base = merged ?? {};
+    const userEnv = (base.env && typeof base.env === 'object' ? base.env : {}) as Record<string, unknown>;
+    const obj = { ...base, ...injected, env: { ...userEnv, ...this._accountEnv } };
+
+    this.removeAccountSettings();
+    const { dir, file } = writeAccountSettings(obj);
+    this._accountSettingsDir = dir;
+    // Settings that could not be read are passed on as given, ahead of ours.
+    return settings && !merged ? ['--settings', settings, '--settings', file] : ['--settings', file];
+  }
+
+  private removeAccountSettings(): void {
+    if (!this._accountSettingsDir) return;
+    removeAccountSettings(this._accountSettingsDir);
+    this._accountSettingsDir = undefined;
+  }
+
+  /**
+   * 'error' reaches listeners only. With none attached — between turns nothing
+   * listens — an emitted 'error' throws out of the event loop, which in the
+   * OpenClaw plugin is the gateway's.
+   */
+  private _emitError(err: Error): void {
+    if (this.listenerCount(SESSION_EVENT.ERROR) > 0) this.emit(SESSION_EVENT.ERROR, err);
+    else this.emit(SESSION_EVENT.LOG, `[claude] ${err.message}`);
   }
 
   // ─── Start ───────────────────────────────────────────────────────────────
@@ -233,13 +306,17 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     }
     if (this.options.customSessionId) args.push('--session-id', this.options.customSessionId);
 
-    // Model — proxy mode mapping
+    // Model — proxy mode mapping. In gateway mode the base URL is the caller's
+    // own gateway, which knows the model by its own name: no `/real/` rewrite.
     if (this.options.model) {
-      if (!isClaudeModel(this.options.model!) && this.options.baseUrl) {
+      if (!isClaudeModel(this.options.model!) && this.options.baseUrl && !claudeGatewayMode()) {
         this._realModel = this.options.model;
         args.push('--model', 'opus');
       } else {
-        const cliModel = this.options.model.includes('/') ? this.options.model.split('/').pop()! : this.options.model;
+        const cliModel =
+          this.options.model.includes('/') && !claudeGatewayMode()
+            ? this.options.model.split('/').pop()!
+            : this.options.model;
         args.push('--model', cliModel);
       }
     }
@@ -323,6 +400,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     if (this.options.includeHookEvents) args.push('--include-hook-events');
     // CLI 2.1.211+: surface subagent output in the parent stream.
     if (this.options.forwardSubagentText) args.push('--forward-subagent-text');
+    if (this.options.chrome) args.push('--chrome');
     if (this.options.permissionPromptTool) {
       args.push('--permission-prompt-tool', this.options.permissionPromptTool);
     } else {
@@ -414,7 +492,8 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     // Spawn
     // A new process answers none of the old one's messages.
     this._unanswered.clear();
-    this.proc = spawn(resolvedBin, args, {
+    this.proc = spawnEngine(resolvedBin, args, {
+      launcher: this.options.launcher,
       cwd: this.options.cwd,
       env: spawnEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -422,13 +501,6 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     });
     // Unref so the parent process can exit independently of the child.
     this.proc.unref();
-
-    // A pipe fault with no listener (EPIPE when the CLI closes stdin before a
-    // write lands) is an uncaught exception that ends the whole host.
-    guardChildStreams(this.proc, (stream, err) => {
-      if (stream === 'stdin') this._stdinFault(err);
-      else reportSessionError(this, new Error(`${stream} error: ${err.message}`), '[claude]');
-    });
 
     // Parse stdout line-by-line
     this._rl = readline.createInterface({ input: this.proc.stdout!, crlfDelay: Infinity });
@@ -448,19 +520,32 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     // close) makes readline emit an unhandled 'error' that crashes the monitor
     // process itself — exactly what Recovery > Complexity forbids.
     this._rl.on('error', (err: Error) => {
-      reportSessionError(this, new Error(`readline error: ${err.message}`), '[claude]');
+      this._emitError(new Error(`readline error: ${err.message}`));
     });
 
     this.proc.stderr?.on('data', (data: Buffer) => {
       this.emit(SESSION_EVENT.LOG, `[stderr] ${sanitizeSecrets(data.toString())}`);
     });
+    // Writing to a CLI that has just died raises 'error' on stdin as well as in
+    // the write callback; unheard, it would throw out of the event loop.
+    this.proc.stdin?.on('error', (err) => this.emit(SESSION_EVENT.LOG, `[stdin] ${err.message}`));
+
+    // Both handlers belong to this process only. switchAccount() replaces the
+    // process in place, and the old one's `close` lands after the new one has
+    // started; acting on it would mark the new process dead and delete its
+    // credential file.
+    const child = this.proc;
+    const superseded = () => this.proc !== null && this.proc !== child;
 
     this.proc.on('close', (code) => {
+      if (superseded()) return;
       this._isReady = false;
+      this.removeAccountSettings();
       this.emit(SESSION_EVENT.CLOSE, code);
     });
 
     this.proc.on('error', (err) => {
+      if (superseded()) return;
       // Spawn/runtime failure: drop references so a later send() fails the
       // readiness check instead of writing to a dead process.
       this._isReady = false;
@@ -471,7 +556,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       }
       this._rl = null;
       this.proc = null;
-      reportSessionError(this, err, '[claude]');
+      this._emitError(err);
     });
 
     // Wait for ready
@@ -553,6 +638,17 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
             this.stats.pluginErrors = pluginErrors as Array<{ plugin: string; reason: string }>;
           }
           this.emit(SESSION_EVENT.INIT, event);
+        } else if (event.subtype === 'model_refusal_fallback') {
+          // The model refused and the CLI re-ran the turn on another model.
+          // The stream-json frame is snake_case; the in-process form camelCase.
+          const e = event as Record<string, unknown>;
+          const from = e.original_model ?? e.originalModel;
+          const to = e.fallback_model ?? e.fallbackModel;
+          const category = e.api_refusal_category ?? e.apiRefusalCategory;
+          if (e.direction === 'retry' && typeof from === 'string' && typeof to === 'string') {
+            this._refusalFallbacks++;
+            this._lastRefusalFallback = { from, to, ...(typeof category === 'string' ? { category } : {}) };
+          }
         } else if (event.subtype === 'api_retry') {
           this.stats.retries++;
           this.stats.lastRetryError =
@@ -619,6 +715,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
 
       case 'assistant':
         this.emit(SESSION_EVENT.ASSISTANT, event);
+        this._noteRequestPrompt(event as Record<string, unknown>);
         if (event.message?.content && Array.isArray(event.message.content)) {
           for (const block of event.message.content) {
             if (block.type === 'tool_use') {
@@ -666,16 +763,23 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
         this.emit(SESSION_EVENT.TOOL_RESULT, event);
         break;
 
+      case 'rate_limit_event':
+        this._noteRateLimit((event as Record<string, unknown>).rate_limit_info);
+        this.emit(SESSION_EVENT.EVENT, event);
+        break;
+
       case 'error':
-        this.emit(
-          SESSION_EVENT.ERROR,
-          new Error(String((event as Record<string, unknown>).error) || JSON.stringify(event)),
-        );
+        this._emitError(new Error(String((event as Record<string, unknown>).error) || JSON.stringify(event)));
         break;
 
       case 'result': {
         const usage = (event as Record<string, unknown>).usage as Record<string, number> | undefined;
         if (usage) this._applyTurnUsage(usage, true);
+        // A turn the account refused: the CLI answers it itself (model `<synthetic>`)
+        // with `api_error: usage_limit_reached` and HTTP 429 (measured on 2.1.322).
+        if ((event as Record<string, unknown>).api_error === 'usage_limit_reached') {
+          this._turnUsage = { ...this._turnUsage, limited: true };
+        }
         this._applyReportedCost((event as Record<string, unknown>).total_cost_usd);
         this._captureContextWindow((event as Record<string, unknown>).modelUsage);
         // A turn this session did not send ends with a result too: a background
@@ -736,6 +840,8 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     // discounting itself by the abandoned turn's tokens.
     this._msgProvisional = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
     this._turnApplied = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
+    this._turnRequestPromptTokens = 0;
+    this._turnUsage = undefined;
 
     let finalMessage = typeof message === 'string' ? message : message;
     if (typeof finalMessage === 'string') {
@@ -774,7 +880,9 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     }
     // Pass an error callback so a broken pipe / closed stdin surfaces instead of
     // silently dropping the write and leaving waitForComplete callers hung.
-    stdin.write(JSON.stringify(payload) + '\n', (err) => this._stdinFault(err));
+    stdin.write(JSON.stringify(payload) + '\n', (err) => {
+      if (err) this._emitError(new Error(`Failed to write to stdin: ${err.message}`));
+    });
 
     if (options.callbacks) this._streamCallbacks = options.callbacks;
 
@@ -789,6 +897,28 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     }
 
     return { requestId, sent: true };
+  }
+
+  /**
+   * Stop the running turn: stream-json's `interrupt` control request, the same
+   * one the SDK sends. The CLI answers with a `control_response`, then ends the
+   * turn with an `error_during_execution` result; an active `/goal` stays set.
+   *
+   * Not named `interrupt`: SessionManager reads a method of that name as the
+   * mark of a codex-app session.
+   */
+  interruptTurn(): boolean {
+    const stdin = this.proc?.stdin;
+    if (!this._isReady || !stdin || stdin.writable === false) return false;
+    const payload = {
+      type: 'control_request',
+      request_id: `interrupt-${randomUUID()}`,
+      request: { subtype: 'interrupt' },
+    };
+    stdin.write(JSON.stringify(payload) + '\n', (err) => {
+      if (err) this._emitError(new Error(`Failed to write to stdin: ${err.message}`));
+    });
+    return true;
   }
 
   // ─── Wait for Turn Complete ──────────────────────────────────────────────
@@ -936,7 +1066,7 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
 
   // ─── Utilities ───────────────────────────────────────────────────────────
 
-  getStats(): SessionStats & { sessionId?: string; uptime: number } {
+  getStats(): SessionStats & { sessionId?: string; uptime: number; cacheCreationTokens: number } {
     return {
       turns: this.stats.turns,
       turnsSucceeded: this.stats.turnsSucceeded,
@@ -945,6 +1075,9 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       tokensIn: this.stats.tokensIn,
       tokensOut: this.stats.tokensOut,
       cachedTokens: this.stats.cachedTokens,
+      // Not in SessionStats: only the goal adapter reads it, to count a goal's
+      // tokens without the cached conversation every turn re-reads.
+      cacheCreationTokens: this.stats.cacheCreationTokens,
       costUsd: Math.round(this.stats.costUsd * 10000) / 10000,
       isReady: this._isReady,
       startTime: this.stats.startTime,
@@ -953,6 +1086,9 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       contextPercent: this._contextPercent(),
       retries: this.stats.retries,
       lastRetryError: this.stats.lastRetryError,
+      ...(this._refusalFallbacks > 0
+        ? { refusalFallbacks: this._refusalFallbacks, lastRefusalFallback: this._lastRefusalFallback }
+        : {}),
       sessionId: this.sessionId,
       uptime: this.stats.startTime ? Math.round((Date.now() - new Date(this.stats.startTime).getTime()) / 1000) : 0,
     };
@@ -975,8 +1111,14 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
   }
 
   getCost(): CostBreakdown {
-    const model = this.options.model || this._engineModel;
-    const pricing = getModelPricing(model);
+    // A model the caller named explicitly wins over what init reports. An alias
+    // (`opus`, `opus[1m]`) is different: what it means is the CLI's decision —
+    // the alias has moved under us five times — so the id init reports wins.
+    const configured = this.options.model;
+    const bare = configured?.replace(/\[1m\]$/i, '');
+    const isAlias = !!bare && resolveAlias(bare) !== bare;
+    const model = (isAlias ? this._engineModel : undefined) || configured || this._engineModel;
+    const pricing = this._pricing(model);
     const nonCachedIn = Math.max(0, this.stats.tokensIn - this.stats.cachedTokens);
     return {
       model: model || 'default',
@@ -1009,6 +1151,33 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
 
   stop(): void {
     this._fireHook('onStop', { cost: this.getCost(), stats: this.getStats() });
+    this._endProcess();
+    this._isPaused = false;
+    this.emit(SESSION_EVENT.CLOSE, 143);
+  }
+
+  /**
+   * Continue this conversation under another Claude account.
+   *
+   * The CLI reads its credential once, at start, so the process is restarted:
+   * same session id via `--resume`, new credential, never `--fork-session` (a
+   * fork would start a new conversation). Statistics and spend carry over; the
+   * cost baseline handles the resumed process reporting the session's totals.
+   */
+  async switchAccount(env: Record<string, string>): Promise<void> {
+    const id = this.sessionId;
+    if (!id) throw new Error('This session has no conversation id to continue under another account');
+    this._endProcess();
+    this.options.resumeSessionId = id;
+    delete this.options.claudeResumeId;
+    this.options.forkSession = false;
+    this.setAccountEnv(env);
+    await this.start();
+  }
+
+  /** End the CLI process and drop its credential file; the session object stays usable. */
+  private _endProcess(): void {
+    this.removeAccountSettings();
     if (this._rl) {
       this._rl.close();
       this._rl = null;
@@ -1050,8 +1219,6 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       this.proc = null;
     }
     this._isReady = false;
-    this._isPaused = false;
-    this.emit(SESSION_EVENT.CLOSE, 143);
   }
 
   // ─── Private ─────────────────────────────────────────────────────────────
@@ -1100,7 +1267,15 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     this.stats.cacheCreation1hTokens = Math.max(0, this.stats.cacheCreation1hTokens + delta.cacheCreate1h);
 
     if (authoritative) {
-      this._lastTurnPromptTokens = reported.in + reported.cacheRead + reported.cacheCreate;
+      // `result.usage` sums every request of the turn — one per tool round — so
+      // it is the turn's spend, not the context's size. The context is the prompt
+      // of the turn's last request; the summed figure stands in only when no
+      // request reported its own usage.
+      this._lastTurnPromptTokens =
+        this._turnRequestPromptTokens > 0
+          ? this._turnRequestPromptTokens
+          : reported.in + reported.cacheRead + reported.cacheCreate;
+      this._turnRequestPromptTokens = 0;
       this._msgProvisional = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
       this._turnApplied = { in: 0, out: 0, cacheRead: 0, cacheCreate: 0, cacheCreate1h: 0 };
     } else {
@@ -1114,6 +1289,49 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
       };
     }
     this._updateCost();
+  }
+
+  /**
+   * Remember the prompt size of one API request of the current turn.
+   *
+   * Every `assistant` event carries its request's usage, and the input side of
+   * it is fixed for the whole request. A subagent's requests arrive here too,
+   * marked with `parent_tool_use_id`; they measure the subagent's own context,
+   * so they are skipped.
+   */
+  private _noteRequestPrompt(event: Record<string, unknown>): void {
+    if (event.parent_tool_use_id) return;
+    const usage = (event.message as Record<string, unknown> | undefined)?.usage as Record<string, unknown> | undefined;
+    if (!usage) return;
+    const num = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    const prompt =
+      num(usage.input_tokens) + num(usage.cache_read_input_tokens) + num(usage.cache_creation_input_tokens);
+    if (prompt > 0) this._turnRequestPromptTokens = prompt;
+  }
+
+  /**
+   * Read a `rate_limit_event`: whether the account refused the turn, its highest
+   * window utilization, and when the window that limits it resets. The CLI emits
+   * one per turn, `status: allowed` with each window's utilization, or
+   * `rejected` once a limit is reached.
+   */
+  private _noteRateLimit(info: unknown): void {
+    if (!info || typeof info !== 'object') return;
+    const i = info as Record<string, unknown>;
+    let utilization: number | undefined;
+    const windows = i.unifiedWindows;
+    if (windows && typeof windows === 'object') {
+      for (const w of Object.values(windows as Record<string, unknown>)) {
+        const u = (w as Record<string, unknown> | null)?.utilization;
+        if (typeof u === 'number' && Number.isFinite(u)) utilization = Math.max(utilization ?? 0, u);
+      }
+    }
+    const resetsAt = typeof i.resetsAt === 'number' && i.resetsAt > 0 ? i.resetsAt * 1000 : undefined;
+    this._turnUsage = {
+      limited: i.status === 'rejected' || !!this._turnUsage?.limited,
+      ...(utilization !== undefined ? { utilization } : {}),
+      ...(resetsAt !== undefined ? { resetsAt } : {}),
+    };
   }
 
   /**
@@ -1144,6 +1362,9 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     // for someone else's tokens. Fall back to the registry, which at least
     // knows which model was really asked for.
     if (this._realModel) return;
+    // A gateway's own model: the CLI prices its tokens from Anthropic's table,
+    // which does not know it. The registry or pricingOverrides decide instead.
+    if (this._onGatewayModel()) return;
     const previous = this._lastReportedCost;
     if (this._costBaselinePending) {
       this._costBaselinePending = false;
@@ -1201,11 +1422,20 @@ export class PersistentClaudeSession extends EventEmitter implements ISession {
     return Math.min(100, Math.round((this._lastTurnPromptTokens / window) * 100));
   }
 
+  /** A non-Claude model served by the caller's own gateway (`CLAWO_CLAUDE_GATEWAY`). */
+  private _onGatewayModel(model = this.options.model): boolean {
+    return !!model && claudeGatewayMode() && !isClaudeModel(model);
+  }
+
+  private _pricing(model: string | undefined) {
+    return model && this._onGatewayModel(model) ? gatewayModelPricing(model) : getModelPricing(model);
+  }
+
   private _updateCost(): void {
     // Only reached when the engine did not report its own spend — a custom CLI
     // driven through this class, or a turn that ended before `result`.
     if (this._lastReportedCost !== null) return;
-    const pricing = getModelPricing(this.options.model);
+    const pricing = this._pricing(this.options.model);
     // Anthropic bills cache writes above the input rate and the premium depends
     // on the TTL: 1.25x for the 5-minute cache, 2x for the 1-hour one. Leaving
     // them out entirely is what made the old estimate collapse on cached

@@ -11,8 +11,7 @@
  *   - Consistent lifecycle semantics (start/stop/pause/resume)
  */
 
-import { spawn } from 'node:child_process';
-import { guardChildStreams } from './child-process-guard.js';
+import { spawnEngine } from './engine-spawn.js';
 import * as readline from 'node:readline';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
@@ -123,13 +122,13 @@ export class PersistentGeminiSession extends BaseOneShotSession {
       let settled = false;
       let gotUsageFromEvents = false;
 
-      const proc = spawn(this.engineBin, args, {
+      const proc = spawnEngine(this.engineBin, args, {
+        launcher: this.options.launcher,
         cwd: this.options.cwd,
         env: { ...process.env },
         stdio: ['pipe', 'pipe', 'pipe'],
       });
       this.currentProc = proc;
-      guardChildStreams(proc);
 
       const timer = setTimeout(() => {
         if (!settled) {

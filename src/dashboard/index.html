@@ -892,7 +892,7 @@
             </label>
             <label>
               Planner model (optional)
-              <input name="planner_model" type="text" placeholder="claude-opus-4-7" />
+              <input name="planner_model" type="text" placeholder="opus" />
             </label>
           </div>
           <div class="modal-footer">
@@ -1600,23 +1600,33 @@
         const path = $('forgePath');
         const fileInput = $('forgeFile');
 
-        for (const f of fileInput.files) {
-          const buf = await f.arrayBuffer();
-          const b64 = btoa(String.fromCharCode(...new Uint8Array(buf)));
-          await fetch('/ultraapp/' + encodeURIComponent(runId) + '/files', {
+        const addFile = async (label, body) => {
+          const r = await fetch('/ultraapp/' + encodeURIComponent(runId) + '/files', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ filename: f.name, dataB64: b64 }),
+            body: JSON.stringify(body),
           });
+          const j = await r.json().catch(() => ({}));
+          if (!r.ok || !j.ok) {
+            renderChatEntry({ role: 'system', kind: 'error', text: `[error] ${label}: ${j.error || r.status}` });
+          }
+        };
+        for (const f of fileInput.files) {
+          // FileReader encodes natively; spreading the bytes into fromCharCode
+          // overflows the call stack for anything past ~100 KB.
+          const dataUrl = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result));
+            reader.onerror = () => reject(reader.error);
+            reader.readAsDataURL(f);
+          });
+          const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+          await addFile(f.name, { filename: f.name, dataB64: b64 });
         }
         fileInput.value = '';
 
         if (path.value.trim()) {
-          await fetch('/ultraapp/' + encodeURIComponent(runId) + '/files', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ absolutePath: path.value.trim() }),
-          });
+          await addFile(path.value.trim(), { absolutePath: path.value.trim() });
           path.value = '';
         }
 
@@ -1662,15 +1672,19 @@
             panel.innerHTML = '';
             return;
           }
+          // Every version of an app shares one URL; the live one is the one deployed or promoted last.
+          const live = j.artifacts
+            .filter((a) => a.deploy)
+            .reduce((m, a) => (!m || (a.deployedAt || '') >= (m.deployedAt || '') ? a : m), null);
           const html = j.artifacts
             .map((a) => {
-              const isDeployed = !!a.deploy;
+              const isLive = a === live;
               const url = a.deploy?.url || '';
               return `<li class="version-row">
                 <span class="version-tag">${escapeHtml(a.version)}</span>
                 <span class="version-meta">${a.builtAt ? new Date(a.builtAt).toLocaleString() : ''}</span>
-                ${isDeployed ? `<a href="${escapeHtml(url)}" target="_blank">${escapeHtml(url)}</a>` : '<span class="version-meta">(not deployed)</span>'}
-                ${isDeployed ? `<button data-promote="${escapeHtml(a.version)}">Promote</button>` : ''}
+                ${isLive ? `<a href="${escapeHtml(url)}" target="_blank">${escapeHtml(url)}</a>` : `<span class="version-meta">${a.deploy ? '(not live)' : '(not deployed)'}</span>`}
+                ${isLive ? '' : `<button data-promote="${escapeHtml(a.version)}">Promote</button>`}
               </li>`;
             })
             .join('');
@@ -1755,8 +1769,85 @@
         });
       }
 
+      function autoloopResumeVisible() {
+        const current = state.autoloop.state;
+        if (!current) return false;
+        if (state.autoloop.live === false) return true;
+        return current.status === 'paused' || current.status === 'terminated';
+      }
+
+      function syncAutoloopResumeButton() {
+        const existing = document.getElementById('auto-resume');
+        if (!autoloopResumeVisible()) {
+          if (existing) existing.remove();
+          return;
+        }
+        const bar = document.querySelector('.topbar');
+        if (!bar || existing) return;
+        const runId = state.autoloop.runId;
+        if (!runId) return;
+        const btn = document.createElement('button');
+        btn.id = 'auto-resume';
+        btn.textContent = 'Resume run';
+        btn.style.cssText =
+          'padding:6px 12px;border:1px solid var(--border);background:var(--accent);color:#fff;border-radius:6px;cursor:pointer;font:inherit;font-weight:600;margin-left:auto';
+        btn.addEventListener('click', async () => {
+          btn.disabled = true;
+          btn.textContent = 'Resuming…';
+          try {
+            const body = {};
+            if (state.autoloop.state && state.autoloop.state.pending_dispatch) {
+              body.pending_dispatch_id = state.autoloop.state.pending_dispatch.dispatch_id;
+              body.send_timeout_ms = (state.autoloop.state.pending_dispatch.timeout_ms || 600000) + 60000;
+            }
+            // A run whose roles used a custom engine cannot be resumed
+            // from an empty body: the config carries credentials, so it is
+            // never persisted and has to be supplied again. What is sent
+            // is a *name* the server resolves from its own environment
+            // (CLAWO_CUSTOM_ENGINE_<REF>) — no credential goes over the
+            // wire, and this button stops being the one caller that
+            // cannot resume such a run.
+            const reqRes = await fetch(`/autoloop/${encodeURIComponent(runId)}/resume-requirements`);
+            const reqJson = reqRes.ok ? await reqRes.json().catch(() => null) : null;
+            for (const role of (reqJson && reqJson.rolesNeedingCustomEngine) || []) {
+              const ref = prompt(
+                `The ${role} used a custom engine, whose config is never stored.\n\n` +
+                  `Enter the reference name set on the orchestrator host as ` +
+                  `CLAWO_CUSTOM_ENGINE_<NAME>:`,
+              );
+              if (!ref) {
+                btn.disabled = false;
+                btn.textContent = 'Resume run';
+                return;
+              }
+              body[`${role}CustomEngineRef`] = ref;
+            }
+            const r2 = await fetch(`/autoloop/${encodeURIComponent(runId)}/resume`, {
+              method: 'POST',
+              headers: { 'content-type': 'application/json' },
+              body: JSON.stringify(body),
+            });
+            if (!r2.ok) {
+              const j2 = await r2.json().catch(() => ({}));
+              alert(`Resume failed: ${(j2 && j2.error) || `HTTP ${r2.status}`}`);
+              btn.disabled = false;
+              btn.textContent = 'Resume run';
+              return;
+            }
+            closeStreams();
+            openAutoloop(runId);
+          } catch (err) {
+            alert(`Resume failed: ${(err && err.message) || err}`);
+            btn.disabled = false;
+            btn.textContent = 'Resume run';
+          }
+        });
+        bar.appendChild(btn);
+      }
+
       async function openAutoloop(id) {
         renderAutoloopShell();
+        state.autoloop.runId = id;
         $('auto-id').textContent = id;
         // Initial state fetch
         try {
@@ -1805,79 +1896,7 @@
               paintReviewer();
             }
           }
-          // For terminated or inactive runs, and for a run paused on a timed-out
-          // send, surface a Resume affordance under the top bar. The button kicks
-          // off /autoloop/<id>/resume and then re-runs openAutoloop so SSE
-          // reconnects with the live state. A live run paused for any other
-          // reason (an expired activity lease, an explicit pause) gets no button:
-          // resume only acts on a pending dispatch there, so it would be a no-op.
-          if (
-            state.autoloop.state &&
-            (!state.autoloop.live ||
-              state.autoloop.state.status === 'terminated' ||
-              (state.autoloop.state.status === 'paused' && state.autoloop.state.pending_dispatch))
-          ) {
-            const bar = document.querySelector('.topbar');
-            if (bar && !document.getElementById('auto-resume')) {
-              const btn = document.createElement('button');
-              btn.id = 'auto-resume';
-              btn.textContent = 'Resume run';
-              btn.style.cssText =
-                'padding:6px 12px;border:1px solid var(--border);background:var(--accent);color:#fff;border-radius:6px;cursor:pointer;font:inherit;font-weight:600;margin-left:auto';
-              btn.addEventListener('click', async () => {
-                btn.disabled = true;
-                btn.textContent = 'Resuming…';
-                try {
-                  const body = {};
-                  if (state.autoloop.state && state.autoloop.state.pending_dispatch) {
-                    body.pending_dispatch_id = state.autoloop.state.pending_dispatch.dispatch_id;
-                    body.send_timeout_ms = (state.autoloop.state.pending_dispatch.timeout_ms || 600000) + 60000;
-                  }
-                  // A run whose roles used a custom engine cannot be resumed
-                  // from an empty body: the config carries credentials, so it is
-                  // never persisted and has to be supplied again. What is sent
-                  // is a *name* the server resolves from its own environment
-                  // (CLAWO_CUSTOM_ENGINE_<REF>) — no credential goes over the
-                  // wire, and this button stops being the one caller that
-                  // cannot resume such a run.
-                  const reqRes = await fetch(`/autoloop/${encodeURIComponent(id)}/resume-requirements`);
-                  const reqJson = reqRes.ok ? await reqRes.json().catch(() => null) : null;
-                  for (const role of (reqJson && reqJson.rolesNeedingCustomEngine) || []) {
-                    const ref = prompt(
-                      `The ${role} used a custom engine, whose config is never stored.\n\n` +
-                        `Enter the reference name set on the orchestrator host as ` +
-                        `CLAWO_CUSTOM_ENGINE_<NAME>:`,
-                    );
-                    if (!ref) {
-                      btn.disabled = false;
-                      btn.textContent = 'Resume run';
-                      return;
-                    }
-                    body[`${role}CustomEngineRef`] = ref;
-                  }
-                  const r2 = await fetch(`/autoloop/${encodeURIComponent(id)}/resume`, {
-                    method: 'POST',
-                    headers: { 'content-type': 'application/json' },
-                    body: JSON.stringify(body),
-                  });
-                  if (!r2.ok) {
-                    const j2 = await r2.json().catch(() => ({}));
-                    alert(`Resume failed: ${(j2 && j2.error) || `HTTP ${r2.status}`}`);
-                    btn.disabled = false;
-                    btn.textContent = 'Resume run';
-                    return;
-                  }
-                  closeStreams();
-                  openAutoloop(id);
-                } catch (err) {
-                  alert(`Resume failed: ${(err && err.message) || err}`);
-                  btn.disabled = false;
-                  btn.textContent = 'Resume run';
-                }
-              });
-              bar.appendChild(btn);
-            }
-          }
+          syncAutoloopResumeButton();
         } catch (err) {
           /* ignore */
         }
@@ -2036,6 +2055,7 @@
             input.placeholder = 'Chat with the Planner… (Enter to send)';
           }
         }
+        syncAutoloopResumeButton();
       }
 
       function paintPlanner() {

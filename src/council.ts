@@ -14,7 +14,6 @@
 
 import { randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { guardChildStreams } from './child-process-guard.js';
 import { changedFilesSince } from './verify/baseline.js';
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
@@ -122,7 +121,6 @@ function spawnAsync(
     });
     let stdout = '';
     let stderr = '';
-    guardChildStreams(child);
     child.stdout.on('data', (d: Buffer) => {
       stdout += d.toString();
     });
@@ -148,62 +146,6 @@ function spawnAsync(
 }
 
 const VALID_AGENT_NAME = /^[a-zA-Z0-9_-]+$/;
-const LEGACY_COUNCIL_GIT_NAME = 'Council';
-const LEGACY_COUNCIL_GIT_EMAIL = 'council@openclaw';
-
-export interface GitIdentity {
-  name: string;
-  email: string;
-}
-
-async function readGitConfigValue(projectDir: string, args: string[]): Promise<string | undefined> {
-  try {
-    const result = await spawnAsync('git', ['-C', projectDir, 'config', ...args], { timeout: GIT_CMD_TIMEOUT_MS });
-    return result.stdout.trim() || undefined;
-  } catch (err) {
-    // `git config --get` exits 1 when the key is absent. Other failures (bad
-    // repository, inaccessible config, etc.) must remain visible.
-    if ((err as Error).message.startsWith('git exited with code 1:')) return undefined;
-    throw err;
-  }
-}
-
-/**
- * Preserve a project's Git identity and repair the repository-wide identity
- * written by Claw Orchestrator releases before 5.0.0-memento.5.
- *
- * Linked worktrees normally share the repository's local config, so repairing
- * the common `user.*` values here repairs every linked Council worktree too.
- */
-export async function ensureProjectGitIdentity(projectDir: string, logger?: Logger): Promise<GitIdentity> {
-  const log = logger || createConsoleLogger('Council');
-  const localName = await readGitConfigValue(projectDir, ['--local', '--get', 'user.name']);
-  const localEmail = await readGitConfigValue(projectDir, ['--local', '--get', 'user.email']);
-  const hasLegacyCouncilIdentity = localName === LEGACY_COUNCIL_GIT_NAME || localEmail === LEGACY_COUNCIL_GIT_EMAIL;
-
-  if (hasLegacyCouncilIdentity) {
-    const globalName = await readGitConfigValue(projectDir, ['--global', '--get', 'user.name']);
-    const globalEmail = await readGitConfigValue(projectDir, ['--global', '--get', 'user.email']);
-    if (!globalName || !globalEmail) {
-      throw new Error('Cannot repair legacy Council Git identity: configure global user.name and user.email first');
-    }
-
-    await spawnAsync('git', ['-C', projectDir, 'config', '--local', 'user.name', globalName], {
-      timeout: GIT_CMD_TIMEOUT_MS,
-    });
-    await spawnAsync('git', ['-C', projectDir, 'config', '--local', 'user.email', globalEmail], {
-      timeout: GIT_CMD_TIMEOUT_MS,
-    });
-    log.warn(`Repaired legacy Council Git identity; future commits inherit ${globalName} <${globalEmail}>`);
-  }
-
-  const name = await readGitConfigValue(projectDir, ['--get', 'user.name']);
-  const email = await readGitConfigValue(projectDir, ['--get', 'user.email']);
-  if (!name || !email) {
-    throw new Error('Council requires Git user.name and user.email to be configured for the project or user');
-  }
-  return { name, email };
-}
 
 /** Best-effort cleanup of already-created worktrees when a batch creation fails */
 async function cleanupCreatedWorktrees(
@@ -249,8 +191,25 @@ async function setupWorktrees(
     await spawnAsync('git', ['-C', projectDir, 'init'], { timeout: GIT_CMD_TIMEOUT_MS });
   }
 
-  // Preserve the project's identity and self-heal the legacy Council override.
-  await ensureProjectGitIdentity(projectDir, log);
+  // Commits here (and the agents' own, in the worktrees) need an identity. Only
+  // a missing one is filled in: `.git/config` belongs to the user and outlives
+  // the council, so an identity they configured at any level is left alone.
+  for (const [key, value] of [
+    ['user.email', 'council@openclaw'],
+    ['user.name', 'Council'],
+  ]) {
+    const configured = await spawnAsync('git', ['-C', projectDir, 'config', '--get', key], {
+      timeout: GIT_CMD_TIMEOUT_MS,
+    })
+      .then((r) => r.stdout.trim().length > 0)
+      .catch(() => false);
+    if (configured) continue;
+    await spawnAsync('git', ['-C', projectDir, 'config', '--local', key, value], {
+      timeout: GIT_CMD_TIMEOUT_MS,
+    }).catch((err) => {
+      log.error(`Failed to set git ${key}:`, err.message);
+    });
+  }
 
   // Ensure at least one commit
   const hasCommit = await spawnAsync('git', ['-C', projectDir, 'rev-parse', 'HEAD'], { timeout: GIT_CMD_TIMEOUT_MS })
@@ -420,6 +379,21 @@ Collaboration ends **only when all members vote YES**.
 Start working!`;
 }
 
+/**
+ * The package this module belongs to: the nearest directory above it holding a
+ * package.json. A fixed `..` is right from `src/` but lands on `dist/` from the
+ * built `dist/src/`, which would leave the package root itself unguarded.
+ */
+export function programRoot(moduleFile: string = fileURLToPath(import.meta.url)): string {
+  let dir = path.dirname(moduleFile);
+  for (;;) {
+    if (fs.existsSync(path.join(dir, 'package.json'))) return dir;
+    const parent = path.dirname(dir);
+    if (parent === dir) return path.resolve(path.dirname(moduleFile), '..');
+    dir = parent;
+  }
+}
+
 /** Resolve the path to configs/ relative to this module (works from both src/ and dist/) */
 function resolveConfigPath(filename: string): string {
   const filePath = fileURLToPath(import.meta.url);
@@ -496,6 +470,11 @@ export class Council extends EventEmitter {
    * from a rebuilt session. This is what lets them run after a restart, which
    * the in-memory registry made impossible.
    */
+  /** Add one send's cost to the council's total. */
+  private _charge(result: SendResult): void {
+    if (this._session && result.usage) this._session.costUsd = (this._session.costUsd ?? 0) + result.usage.costUsd;
+  }
+
   adoptSession(session: CouncilSession): void {
     this._session = session;
   }
@@ -548,7 +527,8 @@ export class Council extends EventEmitter {
   ): Promise<AgentResponse> {
     this.emitEvent({ type: 'agent-start', sessionId, round, agent: agent.name });
 
-    const sessionName = `council-${sessionId.slice(0, 8)}-${agent.name}-r${round}`;
+    // Full run id — truncating to 8 chars made every manager id share `council-`.
+    const sessionName = `${sessionId}-${agent.name}-r${round}`;
     this._activeSessions.add(sessionName);
 
     let content = '';
@@ -575,10 +555,12 @@ export class Council extends EventEmitter {
           model: agent.model,
           baseUrl: agent.baseUrl,
           permissionMode: agent.permissionMode ?? this.config.defaultPermissionMode ?? 'bypassPermissions',
+          ...(agent.sandboxMode === undefined ? {} : { sandboxMode: agent.sandboxMode }),
           appendSystemPrompt: systemPrompt,
           maxTurns: this.config.maxTurnsPerAgent || DEFAULT_MAX_TURNS_PER_AGENT,
           maxBudgetUsd: this.config.maxBudgetUsd,
           customEngine: agent.customEngine,
+          ...(agent.acpAgent === undefined ? {} : { acpAgent: agent.acpAgent }),
           effort: agent.effort,
           ultracode: agent.ultracode,
           orchestration: {
@@ -602,6 +584,7 @@ export class Council extends EventEmitter {
             this.emitEvent({ type: 'agent-chunk', sessionId, round, agent: agent.name, content: chunk });
           },
         });
+        this._charge(result);
 
         content = result.output;
 
@@ -625,6 +608,7 @@ export class Council extends EventEmitter {
               'Stop all tool calls. Output your complete report now, including your consensus vote [CONSENSUS: YES] or [CONSENSUS: NO].',
               { timeout: FOLLOWUP_TIMEOUT_MS, parentRunId: sessionId },
             );
+            this._charge(followup);
             if (followup.output.trim().length > 0) {
               content = followup.output;
               if (hasConsensusMarker(content) || content.length >= MIN_COMPLETE_RESPONSE_LENGTH) break;
@@ -691,7 +675,7 @@ export class Council extends EventEmitter {
     const trimmedTask = session.task;
 
     // Safety check: prevent council from running inside the program's own directory
-    const moduleRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+    const moduleRoot = programRoot();
     const resolvedProjectDir = path.resolve(this.config.projectDir);
     const rel = path.relative(moduleRoot, resolvedProjectDir);
     const isInside = rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));

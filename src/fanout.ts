@@ -3,8 +3,8 @@
  * results, with an optional synthesis pass.
  *
  * This is the cross-engine "diverse perspectives / best-of-N" primitive: each
- * agent runs in its own session (any engine) against the shared projectDir and
- * returns an answer. Unlike `council`, there is no consensus voting, no rounds,
+ * agent runs in its own session (any engine) against the shared projectDir, or
+ * a directory of its own, and returns an answer. Unlike `council`, there is no consensus voting, no rounds,
  * and no git-worktree isolation — so it is intended for analysis/generation
  * that returns text (review from N angles, best-of-N drafts), NOT parallel file
  * edits. For isolated parallel editing use `council` (per-agent worktrees).
@@ -25,6 +25,8 @@ import type {
 } from './types.js';
 import { type Logger } from './logger.js';
 import { mapBounded } from './concurrency.js';
+import { sanitizeCwd } from './validation.js';
+import * as path from 'node:path';
 
 /** Minimal SessionManager surface used by Fanout (avoids a circular import). */
 interface SessionManagerLike {
@@ -40,6 +42,11 @@ interface SessionManagerLike {
 export interface FanoutAgentSpec extends AgentBinding {
   /** Unique label for this agent (used in the session name and results). */
   name: string;
+  /**
+   * This agent's own working directory, absolute or relative to the fan-out's.
+   * Agents that each write code need one apiece, or they edit the same files.
+   */
+  cwd?: string;
   /** Complete per-agent prompt; replaces the shared task when non-empty. */
   prompt?: string;
   /** Role instructions prepended to the shared task without a non-empty prompt. */
@@ -48,9 +55,11 @@ export interface FanoutAgentSpec extends AgentBinding {
   customEngine?: CustomEngineConfig;
   permissionMode?: PermissionMode;
   /**
-   * The engine-agnostic sandbox. `permissionMode: 'plan'` constrains Claude only;
-   * `sandboxMode: 'read-only'` is what keeps an agent on any engine from writing,
-   * and it matters here because every agent shares the one project directory.
+   * The engine-agnostic sandbox. `permissionMode` goes to each engine's own
+   * permission handling (Claude and Grok have a plan mode; Codex, Antigravity and
+   * OpenCode ignore it), so `sandboxMode: 'read-only'` is what keeps an agent on
+   * any engine from writing — an engine that cannot hold it refuses to start. It
+   * matters here because every agent shares the one project directory.
    */
   sandboxMode?: 'read-only' | 'workspace-write' | 'danger-full-access';
 }
@@ -63,6 +72,8 @@ export interface FanoutConfig {
   synthesize?: boolean;
   synthesisModel?: string;
   synthesisEngine?: EngineType;
+  /** The ACP agent preset the synthesis pass starts when `synthesisEngine` is `acp`. */
+  synthesisAcpAgent?: string;
   /**
    * Permission mode for the synthesis pass. Defaults to `bypassPermissions`
    * like the agents do, but a read-only fan-out has to pass `plan` here too:
@@ -90,10 +101,16 @@ export interface FanoutAgentResult {
   agent: string;
   engine: EngineType;
   model?: string;
+  /** The directory this agent ran in. */
+  cwd?: string;
   ok: boolean;
   output: string;
   error?: string;
   durationMs: number;
+  /** What this agent's turn cost, as its send measured it. */
+  costUsd?: number;
+  /** A goal agent: the child run its goal ran in, and how the goal ended. */
+  goal?: { runId: string; status?: string; tokensUsed?: number; threadId?: string };
 }
 
 export interface FanoutSession {
@@ -107,6 +124,8 @@ export interface FanoutSession {
   synthesis?: string;
   /** Set when synthesis was requested but failed, so callers can tell it apart from "not requested". */
   synthesisError?: string;
+  /** Every agent turn and the synthesis pass, summed — the fan-out's share of its run's cost. */
+  costUsd?: number;
   error?: string;
 }
 
@@ -192,10 +211,12 @@ export class Fanout {
     }
     const sessionName = `${this.session.id}-${spec.name}`;
     const start = Date.now();
+    let cwd = this.config.projectDir;
     try {
+      cwd = spec.cwd ? sanitizeCwd(path.resolve(this.config.projectDir, spec.cwd))! : this.config.projectDir;
       await this.manager.startSession({
         name: sessionName,
-        cwd: this.config.projectDir,
+        cwd,
         engine,
         model: spec.model,
         ...(spec.effort === undefined ? {} : { effort: spec.effort }),
@@ -205,6 +226,7 @@ export class Fanout {
         maxTurns: this.config.maxTurnsPerAgent ?? DEFAULT_MAX_TURNS,
         maxBudgetUsd: this.config.maxBudgetUsd,
         customEngine: spec.customEngine,
+        ...(spec.acpAgent === undefined ? {} : { acpAgent: spec.acpAgent }),
         orchestration: {
           runId: this.session.id,
           runKind: 'fanout',
@@ -213,7 +235,8 @@ export class Fanout {
           codename: spec.name,
           engine,
           model: spec.model,
-          cwd: this.config.projectDir,
+          effort: spec.effort,
+          cwd,
         },
       });
       const before = this._stats(sessionName);
@@ -234,16 +257,19 @@ export class Fanout {
         agent: spec.name,
         engine,
         model: spec.model,
+        cwd,
         ok,
         output: result.output,
         error: ok ? undefined : result.error || 'engine did not report the turn as succeeded',
         durationMs: Date.now() - start,
+        ...(result.usage ? { costUsd: this._charge(result.usage.costUsd) } : {}),
       };
     } catch (err) {
       return {
         agent: spec.name,
         engine,
         model: spec.model,
+        cwd,
         ok: false,
         output: '',
         error: (err as Error).message,
@@ -264,6 +290,12 @@ export class Fanout {
    * before/after pair that turns out to be the same reference silently compares
    * a value against itself and always reports success.
    */
+  /** Add one send's cost to the fan-out's total and hand it back. */
+  private _charge(costUsd: number): number {
+    this.session.costUsd = (this.session.costUsd ?? 0) + costUsd;
+    return costUsd;
+  }
+
   private _stats(name: string): { turns: number; turnsSucceeded: number } | undefined {
     if (!this.manager.getStatus) return undefined;
     try {
@@ -289,24 +321,26 @@ export class Fanout {
         cwd: this.config.projectDir,
         engine: this.config.synthesisEngine || 'claude',
         model: this.config.synthesisModel,
-        permissionMode: this.config.synthesisPermissionMode ?? 'bypassPermissions',
-        maxTurns: this.config.maxTurnsPerAgent ?? DEFAULT_MAX_TURNS,
-        maxBudgetUsd: this.config.maxBudgetUsd,
+        ...(this.config.synthesisAcpAgent === undefined ? {} : { acpAgent: this.config.synthesisAcpAgent }),
         orchestration: {
           runId: this.session.id,
           runKind: 'fanout',
           agentKey: 'synthesis',
-          agentName: 'Synthesis',
+          agentName: 'synthesis',
           codename: 'synthesis',
           engine: this.config.synthesisEngine || 'claude',
           model: this.config.synthesisModel,
           cwd: this.config.projectDir,
         },
+        permissionMode: this.config.synthesisPermissionMode ?? 'bypassPermissions',
+        maxTurns: this.config.maxTurnsPerAgent ?? DEFAULT_MAX_TURNS,
+        maxBudgetUsd: this.config.maxBudgetUsd,
       });
       const result = await this.manager.sendMessage(sessionName, prompt, {
         timeout: this.config.agentTimeoutMs ?? DEFAULT_AGENT_TIMEOUT_MS,
         parentRunId: this.session.id,
       });
+      if (result.usage) this._charge(result.usage.costUsd);
       // `sendMessage` reports a turn-level failure (auth loss mid-turn, invalid
       // model, rate-limit exhaustion) by RETURNING `{error}`, not by throwing —
       // so the catch below never saw those and `result.output` (the error text,

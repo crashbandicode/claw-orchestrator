@@ -86,11 +86,13 @@ New tools, all broker-only:
 
 | Tool | Required fields | Behavior |
 | --- | --- | --- |
-| `thread_register` | `name`, `nativeSessionId` | Records a manual thread. Does not spawn or resume it. Refuses a name that is already a live managed session. |
-| `thread_mailbox_send` | `name`, `from`, `message` | Queues mail for a registered thread. Optional `messageId`. Does not start a native turn. |
+| `thread_register` | `name`, `nativeSessionId` | Records a manual thread. Does not spawn it. Refuses a name that is already a live managed session. `session_start` of that name later resumes the native session and becomes its managed owner. |
+| `thread_mailbox_send` | `name`, `from`, `message` | Queues mail while the thread has no live owner, and delivers it once a managed owner is live. Optional `messageId`. |
 | `thread_mailbox_read` | `name` | Reads that thread. `unreadOnly` defaults to true. Concurrent reads see the same unread mail until ack. |
 | `thread_mailbox_ack` | `messageId` or `messageIds` | Marks mail read. Ack of an already-read id succeeds again. |
 | `thread_mailbox_wait` | `name` | Resolves when unread mail is queued, or when `waitTimeout` elapses. |
+
+`session_start` of a registered manual-thread name resumes that native session. Pass `engine` when the registration has no provider; an OpenCode id beginning with `ses_` is started as `opencode`. `session_deliver_inbox` does the same and then delivers queued mail. A second live owner of that name or native session is refused.
 
 Managed `session_send_to` goes through SessionManager's serialized turn path. A TCP write is not model delivery. Status stays `queued` until the serialized send finishes, then `read`. A native wait timeout marks that message `uncertain` and does not retry it. Broadcast `*` reaches managed sessions on that broker only and skips the sender.
 

@@ -8,14 +8,14 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
-import { randomUUID } from 'node:crypto';
 import { execFile, execFileSync } from 'node:child_process';
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
+import { execEngine } from './engine-spawn.js';
 
 const execFileAsync = promisify(execFile);
 import * as http from 'node:http';
 import { createRequire } from 'node:module';
-import RE2 from 're2';
 
 const _require = createRequire(import.meta.url);
 function getPluginVersion(): string {
@@ -38,8 +38,11 @@ function getPluginVersion(): string {
 
 // ─── Persistence ─────────────────────────────────────────────────────────────
 
-const PERSIST_DIR = path.join(os.homedir(), '.openclaw');
+// CLAWO_SESSIONS_DIR relocates the file, so tests never touch the real one.
+const PERSIST_DIR = process.env.CLAWO_SESSIONS_DIR || path.join(os.homedir(), '.openclaw');
 const PERSIST_FILE = path.join(PERSIST_DIR, 'claude-sessions.json');
+/** Largest request body the auto-proxy accepts: Anthropic's own Messages API limit (32 MB). */
+const PROXY_MAX_BODY_BYTES = 32 * 1024 * 1024;
 // PERSIST_DISK_TTL_MS imported from ./constants.js
 
 interface PersistedSession {
@@ -49,12 +52,16 @@ interface PersistedSession {
   model?: string;
   engine?: EngineType;
   sandboxMode?: SessionConfig['sandboxMode'];
+  autoCompactPercent?: number;
+  chrome?: boolean;
+  /** The Claude account the caller asked for (a name or `auto`), not the one it moved to. */
+  claudeAccount?: string;
   originalCreated: string;
   lastResumed: string;
   lastActivity: number;
 }
 
-function loadPersistedSessions(file = PERSIST_FILE): Map<string, PersistedSession> {
+function loadPersistedSessions(file: string = PERSIST_FILE): Map<string, PersistedSession> {
   try {
     if (!fs.existsSync(file)) return new Map();
     const raw = fs.readFileSync(file, 'utf8');
@@ -68,50 +75,53 @@ function loadPersistedSessions(file = PERSIST_FILE): Map<string, PersistedSessio
   }
 }
 
-// Atomic write: write to .tmp then rename to avoid corrupt reads on crash
-function savePersistedSessions(sessions: Map<string, PersistedSession>, logger?: Logger, file = PERSIST_FILE): void {
+/**
+ * Write this process's changes into the shared session file.
+ *
+ * Several processes share the file — the server, the OpenClaw plugin, every
+ * `clawo-mcp` and `clawo acp` a host starts. Each used to write its whole
+ * in-memory map back, so the last writer erased whatever the others had added
+ * since it loaded: a long-lived session's resume record could vanish because an
+ * unrelated process exited. Now only the names this process changed (`dirty`,
+ * set or deleted) are merged into what is on disk, under a lock, and the merged
+ * map is returned so the caller sees the other processes' sessions too.
+ *
+ * Returns undefined when the lock stays busy; `dirty` is left as it was, so
+ * the changes go out with the next save instead of being lost.
+ */
+function savePersistedSessions(
+  mine: Map<string, PersistedSession>,
+  dirty: Set<string>,
+  logger?: Logger,
+  file: string = PERSIST_FILE,
+): Map<string, PersistedSession> | undefined {
+  const log = logger || createConsoleLogger('SessionManager');
   try {
     fs.mkdirSync(path.dirname(file), { recursive: true });
-    const arr = Array.from(sessions.values());
-    const tmp = file + '.tmp';
-    fs.writeFileSync(tmp, JSON.stringify(arr, null, 2));
-    fs.renameSync(tmp, file);
+    const result = withFileLock(`${file}.lock`, () => {
+      const merged = loadPersistedSessions(file);
+      for (const name of dirty) {
+        const entry = mine.get(name);
+        if (entry) merged.set(name, entry);
+        else merged.delete(name);
+      }
+      const tmp = `${file}.${process.pid}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(Array.from(merged.values()), null, 2));
+      fs.renameSync(tmp, file);
+      return merged;
+    });
+    if (!result.ok) {
+      log.warn('Session file busy; changes kept for the next save');
+      return undefined;
+    }
+    dirty.clear();
+    return result.value;
   } catch (err) {
-    (logger || createConsoleLogger('SessionManager')).warn('Failed to persist sessions:', (err as Error).message);
+    log.warn('Failed to persist sessions:', (err as Error).message);
+    return undefined;
   }
 }
 
-// Async version for hot-path (sendMessage, TTL cleanup)
-function savePersistedSessionsAsync(
-  sessions: Map<string, PersistedSession>,
-  logger?: Logger,
-  file = PERSIST_FILE,
-): void {
-  const log = logger || createConsoleLogger('SessionManager');
-  const arr = Array.from(sessions.values());
-  const tmp = file + '.tmp';
-  fs.mkdir(path.dirname(file), { recursive: true }, (mkdirErr) => {
-    if (mkdirErr) {
-      log.error('Failed to create persist dir:', mkdirErr.message);
-      return;
-    }
-    fs.writeFile(tmp, JSON.stringify(arr, null, 2), (writeErr) => {
-      if (writeErr) {
-        log.error('Failed to write session file:', writeErr.message);
-        return;
-      }
-      fs.rename(tmp, file, (renameErr) => {
-        if (renameErr) {
-          log.error('Failed to rename session file:', renameErr.message);
-          // Clean up orphan tmp file
-          fs.unlink(tmp, () => {});
-        }
-      });
-    });
-  });
-}
-
-// Debounce helper — coalesces rapid writes into one
 function makeDebounced(fn: () => void, ms: number): () => void {
   let timer: ReturnType<typeof setTimeout> | null = null;
   return () => {
@@ -129,7 +139,7 @@ import { detectRepoLang } from './kernel/repo.js';
 import { RunKernel, runDir as kernelRunDir } from './kernel/engine.js';
 import { registerDefaultExecutors } from './kernel/nodes/index.js';
 import { autoloopStateFromRecord, makeAutoloopExecutor, type AutoloopHandle } from './kernel/nodes/autoloop.js';
-import { loadRun, readNodeOutput, type RunSummary } from './kernel/store.js';
+import { isValidRunId, loadRun, readNodeOutput, runExists, type RunSummary } from './kernel/store.js';
 import {
   LEGACY_NODE,
   joinFindings,
@@ -159,11 +169,19 @@ import {
   type RunLedgerSummary,
 } from './run-ledger.js';
 import { checkBudget, isBudgetExceeded } from './budget.js';
+import { withFileLock } from './kernel/file-lock.js';
 import { InboxManager, type SessionLookup } from './inbox-manager.js';
-import { sanitizeCwd, validateName } from './validation.js';
-import { sanitizeSecrets } from './sanitize.js';
-import { CodexMcpConfigError, validateCodexMcpSelection } from './codex-mcp.js';
+import { compileSafeRegex, sanitizeCwd, validateName } from './validation.js';
 import { PersistentClaudeSession } from './persistent-session.js';
+import {
+  ClaudeAccountPool,
+  accountEnv,
+  claudeAccountsFile,
+  loadClaudeAccounts,
+  readAccountSecret,
+  type AccountState,
+  type ClaudeAccount,
+} from './claude-accounts.js';
 import {
   cloneTranscript,
   DEFAULT_HANDOFF_CHARS,
@@ -175,19 +193,27 @@ import {
 } from './handoff.js';
 import { PersistentGeminiSession } from './persistent-gemini-session.js';
 import { PersistentCodexSession } from './persistent-codex-session.js';
-import { PersistentCodexAppServerSession } from './persistent-codex-app-session.js';
+import { PersistentCodexAppServerSession, type ThreadGoal } from './persistent-codex-app-session.js';
+import type { GoalSession } from './kernel/nodes/goal.js';
+import { ClaudeGoalSession, type ClaudeGoalOpen } from './claude-goal-session.js';
 import { PersistentCursorSession } from './persistent-cursor-session.js';
 import { PersistentGrokSession } from './persistent-grok-session.js';
 import { PersistentOpencodeSession } from './persistent-opencode-session.js';
 import { PersistentAgySession } from './persistent-agy-session.js';
 import { PersistentCustomSession } from './persistent-custom-session.js';
+import { PersistentAcpSession } from './persistent-acp-session.js';
 import { resolveCustomEngine } from './engine-presets.js';
 import {
   type SessionConfig,
   type SessionInfo,
-  type SessionHealth,
   type SendOptions,
+  type OrchestrationAgentContext,
+  type OrchestrationAgentStatus,
+  type OrchestrationRunStatus,
+  PARENT_TOOL_IDS,
+  type ParentToolId,
   type PermissionDenial,
+  type GeneratedImage,
   type SendResult,
   type PluginConfig,
   type EffortLevel,
@@ -200,11 +226,6 @@ import {
   type RuleInfo,
   type StreamEvent,
   type ISession,
-  PARENT_TOOL_IDS,
-  type ParentToolId,
-  type OrchestrationAgentContext,
-  type OrchestrationAgentStatus,
-  type OrchestrationRunStatus,
   type CouncilConfig,
   type CouncilSession,
   type CouncilReviewResult,
@@ -216,18 +237,31 @@ import {
   overrideModelPricing,
   ENGINE_BINARY_NAMES,
 } from './types.js';
-import { parentSessionIdFromDelegateMarker } from './remote/delegate-marker.js';
-import { resolveAlias, isClaudeModel, lookupModel } from './models.js';
+import { resolveAlias, isClaudeModel, lookupModel, resolveEngineAndModel, claudeGatewayMode } from './models.js';
 import { isAgyConversationId } from './agy-conversation.js';
 import { Council } from './council.js';
 import { Fanout, type FanoutConfig, type FanoutSession, type FanoutAgentSpec } from './fanout.js';
-import { AutoloopRunner } from './autoloop/runner.js';
+import { AutoloopRunner, type AutoloopInputSnapshot } from './autoloop/runner.js';
+import { boundedErrorReason, sanitizeSecrets } from './sanitize.js';
+import { OrchestrationEventWriter } from './orchestration-events.js';
+import { CodexMcpConfigError, validateCodexMcpSelection } from './codex-mcp.js';
+import { parentSessionIdFromDelegateMarker } from './remote/delegate-marker.js';
 import { ClaudeAgentDispatcher, type ClaudeAgentDispatcherConfig } from './autoloop/dispatcher.js';
 import type { AutoloopState, PushPolicy } from './autoloop/types.js';
-import { DEFAULT_PUSH_POLICY, DEFAULT_SEND_TIMEOUT_MS, validateAutoloopTimeoutConfig } from './autoloop/types.js';
-import { Msg as AutoloopMsg, type PushChannel, type PushLevel, type SendTimeoutPayload } from './autoloop/messages.js';
+import {
+  DEFAULT_PUSH_POLICY,
+  DEFAULT_SEND_TIMEOUT_MS,
+  MAX_METRIC_HISTORY,
+  validateAutoloopTimeoutConfig,
+} from './autoloop/types.js';
+import {
+  Msg as AutoloopMsg,
+  type AnyAutoloopMessage,
+  type PushChannel,
+  type PushLevel,
+  type SendTimeoutPayload,
+} from './autoloop/messages.js';
 import { appendPushLog, notifyUserFallbackChain } from './autoloop/notify.js';
-import { OrchestrationEventWriter } from './orchestration-events.js';
 import { UltraappManager } from './ultraapp/manager.js';
 import { UltraappStore, defaultStoreRoot } from './ultraapp/store.js';
 import type { UltraappRouter } from './ultraapp/router.js';
@@ -253,6 +287,8 @@ interface ManagedSession {
   cwd: string;
   claudeSessionId?: string;
   skipPersistence?: boolean;
+  /** The Claude account the session runs under now; it changes when the session rotates. */
+  account?: string;
   /**
    * Per-session send chain. Concurrent sendMessage() calls on the same session
    * MUST serialize, otherwise PersistentClaudeSession's single _streamCallbacks
@@ -262,17 +298,16 @@ interface ManagedSession {
    * thrown send still unblocks waiters.
    */
   sendChain?: Promise<unknown>;
+  orchestration?: OrchestrationAgentContext;
+  orchestrationBoundNativeId?: string;
+  orchestrationLastStatus?: OrchestrationAgentStatus;
+  nativeIdentityListener?: (...args: unknown[]) => void;
   /**
    * Latched once cumulative spend reaches `config.maxBudgetUsd`. The gate in
    * sendMessage re-derives this from getCost() anyway; the flag exists so the
    * session listings can show *why* a session stopped accepting turns.
    */
   budgetExhausted?: boolean;
-  orchestration: OrchestrationAgentContext;
-  orchestrationBoundNativeId?: string;
-  orchestrationLastStatus: OrchestrationAgentStatus;
-  /** Bound `SESSION_EVENT.NATIVE_IDENTITY` listener; removed on stop/restart. */
-  nativeIdentityListener?: (...args: unknown[]) => void;
   /**
    * Sends recorded in the run ledger for this session in this process — the
    * row's `turn` index. Not `stats.turns`: on claude that counts every `user`
@@ -291,23 +326,7 @@ interface ManagedSession {
    * so a first turn that fails does not strand the conversation it was carrying.
    */
   pendingHandoff?: string;
-  /**
-   * Engine errors recorded by the guard `_guardSessionEvents()` installs on every
-   * session. Shared with that guard's closures, which are attached before the
-   * session starts (an engine can report an error during its own handshake), so
-   * this object exists before the `ManagedSession` does.
-   */
-  health: SessionHealthRecord;
 }
-
-/**
- * Mutable form of `SessionHealth` kept per managed session. `starting` is true until
- * `start()` resolves: an engine that is not ready yet is not a failed one.
- */
-type SessionHealthRecord = SessionHealth & { starting?: boolean };
-
-/** Cap on a recorded error message, so a verbose engine error cannot bloat session listings. */
-const MAX_RECORDED_ERROR_CHARS = 500;
 
 /**
  * Structural type for the `codex-app` engine session, exposing the app-server
@@ -327,6 +346,9 @@ type CodexAppSession = ISession & {
     cursor?: string;
     limit?: number;
   }) => Promise<{ data: unknown[]; nextCursor: string | null }>;
+  setGoal: PersistentCodexAppServerSession['setGoal'];
+  getGoal: PersistentCodexAppServerSession['getGoal'];
+  clearGoal: PersistentCodexAppServerSession['clearGoal'];
 };
 
 // ─── Cross-process visibility ───────────────────────────────────────────────
@@ -435,6 +457,15 @@ function readStoredAutoloopResumeContext(
     if (row.pendingDispatchId === pendingDispatch?.dispatch_id) pendingDispatch = null;
   }
   return { effectiveSendTimeoutMs, pendingDispatch };
+}
+
+/** A process's command line as `ps` prints it, or undefined when it cannot be read. */
+function processCommand(pid: number): string | undefined {
+  try {
+    return execFileSync('ps', ['-p', String(pid), '-o', 'command='], { encoding: 'utf8', timeout: 3_000 }).trim();
+  } catch {
+    return undefined;
+  }
 }
 
 function validateSendTimeoutIncrease(value: unknown, current: number): asserts value is number {
@@ -559,7 +590,22 @@ function validateAutoloopRole(
     if (!customEngine) throw new Error(`${label} custom engine config is required`);
     validateAutoloopCustomEngine(role, customEngine);
   }
+  // An Autoloop role is configured by engine name alone and has no field for the
+  // agent an `acp` engine starts, so the session could only fail later.
+  if (resolved === 'acp') throw new Error(`${label} engine 'acp' is not supported by Autoloop`);
   return resolved;
+}
+
+/**
+ * The plugin's `defaultModel` for a session on `engine` that names no model, or
+ * undefined to let the engine run its own default. Engines do not share a model
+ * namespace, so the default goes only to an engine that runs it; the claude
+ * engine takes any model, proxying a non-Claude one to the gateway.
+ */
+function defaultModelFor(engine: EngineType, defaultModel: string | undefined): string | undefined {
+  if (!defaultModel || engine === 'claude') return defaultModel;
+  const owner = resolveEngineAndModel(defaultModel).engine;
+  return owner === (engine === 'codex-app' ? 'codex' : engine) ? defaultModel : undefined;
 }
 
 function validateAutoloopEffort(role: AutoloopRoleName, effort: EffortLevel | undefined): void {
@@ -570,6 +616,301 @@ function validateAutoloopEffort(role: AutoloopRoleName, effort: EffortLevel | un
   }
 }
 
+/** True when path is under tasks/<id>/ and tasks/<id>/goal.json is a regular file. */
+function isMarkedAutoloopLedgerPath(workspace: string, filePath: string): boolean {
+  const parts = filePath.split('/');
+  if (parts.length < 3 || parts[0] !== 'tasks') return false;
+  for (const seg of parts) {
+    if (seg === '' || seg === '.' || seg === '..') return false;
+  }
+  const id = parts[1]!;
+  try {
+    return fs.statSync(path.join(workspace, 'tasks', id, 'goal.json')).isFile();
+  } catch {
+    return false;
+  }
+}
+
+/** Porcelain XY allowed for a marked ledger: untracked or index-clean worktree mod. */
+function isAllowedAutoloopLedgerStatus(x: string, y: string): boolean {
+  return (x === '?' && y === '?') || (x === ' ' && y === 'M');
+}
+
+/** True for an index gitlink, false for an ordinary path, null when Git cannot answer. */
+function isTrackedGitlink(workspace: string, filePath: string): boolean | null {
+  try {
+    const record = execFileSync(
+      'git',
+      ['--literal-pathspecs', '-C', workspace, 'ls-files', '--stage', '-z', '--', filePath],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, LC_ALL: 'C' },
+      },
+    );
+    return record.startsWith('160000 ');
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `git status` paths are repo-root-relative. Strip a verified `--show-prefix` so
+ * ledger checks see workspace-relative paths. Null = outside the workspace.
+ */
+function workspaceRelativePorcelainPath(repoRelPath: string, prefix: string): string | null {
+  if (prefix.length === 0) return repoRelPath;
+  if (!repoRelPath.startsWith(prefix)) return null;
+  return repoRelPath.slice(prefix.length);
+}
+
+/**
+ * Read and verify `rev-parse --show-prefix` against toplevel↔workspace relative
+ * path. Returns null when verification fails (caller fail-closes as dirty).
+ */
+function readVerifiedGitShowPrefix(workspace: string): string | null {
+  try {
+    const toplevel = execFileSync('git', ['-C', workspace, 'rev-parse', '--show-toplevel'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).replace(/\r?\n$/, '');
+    const prefix = execFileSync('git', ['-C', workspace, 'rev-parse', '--show-prefix'], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    }).replace(/\r?\n$/, '');
+    const resolvedTop = fs.realpathSync(toplevel);
+    const resolvedWs = fs.realpathSync(workspace);
+    const rel = path.relative(resolvedTop, resolvedWs);
+    if (rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel)) return null;
+    const expected = rel === '' ? '' : `${rel.split(path.sep).join('/')}/`;
+    return expected === prefix ? prefix : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Only this deterministic git failure means a non-repository workspace. */
+function isNotGitRepositoryError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const stderr = (err as { stderr?: string | Buffer }).stderr;
+  const text = typeof stderr === 'string' ? stderr : Buffer.isBuffer(stderr) ? stderr.toString('utf8') : '';
+  const lines = text.trim().split(/\r?\n/);
+  if (lines.length === 1) {
+    return lines[0] === 'fatal: not a git repository (or any of the parent directories): .git';
+  }
+  return (
+    lines.length === 2 &&
+    /^fatal: not a git repository \(or any parent up to mount point .+\)$/.test(lines[0]!) &&
+    lines[1] === 'Stopping at filesystem boundary (GIT_DISCOVERY_ACROSS_FILESYSTEM not set).'
+  );
+}
+
+/**
+ * Parse `git status --porcelain=v1 -z` output. Returns true when any record must
+ * refuse autoloopStart. Ignore only status exactly `??` or index-clean ` M`
+ * under a marked ledger (after normalizing repo-root paths with a verified
+ * show-prefix).
+ */
+function porcelainHasDisallowedAutoloopDirt(workspace: string, porcelain: string, prefix: string): boolean {
+  if (porcelain.length === 0) return false;
+  let i = 0;
+  while (i < porcelain.length) {
+    if (i + 3 > porcelain.length) return true;
+    const x = porcelain[i]!;
+    const y = porcelain[i + 1]!;
+    if (porcelain[i + 2] !== ' ') return true;
+    i += 3;
+    const nul = porcelain.indexOf('\0', i);
+    if (nul < 0) return true;
+    const repoRelPath = porcelain.slice(i, nul);
+    i = nul + 1;
+    if (x === 'R' || x === 'C' || y === 'R' || y === 'C') {
+      const nul2 = porcelain.indexOf('\0', i);
+      if (nul2 < 0) return true;
+      i = nul2 + 1;
+      return true;
+    }
+    const filePath = workspaceRelativePorcelainPath(repoRelPath, prefix);
+    if (filePath === null || !isAllowedAutoloopLedgerStatus(x, y) || !isMarkedAutoloopLedgerPath(workspace, filePath)) {
+      return true;
+    }
+    // Porcelain v1 -z collapses every kind of submodule dirt to worktree `M`.
+    // Never let a gitlink inherit the ordinary ledger-file ` M` exception.
+    if (x === ' ' && y === 'M' && isTrackedGitlink(workspace, filePath) !== false) return true;
+  }
+  return false;
+}
+
+/** Fixed generic refusal — no runId, path, file bytes, or git stderr. */
+const AUTOLOOP_LEDGER_ISOLATION_ERROR = 'Autoloop could not isolate the run ledger from Git';
+
+function refuseAutoloopLedgerIsolation(): never {
+  throw new Error(AUTOLOOP_LEDGER_ISOLATION_ERROR);
+}
+
+/** Ensure absPath is a real directory (not a symlink); mkdir non-recursively if missing. */
+function ensureRealAutoloopDir(absPath: string): void {
+  if (!fs.existsSync(absPath)) fs.mkdirSync(absPath);
+  let st: fs.Stats;
+  try {
+    st = fs.lstatSync(absPath);
+  } catch {
+    refuseAutoloopLedgerIsolation();
+  }
+  if (!st.isDirectory() || st.isSymbolicLink()) refuseAutoloopLedgerIsolation();
+}
+
+/**
+ * After dirty refusal: create `tasks/<runId>/.gitignore` (`*`) and prove via
+ * check-ignore. Never deletes ledger state. Invalid runIds skip (kernel rejects).
+ */
+function ensureAutoloopRunLedgerIgnored(workspace: string, runId: string): void {
+  if (!isValidRunId(runId)) return;
+  const relLedger = path.posix.join('tasks', runId);
+  const gitEnv = { ...process.env, LC_ALL: 'C' };
+  let tracked: string;
+  try {
+    tracked = execFileSync('git', ['-C', workspace, '--literal-pathspecs', 'ls-files', '-z', '--', relLedger], {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: gitEnv,
+    });
+  } catch {
+    refuseAutoloopLedgerIsolation();
+  }
+  if (tracked.length > 0) refuseAutoloopLedgerIsolation();
+
+  const tasksAbs = path.join(workspace, 'tasks');
+  const ledgerAbs = path.join(tasksAbs, runId);
+  try {
+    ensureRealAutoloopDir(tasksAbs);
+    ensureRealAutoloopDir(ledgerAbs);
+    if (fs.realpathSync(ledgerAbs) !== path.join(fs.realpathSync(workspace), 'tasks', runId)) {
+      refuseAutoloopLedgerIsolation();
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message === AUTOLOOP_LEDGER_ISOLATION_ERROR) throw err;
+    refuseAutoloopLedgerIsolation();
+  }
+
+  const ignoreAbs = path.join(ledgerAbs, '.gitignore');
+  try {
+    const fd = fs.openSync(ignoreAbs, 'wx');
+    try {
+      fs.writeFileSync(fd, '*\n');
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'EEXIST') refuseAutoloopLedgerIsolation();
+    try {
+      const st = fs.lstatSync(ignoreAbs);
+      if (!st.isFile() || st.isSymbolicLink()) refuseAutoloopLedgerIsolation();
+      const bytes = fs.readFileSync(ignoreAbs, 'utf8');
+      if (bytes !== '*' && bytes !== '*\n' && bytes !== '*\r\n') refuseAutoloopLedgerIsolation();
+    } catch (inner) {
+      if (inner instanceof Error && inner.message === AUTOLOOP_LEDGER_ISOLATION_ERROR) throw inner;
+      refuseAutoloopLedgerIsolation();
+    }
+  }
+
+  // check-ignore rejects --literal-pathspecs; valid runIds have no pathspec magic.
+  for (const probe of [
+    `${relLedger}/.gitignore`,
+    `${relLedger}/chat.jsonl`,
+    `${relLedger}/decisions.jsonl`,
+    `${relLedger}/iter/0/verdict.json`,
+    `${relLedger}/reviewer_sandbox/prior_verdict.json`,
+  ]) {
+    try {
+      execFileSync('git', ['-C', workspace, 'check-ignore', '-q', '--', probe], {
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: gitEnv,
+      });
+    } catch {
+      refuseAutoloopLedgerIsolation();
+    }
+  }
+}
+
+/**
+ * Fresh-start workspace boundary shared by `autoloopStart` and a fresh workflow
+ * `autoloop` boot: refuse a dirty Git worktree, then isolate the run ledger.
+ * `invalidRunId: 'defer'` skips isolation for invalid ids (direct start — the
+ * kernel rejects them). `'refuse'` fails closed with the fixed isolation error
+ * (fresh workflow path — config.runId is not the kernel run id).
+ */
+function applyAutoloopFreshStartBoundary(
+  workspace: string,
+  runId: string,
+  opts: { invalidRunId: 'defer' | 'refuse' },
+): void {
+  // Refuse a dirty git worktree before the run directory or Planner exists.
+  // --no-optional-locks: this check only reads, so it must not refresh and
+  // rewrite .git/index under index.lock, which a commit running in the same
+  // repository at that moment would then fail on.
+  // --porcelain=v1 -z keeps paths literal (spaces/quotes). --untracked-files=all
+  // overrides status.showUntrackedFiles=no, while --ignore-submodules=none
+  // prevents repository config from hiding submodule dirt; do not pass
+  // --ignored. Only the deterministic not-a-git-repository error allows the
+  // start; every other status failure rejects. Do not raise maxBuffer:
+  // ENOBUFS or already-nonempty stdout means dirt. Untracked (??) or
+  // index-clean worktree mods
+  // (` M`) under tasks/<id>/ are ignored only when tasks/<id>/goal.json is a
+  // regular file — every other status (staged/rename/copy/delete/conflict/
+  // malformed) rejects.
+  // Nested workspaces: status paths are repo-root-relative; strip a verified
+  // `rev-parse --show-prefix` before the ledger check; paths outside the
+  // workspace still refuse.
+  const dirtyStartError = new Error('Autoloop workspace has uncommitted changes; commit or stash them before starting');
+  let porcelain = '';
+  let inGitRepository = false;
+  try {
+    porcelain = execFileSync(
+      'git',
+      [
+        '--no-optional-locks',
+        '-C',
+        workspace,
+        'status',
+        '--porcelain=v1',
+        '-z',
+        '--untracked-files=all',
+        '--ignore-submodules=none',
+      ],
+      {
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'pipe'],
+        env: { ...process.env, LC_ALL: 'C' },
+      },
+    );
+    inGitRepository = true;
+  } catch (err) {
+    const e = err as { code?: string; stdout?: string | Buffer };
+    const partial =
+      typeof e.stdout === 'string' ? e.stdout : Buffer.isBuffer(e.stdout) ? e.stdout.toString('utf8') : '';
+    if (e.code === 'ENOBUFS' || partial.trim() !== '' || !isNotGitRepositoryError(err)) {
+      throw dirtyStartError;
+    }
+    porcelain = '';
+  }
+  if (porcelain.length > 0) {
+    const prefix = readVerifiedGitShowPrefix(workspace);
+    if (prefix === null || porcelainHasDisallowedAutoloopDirt(workspace, porcelain, prefix)) {
+      throw dirtyStartError;
+    }
+  }
+  // Run-local ledger isolation: tasks/<runId>/.gitignore (*) + check-ignore proof.
+  // Git workspaces only; skips invalid ids so kernel.start rejects them unchanged.
+  if (inGitRepository) {
+    if (!isValidRunId(runId)) {
+      if (opts.invalidRunId === 'refuse') refuseAutoloopLedgerIsolation();
+      return;
+    }
+    ensureAutoloopRunLedgerIgnored(workspace, runId);
+  }
+}
+
 /**
  * The tool calls a turn's `result` event says the engine refused, normalized.
  *
@@ -577,6 +918,15 @@ function validateAutoloopEffort(role: AutoloopRoleName, effort: EffortLevel | un
  * engine emits a result event of its own shape, so anything that is not an
  * array of objects naming a tool is ignored rather than trusted.
  */
+/** Images an engine attached to its result event as `generated_images`. */
+function readGeneratedImages(evt: Record<string, unknown> | undefined): GeneratedImage[] {
+  const raw = evt?.generated_images;
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(
+    (i): i is GeneratedImage => !!i && typeof i === 'object' && typeof (i as GeneratedImage).path === 'string',
+  );
+}
+
 function readPermissionDenials(evt: Record<string, unknown> | undefined): PermissionDenial[] {
   const raw = evt?.permission_denials;
   if (!Array.isArray(raw)) return [];
@@ -594,8 +944,129 @@ function readPermissionDenials(evt: Record<string, unknown> | undefined): Permis
   return out;
 }
 
+/** Fixed refusal when a non-fresh boot cannot trust the closed-ledger prefix. */
+const AUTOLOOP_CLOSED_LEDGER_REFUSAL = 'Autoloop resume refused: ledger closed-prefix is incomplete or malformed';
+
+const REVIEWER_DECISIONS = new Set(['advance', 'hold', 'rollback']);
+
+type ClosedLedgerRestore = { iter: number; metric_history: number[] };
+
+/**
+ * One-reader closed-ledger restore for non-fresh `_bootAutoloop`.
+ *
+ * Derives typed `iter` / `metric_history` from the contiguous valid closed
+ * prefix starting at 0. Checkpoint bytes are never progress authority.
+ * Returns null when there is no valid prefix (legacy lone verdict, empty).
+ * Throws {@link AUTOLOOP_CLOSED_LEDGER_REFUSAL} on gap / malformed tail.
+ */
+/** Canonical numeric iter directory names — no leading zeros. */
+const CLOSED_LEDGER_ITER_DIR = /^(0|[1-9][0-9]*)$/;
+
+function readClosedLedgerRestore(ledgerDir: string): ClosedLedgerRestore | null {
+  const iterRoot = path.join(ledgerDir, 'iter');
+  if (!fs.existsSync(iterRoot)) return null;
+
+  let numericDirs: number[];
+  try {
+    numericDirs = fs
+      .readdirSync(iterRoot)
+      .filter((name) => CLOSED_LEDGER_ITER_DIR.test(name))
+      .map((name) => Number(name))
+      .sort((a, b) => a - b);
+  } catch {
+    return null;
+  }
+  if (numericDirs.length === 0) return null;
+  const present = new Set(numericDirs);
+
+  const metrics: number[] = [];
+  let i = 0;
+  for (;;) {
+    const iterDir = path.join(iterRoot, String(i));
+    if (!fs.existsSync(iterDir)) {
+      // K=-1 / no valid closed prefix: never refuse on higher dirs (base Planner-only).
+      if (i === 0) return null;
+      for (const j of present) {
+        if (j > i) throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
+      }
+      break;
+    }
+
+    const directivePath = path.join(iterDir, 'directive.json');
+    const verdictPath = path.join(iterDir, 'verdict.json');
+    const hasDirective = fs.existsSync(directivePath);
+    const hasVerdict = fs.existsSync(verdictPath);
+
+    if (!hasDirective) {
+      if (hasVerdict) {
+        // Legacy lone verdict (or directive-less "closed" appearance).
+        if (i === 0) return null;
+        throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
+      }
+      // Empty/non-closed at 0: prefixless compat before any gap check.
+      if (i === 0) return null;
+      for (const j of present) {
+        if (j > i) throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
+      }
+      break;
+    }
+
+    if (!hasVerdict) {
+      // Open / directive-only / committed-without-review tail at i.
+      // No closed prefix yet: return null before gap checks (open0+lateriter1 compat).
+      if (i === 0) return null;
+      for (const j of present) {
+        if (j > i) throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
+      }
+      const history =
+        metrics.length > MAX_METRIC_HISTORY ? metrics.slice(metrics.length - MAX_METRIC_HISTORY) : metrics.slice();
+      return { iter: i, metric_history: history };
+    }
+
+    let raw: string;
+    try {
+      raw = fs.readFileSync(verdictPath, 'utf8');
+    } catch {
+      // Prefixless unreadable verdict at 0: no-restore / no-refusal (base compat).
+      if (i === 0) return null;
+      throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      if (i === 0) return null;
+      throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      if (i === 0) return null;
+      throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
+    }
+    const verdict = parsed as Record<string, unknown>;
+    if (verdict.iter !== i) {
+      if (i === 0) return null;
+      throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
+    }
+    if (typeof verdict.decision !== 'string' || !REVIEWER_DECISIONS.has(verdict.decision)) {
+      if (i === 0) return null;
+      throw new Error(AUTOLOOP_CLOSED_LEDGER_REFUSAL);
+    }
+    if (typeof verdict.metric === 'number' && Number.isFinite(verdict.metric)) {
+      metrics.push(verdict.metric);
+    }
+    i += 1;
+  }
+
+  if (i === 0) return null;
+  const history =
+    metrics.length > MAX_METRIC_HISTORY ? metrics.slice(metrics.length - MAX_METRIC_HISTORY) : metrics.slice();
+  return { iter: i, metric_history: history };
+}
+
 export class SessionManager {
   private sessions = new Map<string, ManagedSession>();
+  /** Goal adapters over `claude` sessions, by session name; dropped when the session stops. */
+  private _claudeGoals = new Map<string, ClaudeGoalSession>();
   private _pendingSessions = new Map<string, Promise<SessionInfo>>();
   /**
    * Starts that passed the capacity check and are not in `sessions` yet. The
@@ -604,29 +1075,36 @@ export class SessionManager {
    * a fan-out's agents — passed it, and the cap limited nothing.
    */
   private _startsInFlight = 0;
-  /** Remote operations accepted but not yet finished. Idle TTL must not reap them. */
-  private _sessionHolds = new Map<string, number>();
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private pluginConfig: PluginConfig;
   private persistedSessions: Map<string, PersistedSession>;
   private _debouncedSave: () => void;
   private _proxyServer: http.Server | null = null;
   private _proxyPort: number | null = null;
+  /** Per-process secret every request to the auto-proxy must carry as its first path segment. */
+  private _proxyToken: string | null = null;
   /** In-flight proxy startup, so concurrent callers share one server. */
   private _proxyStartPromise: Promise<number | null> | null = null;
   private _activePids = new Map<string, number>();
+  /**
+   * Each recorded pid's command line when it was recorded. An orphan is killed
+   * only if it is still that process: this is what lets cleanup recognise an
+   * ACP agent or a custom engine, whose binary is no fixed name.
+   */
+  private _pidCommands = new Map<number, string>();
   private _circuitBreaker = new CircuitBreaker();
   private _inbox = new InboxManager();
   /** cwd → detected language, so the manifest probe runs once per directory. */
   private _repoLangCache = new Map<string, string | undefined>();
   private logger: Logger;
-  private readonly _persistFile: string;
-  private readonly _pidFile: string;
   private _ultraappManager: UltraappManager | null = null;
   private _ultraappRouter: UltraappRouter | null = null;
   private _ultraappRuntimeMode: 'host' | 'docker' = 'host';
-  private _orchestrationEvents: OrchestrationEventWriter;
-  private _startedOrchestrationRuns = new Map<string, OrchestrationAgentContext>();
+  private readonly _persistFile: string;
+  private readonly _pidFile: string;
+  private readonly _sessionHolds = new Map<string, number>();
+  private _orchestrationEvents!: OrchestrationEventWriter;
+  private readonly _startedOrchestrationRuns = new Map<string, OrchestrationAgentContext>();
 
   constructor(config?: Partial<PluginConfig> & { stateDirectory?: string }, logger?: Logger) {
     if (config?.stateDirectory !== undefined) {
@@ -637,17 +1115,26 @@ export class SessionManager {
       this._persistFile = PERSIST_FILE;
       this._pidFile = SessionManager.PID_FILE;
     }
+    const fromEnv = process.env.CLAWO_MAX_CONCURRENT_SESSIONS?.trim();
     const maxConcurrentSessions =
-      config?.maxConcurrentSessions ?? Number(process.env.CLAWO_MAX_CONCURRENT_SESSIONS?.trim() || '5');
+      config?.maxConcurrentSessions ?? (fromEnv === undefined || fromEnv === '' ? 5 : Number(fromEnv));
     if (!Number.isSafeInteger(maxConcurrentSessions) || maxConcurrentSessions < 0) {
       throw new Error(
         'maxConcurrentSessions / CLAWO_MAX_CONCURRENT_SESSIONS must be a non-negative integer (0 = unlimited)',
       );
     }
     this.logger = logger || createConsoleLogger('SessionManager');
-    this._orchestrationEvents = new OrchestrationEventWriter({ orchestratorVersion: getPluginVersion() }, this.logger);
+    const outbox =
+      process.env.CLAWO_MEMENTO_OUTBOX ||
+      (process.env.VITEST ? path.join(os.tmpdir(), `clawo-memento-events-${process.pid}`, 'events.jsonl') : undefined);
+    this._orchestrationEvents = new OrchestrationEventWriter(
+      { orchestratorVersion: getPluginVersion(), ...(outbox ? { outboxFile: outbox } : {}) },
+      this.logger,
+    );
     this.pluginConfig = {
-      claudeBin: config?.claudeBin || 'claude',
+      // CLAUDE_BIN is what PersistentClaudeSession already honours when it gets no
+      // explicit binary; the manager always passed one, so the variable was dead.
+      claudeBin: config?.claudeBin || process.env.CLAUDE_BIN || 'claude',
       defaultModel: config?.defaultModel,
       defaultPermissionMode: config?.defaultPermissionMode || 'acceptEdits',
       defaultEffort: config?.defaultEffort || 'auto',
@@ -665,10 +1152,7 @@ export class SessionManager {
     // Clean up orphaned child processes from a previous unclean exit
     this._cleanupOrphanedPids();
     // Debounced async writer — at most one write per 5 seconds on hot paths
-    this._debouncedSave = makeDebounced(
-      () => savePersistedSessionsAsync(this.persistedSessions, this.logger, this._persistFile),
-      DEBOUNCED_SAVE_MS,
-    );
+    this._debouncedSave = makeDebounced(() => this._savePersisted(), DEBOUNCED_SAVE_MS);
 
     // Start TTL cleanup timer
     this.cleanupTimer = setInterval(() => this._cleanupIdleSessions(), CLEANUP_INTERVAL_MS);
@@ -727,6 +1211,10 @@ export class SessionManager {
 
   async startSession(config: Partial<SessionConfig> & { name?: string }): Promise<SessionInfo> {
     const name = config.name || `session-${Date.now()}`;
+    const compactAt = config.autoCompactPercent;
+    if (compactAt !== undefined && !(Number.isFinite(compactAt) && compactAt >= 1 && compactAt <= 99)) {
+      throw new Error('autoCompactPercent must be a number from 1 to 99');
+    }
 
     // Check pending first — a concurrent caller may have already started creation
     const pending = this._pendingSessions.get(name);
@@ -748,9 +1236,9 @@ export class SessionManager {
     }
   }
 
-  /** Session slots a new start could take right now. */
+  /** Session slots a new start could take right now. Zero means unlimited. */
   freeSessionSlots(): number {
-    if (this.pluginConfig.maxConcurrentSessions === 0) return Infinity;
+    if (this.pluginConfig.maxConcurrentSessions === 0) return Number.POSITIVE_INFINITY;
     return Math.max(0, this.pluginConfig.maxConcurrentSessions - this.sessions.size - this._startsInFlight);
   }
 
@@ -794,6 +1282,7 @@ export class SessionManager {
     const persisted = skipPersist ? undefined : this.persistedSessions.get(name);
     // Unified: only use resumeSessionId (claudeResumeId is an internal alias, not exposed)
     const resumeId = config.resumeSessionId ?? persisted?.claudeSessionId;
+    const engine: EngineType = config.engine || persisted?.engine || 'claude';
 
     // ORDER IS LOAD-BEARING — do not "fix" it by moving `...config` up.
     //
@@ -810,8 +1299,11 @@ export class SessionManager {
       cwd: config.cwd || persisted?.cwd || process.cwd(),
       permissionMode: config.permissionMode || this.pluginConfig.defaultPermissionMode,
       effort: config.effort || this.pluginConfig.defaultEffort,
-      model: config.model || persisted?.model || this.pluginConfig.defaultModel,
+      model: config.model || persisted?.model || defaultModelFor(engine, this.pluginConfig.defaultModel),
       sandboxMode: config.sandboxMode ?? persisted?.sandboxMode,
+      autoCompactPercent: config.autoCompactPercent ?? persisted?.autoCompactPercent,
+      chrome: config.chrome ?? persisted?.chrome,
+      claudeAccount: config.claudeAccount ?? persisted?.claudeAccount,
       ...config,
       ...(resumeId ? { resumeSessionId: resumeId } : {}),
     };
@@ -821,10 +1313,6 @@ export class SessionManager {
       fullConfig.resolvedModel = this._resolveModel(fullConfig.model, fullConfig.modelOverrides);
     }
 
-    // Auto-inject proxy baseUrl for non-Claude models on the claude engine.
-    // Starts a local proxy server that converts Anthropic → OpenAI format
-    // and forwards to the OpenClaw gateway. Zero config required.
-    const engine: EngineType = fullConfig.engine || persisted?.engine || 'claude';
     // Write the resolved engine back so downstream consumers of the managed
     // config (agy resume-id lookups, _persistSession's registry entry) see the
     // real engine even when it came from the persisted registry.
@@ -833,54 +1321,67 @@ export class SessionManager {
     fullConfig.orchestration = orchestration;
     this._ensureOrchestrationRunStarted(orchestration);
     this._orchestrationEvents.emit('agent.declared', orchestration, { agentStatus: 'declared' });
-
-    let session: ISession;
-    try {
-      // Circuit breaker and proxy setup are part of starting the declared
-      // child. Every rejection must therefore close its lifecycle record.
-      this._circuitBreaker.check(engine);
-      // A selection on an engine that would ignore it, or without ignoreUserConfig,
-      // is refused here rather than silently starting servers the caller excluded.
-      validateCodexMcpSelection(fullConfig, engine);
-      if (engine === 'claude' && fullConfig.resolvedModel && !fullConfig.baseUrl) {
-        if (!isClaudeModel(fullConfig.resolvedModel!)) {
-          const proxyPort = await this._ensureProxyServer();
-          if (proxyPort) {
-            fullConfig.baseUrl = `http://127.0.0.1:${proxyPort}`;
-          }
-        }
-      }
-      session = this._createSession(engine, fullConfig);
-    } catch (err) {
+    const failOrchestration = (): void => {
       this._orchestrationEvents.emit('agent.status', orchestration, { agentStatus: 'failed' });
       if (orchestration.runKind === 'session') this._emitOrchestrationRunStatus(orchestration, 'failed');
+    };
+
+    // Circuit breaker — reject early if engine is in backoff
+    try {
+      this._circuitBreaker.check(engine);
+      validateCodexMcpSelection(fullConfig, engine);
+    } catch (err) {
+      failOrchestration();
       throw err;
     }
 
+    // The Claude account the session runs under, resolved before anything spawns:
+    // a missing credential fails the start instead of falling back to another login.
+    // Only a session that takes an account awaits anything here: an extra await on
+    // every claude start would reorder concurrent starts.
+    const pick = engine === 'claude' ? this._pickStartAccount(fullConfig) : undefined;
+    const account = pick ? { name: pick.name, env: accountEnv(pick, await readAccountSecret(pick)) } : undefined;
+
+    // Auto-inject proxy baseUrl for non-Claude models on the claude engine.
+    // Starts a local proxy server that converts Anthropic → OpenAI format
+    // and forwards to the OpenClaw gateway. Zero config required.
+    // Not in gateway mode: there the caller's own gateway serves the model by name.
+    if (engine === 'claude' && fullConfig.resolvedModel && !fullConfig.baseUrl && !claudeGatewayMode()) {
+      if (!isClaudeModel(fullConfig.resolvedModel!)) {
+        const proxyPort = await this._ensureProxyServer();
+        if (proxyPort) {
+          fullConfig.baseUrl = this._proxyBaseUrl(proxyPort);
+        }
+      }
+    }
+    let session: ISession;
+    try {
+      session = this._createSession(engine, fullConfig);
+    } catch (err) {
+      failOrchestration();
+      throw err;
+    }
+    if (account && session instanceof PersistentClaudeSession) session.setAccountEnv(account.env);
+
     session.on(SESSION_EVENT.LOG, (...args: unknown[]) => this.logger.info(`[Session:${name}]`, ...args));
-    // Before start(): an engine may report an error during its own handshake.
-    const health: SessionHealthRecord = { state: 'ok', errorCount: 0, starting: true };
-    this._guardSessionEvents(name, session, health);
+    this._guardSessionEvents(name, session);
 
     try {
       await session.start();
     } catch (err) {
-      // A rejected codexMcpServers selection, or a Codex config that cannot be
-      // enumerated, says nothing about the engine itself: counting it would let a
-      // few bad requests refuse every valid start on that engine.
       if (!(err instanceof CodexMcpConfigError)) this._circuitBreaker.recordFailure(engine);
-      this._orchestrationEvents.emit('agent.status', orchestration, { agentStatus: 'failed' });
-      if (orchestration.runKind === 'session') this._emitOrchestrationRunStatus(orchestration, 'failed');
+      failOrchestration();
       throw err;
     }
 
     // Engine started successfully — reset circuit breaker
     this._circuitBreaker.reset(engine);
-    health.starting = false;
 
     // Track child process PID for orphan cleanup
     if (session.pid) {
       this._activePids.set(name, session.pid);
+      const command = processCommand(session.pid);
+      if (command) this._pidCommands.set(session.pid, command);
       this._savePids();
     }
 
@@ -892,9 +1393,9 @@ export class SessionManager {
       cwd: fullConfig.cwd,
       claudeSessionId: this._sessionResumeId(engine, session),
       skipPersistence: skipPersist,
+      ...(account ? { account: account.name } : {}),
       orchestration,
       orchestrationLastStatus: 'idle',
-      health,
     };
 
     release();
@@ -914,6 +1415,16 @@ export class SessionManager {
   }
 
   async sendMessage(name: string, message: string, options: SendOptions = {}): Promise<SendResult> {
+    return this._sendTurn(name, message, options);
+  }
+
+  /** `onDispatch` fires once the turn has passed every check and is handed to the engine. */
+  private async _sendTurn(
+    name: string,
+    message: string,
+    options: SendOptions,
+    onDispatch?: () => void,
+  ): Promise<SendResult> {
     const managed = this._getSession(name);
 
     // Per-session serialization. Two concurrent sendMessage() calls on the
@@ -927,8 +1438,7 @@ export class SessionManager {
     const link = new Promise<void>((resolve) => {
       releaseChain = resolve;
     });
-    const tail = prior.then(() => link).catch(() => link);
-    managed.sendChain = tail;
+    managed.sendChain = prior.then(() => link).catch(() => link);
     try {
       await prior;
     } catch {
@@ -941,17 +1451,11 @@ export class SessionManager {
     // calling send() on a detached/stopped session (TOCTOU on the sessions map).
     if (this.sessions.get(name) !== managed) {
       releaseChain();
-      if (managed.sendChain === tail) managed.sendChain = undefined;
+      if (managed.sendChain === link) managed.sendChain = undefined;
       throw new Error(`Session '${name}' was stopped while a prior turn was in flight`);
-    }
-    if (managed.session.isBusy) {
-      releaseChain();
-      if (managed.sendChain === tail) managed.sendChain = undefined;
-      throw new Error(`Session '${name}' has a native turn still in progress`);
     }
 
     try {
-      this._noteDelegateMarker(managed, message);
       managed.lastActivity = Date.now();
 
       // Spend cap, enforced here rather than per-engine. Claude Code also gets
@@ -962,6 +1466,26 @@ export class SessionManager {
         session: name,
         engine: managed.config.engine || 'claude',
       });
+
+      // Compact before the send rather than after the previous reply, so the
+      // caller is never kept waiting for it, and inside the send chain, so no
+      // other send can interleave. Best effort: a failed or unsupported compact
+      // must not cost the caller their turn.
+      const compactAt = managed.config.autoCompactPercent;
+      if (compactAt && managed.session.getStats().contextPercent >= compactAt) {
+        try {
+          await managed.session.compact();
+          this.logger.info(`[SessionManager] ${name}: context at or above ${compactAt}% — compacted before send`);
+        } catch (err) {
+          this.logger.warn(`[SessionManager] ${name}: auto-compact failed: ${(err as Error).message}`);
+        }
+      }
+
+      // Leave an account the pool already knows is spent before the turn hits it.
+      // Awaited only when there is a move to make, so a session without an
+      // account sends on the same tick it always did.
+      const leaving = this._rotateBeforeTurn(name, managed);
+      if (leaving) await leaving;
 
       const sendOpts: Record<string, unknown> = {
         waitForComplete: true,
@@ -1003,11 +1527,25 @@ export class SessionManager {
       let turnError: string | undefined;
 
       try {
-        this._setOrchestrationAgentStatus(managed, 'running');
+        if (managed.orchestration) this._noteDelegateMarker(managed, message);
+        if (managed.orchestration) this._setOrchestrationAgentStatus(managed, 'running');
         // A session handed off from another engine carries that conversation in
         // front of its first message; after that the engine holds it itself.
         const outgoing = managed.pendingHandoff ? `${managed.pendingHandoff}\n\n${message}` : message;
-        const result = await managed.session.send(outgoing, sendOpts);
+        onDispatch?.();
+        let result = await managed.session.send(outgoing, sendOpts);
+        // An account that refused the turn: continue the conversation under the next
+        // account in the rotation and send the turn again, at most once per account.
+        for (let tries = this._rotationSize(); tries > 0; tries--) {
+          if (!(await this._rotateAfterTurn(name, managed))) break;
+          result = await managed.session.send(outgoing, sendOpts);
+        }
+        const after = this._statsSnapshot(managed);
+        const usage = {
+          tokensIn: Math.max(0, after.tokensIn - ledgerBefore.tokensIn),
+          tokensOut: Math.max(0, after.tokensOut - ledgerBefore.tokensOut),
+          costUsd: Math.max(0, after.costUsd - ledgerBefore.costUsd),
+        };
 
         // Update the resume-capable session ID if available (skip disk persist
         // for ephemeral sessions that were started with skipPersistence)
@@ -1018,7 +1556,6 @@ export class SessionManager {
             this._persistSession(name, managed);
           }
         }
-        this._bindOrchestrationIdentity(managed);
 
         if ('text' in result) {
           // The CLI reports turn-level failures (invalid --model, auth loss) as a
@@ -1033,13 +1570,21 @@ export class SessionManager {
           const evt = (result as { event?: Record<string, unknown> }).event;
           if (evt?.is_error) {
             turnError = String((evt.result as string) || result.text || 'turn failed');
+          } else if (evt?.stop_reason === 'process_exit') {
+            // A long-running engine process that dies mid-turn resolves the send
+            // with whatever it had streamed and no result event. That is an
+            // unfinished turn, not a reply: the partial text stays in `output`,
+            // and the exit code goes into the error the caller sees.
+            const code = evt.exit_code;
+            turnError =
+              `the ${managed.config.engine || 'claude'} process exited` +
+              `${typeof code === 'number' ? ` with code ${code}` : ''} before the turn finished`;
           }
-          this._setOrchestrationAgentStatus(managed, turnError ? 'failed' : 'idle');
-          if (!turnError && managed.health.state === 'degraded') managed.health.state = 'ok';
           // Surfaced here because this is the one place every caller funnels
           // through. The result event was dropped at this line, and it is the
           // only record of a blocked call: the turn itself still reports success.
           const permissionDenials = readPermissionDenials(evt);
+          const images = readGeneratedImages(evt);
           // The record holds what the caller said, never the replayed history in
           // front of it — a second handoff would otherwise nest one inside the other.
           managed.transcript ??= newTranscript();
@@ -1053,25 +1598,18 @@ export class SessionManager {
             sessionId: this._managedResumeId(managed),
             error: turnError,
             events: [],
-            orchestrationRunId: managed.orchestration.runId,
-            orchestrationAgentKey: managed.orchestration.agentKey,
+            usage,
             ...(permissionDenials.length ? { permissionDenials } : {}),
+            ...(images.length ? { images } : {}),
           };
         }
 
-        this._setOrchestrationAgentStatus(managed, 'idle');
-        return {
-          output: '',
-          sessionId: this._managedResumeId(managed),
-          events: [],
-          orchestrationRunId: managed.orchestration.runId,
-          orchestrationAgentKey: managed.orchestration.agentKey,
-        };
+        return { output: '', sessionId: this._managedResumeId(managed), events: [], usage };
       } catch (err) {
         turnError = (err as Error).message;
-        this._setOrchestrationAgentStatus(managed, 'failed');
         throw err;
       } finally {
+        if (managed.orchestration) this._setOrchestrationAgentStatus(managed, turnError ? 'failed' : 'idle');
         this._recordRunTurn(name, managed, ledgerBefore, startedAt, turnError, options.parentRunId, {
           nodeKind: options.nodeKind,
           taskKind: options.taskKind,
@@ -1080,7 +1618,7 @@ export class SessionManager {
     } finally {
       releaseChain();
       // If this was the tail of the chain, clear it so memory doesn't grow.
-      if (managed.sendChain === tail) managed.sendChain = undefined;
+      if (managed.sendChain === link) managed.sendChain = undefined;
     }
   }
 
@@ -1110,6 +1648,7 @@ export class SessionManager {
       message?: string;
       maxChars?: number;
       customEngine?: SessionConfig['customEngine'];
+      acpAgent?: SessionConfig['acpAgent'];
     },
   ): Promise<{
     name: string;
@@ -1136,6 +1675,8 @@ export class SessionManager {
       sandboxMode: source.config.sandboxMode,
       effort: source.config.effort,
       maxBudgetUsd: source.config.maxBudgetUsd,
+      autoCompactPercent: source.config.autoCompactPercent,
+      claudeAccount: source.config.claudeAccount,
       systemPrompt: source.config.systemPrompt,
       appendSystemPrompt: source.config.appendSystemPrompt,
       addDir: source.config.addDir,
@@ -1156,6 +1697,7 @@ export class SessionManager {
       engine: opts.engine,
       ...(opts.model ? { model: opts.model } : {}),
       ...(opts.customEngine ? { customEngine: opts.customEngine } : {}),
+      ...(opts.acpAgent ? { acpAgent: opts.acpAgent } : {}),
     });
     const target = this._getSession(targetName);
     // The new session's record starts as the source's, so a second handoff from
@@ -1198,6 +1740,7 @@ export class SessionManager {
     toolCalls: number;
     toolErrors: number;
     costUsd: number;
+    refusalFallbacks: number;
   } {
     const empty = {
       turns: 0,
@@ -1208,6 +1751,7 @@ export class SessionManager {
       toolCalls: 0,
       toolErrors: 0,
       costUsd: 0,
+      refusalFallbacks: 0,
     };
     try {
       const st = managed.session.getStats();
@@ -1220,6 +1764,7 @@ export class SessionManager {
         toolCalls: st.toolCalls || 0,
         toolErrors: st.toolErrors || 0,
         costUsd: this._spentUsd(managed),
+        refusalFallbacks: st.refusalFallbacks || 0,
       };
     } catch {
       return empty;
@@ -1268,10 +1813,18 @@ export class SessionManager {
       ok: !error && (after.turns > before.turns ? after.turnsSucceeded > before.turnsSucceeded : true),
     };
     // Fall back to the engine's own reported model, so a session started
-    // without an explicit `model` still records what actually answered.
-    const model = managed.config.resolvedModel || managed.config.model || this._reportedModel(managed);
+    // without an explicit `model` still records what actually answered. An
+    // alias (`opus[1m]`) is the CLI's to resolve, so what it reports wins there.
+    const configured = managed.config.resolvedModel || managed.config.model;
+    const bare = configured?.replace(/\[1m\]$/i, '');
+    const isAlias = !!bare && resolveAlias(bare) !== bare;
+    const model = (isAlias ? this._reportedModel(managed) : undefined) || configured || this._reportedModel(managed);
     if (model) row.model = model;
     if (error) row.error = error.slice(0, 500);
+    if (after.refusalFallbacks > before.refusalFallbacks) {
+      const fallback = managed.session.getStats().lastRefusalFallback;
+      if (fallback) row.refusalFallback = fallback;
+    }
     if (parent) row.parent = parent;
     if (dims.nodeKind) row.nodeKind = dims.nodeKind;
     if (dims.taskKind) row.taskKind = dims.taskKind;
@@ -1369,13 +1922,19 @@ export class SessionManager {
       kernel.setExecutor(
         'autoloop',
         makeAutoloopExecutor({
-          boot: (config, secrets) =>
+          boot: (config, secrets, { freshStart, restoredInput }) =>
             this._bootAutoloop({
               ...(config as Parameters<SessionManager['_bootAutoloop']>[0]),
               // Custom-engine configs never reach the spec, so they come from
               // the run's in-memory secret bag — supplied at start, and
               // re-supplied by the caller on a resume.
               ...(secrets as Partial<Parameters<SessionManager['_bootAutoloop']>[0]>),
+              // Internal never-persisted marker LAST so spec.config / secrets
+              // cannot override the kernel visits===1 fresh-start signal.
+              // Always set (including false on resume) — omitting false left a
+              // `_freshStart: true` from config/secrets intact.
+              _freshStart: freshStart,
+              _restoredInput: restoredInput,
             }),
           ready: (key, value) => {
             const deferred = this._autoloopReady.get(key);
@@ -1392,9 +1951,6 @@ export class SessionManager {
           },
         }),
       );
-      // Council/fanout now finish inside the durable kernel. Preserve the
-      // Memento terminal event at that actual completion boundary, not when
-      // the asynchronous start method returns its initial run record.
       kernel.on('kernel-event', ({ runId, event }: { runId: string; event: KernelEvent }) => {
         if (event.type !== 'run_state' || !['completed', 'failed', 'cancelled'].includes(event.state)) return;
         const context = this._startedOrchestrationRuns.get(runId);
@@ -1417,7 +1973,8 @@ export class SessionManager {
     // previously started run's spec — a subflow referencing a template by name
     // without arguments has nothing to run.
     const record = loadRun(name);
-    return record?.spec;
+    if (!record?.spec || hasInternalNodes(record.spec)) return undefined;
+    return record.spec;
   }
 
   /**
@@ -1437,6 +1994,7 @@ export class SessionManager {
     spec: WorkflowSpec,
     opts: { runId?: string; cwd?: string; contract?: unknown } = {},
   ): Promise<RunRecord> {
+    refuseInternalNodes(spec);
     return this.kernel.start(spec, opts);
   }
 
@@ -1500,6 +2058,11 @@ export class SessionManager {
     const contract = normalizeContract(args.contract);
     if (!contract) throw new Error('verifyRun requires a contract with at least one recognised check');
     const runId = args.label || `verify-${Date.now().toString(36)}`;
+    // The bundle goes under the run store, keyed by the label. A label naming a
+    // workflow run would plant this evidence in that run's directory.
+    if (runExists(runId)) {
+      throw new Error(`verify_run label '${runId}' names an existing workflow run; choose another label`);
+    }
     const dir = kernelRunDir(runId);
     const evidenceId = 'verify-01';
     const { results, rounds } = await runContract(contract, {
@@ -1524,30 +2087,46 @@ export class SessionManager {
 
   async stopSession(name: string, opts: { keepPersisted?: boolean } = {}): Promise<void> {
     const managed = this._getSession(name);
-    const terminalStatus: OrchestrationAgentStatus =
-      managed.orchestrationLastStatus === 'failed' ? 'failed' : 'completed';
-    this._setOrchestrationAgentStatus(managed, terminalStatus);
-    if (managed.orchestration.runKind === 'session') {
-      this._emitOrchestrationRunStatus(managed.orchestration, terminalStatus === 'failed' ? 'failed' : 'completed');
-    }
-    this._unwireNativeIdentity(managed);
-    await managed.session.stop();
-    this.sessions.delete(name);
+    this._finishOrchestration(managed);
+    managed.session.stop();
+    this._removeSession(name);
     // Remove PID tracking
-    this._activePids.delete(name);
+    this._forgetPid(name);
     this._savePids();
     if (!opts.keepPersisted) {
       // Explicit stop = user intent to end session — remove from disk too.
       // Callers that want the session resumable (autoloop terminate that
       // should still allow /autoloop/<id>/resume to reattach the Planner's
       // Claude conversation) pass keepPersisted: true.
-      this.persistedSessions.delete(name);
-      savePersistedSessions(this.persistedSessions, this.logger, this._persistFile);
+      this._forgetPersisted(name);
+      this._savePersisted();
+      // Its unread mail was for this conversation; a later session that takes
+      // the name is a different one and must not receive it.
+      this._inbox.clear(name);
     }
   }
 
   hasSession(name: string): boolean {
     return this.sessions.has(name);
+  }
+
+  /** Keep an idle session alive while a broker operation is delivering to it. */
+  holdSession(name: string): void {
+    this._sessionHolds.set(name, (this._sessionHolds.get(name) ?? 0) + 1);
+  }
+
+  releaseSessionHold(name: string): void {
+    const count = (this._sessionHolds.get(name) ?? 1) - 1;
+    if (count <= 0) this._sessionHolds.delete(name);
+    else this._sessionHolds.set(name, count);
+  }
+
+  hasLiveSession(name: string): boolean {
+    return this.sessions.has(name);
+  }
+
+  isSessionBusy(name: string): boolean {
+    return this.sessions.get(name)?.session.isBusy ?? false;
   }
 
   listSessions(): SessionInfo[] {
@@ -1575,7 +2154,7 @@ export class SessionManager {
   ): Promise<Array<{ time: string; type: string; content: string }>> {
     const managed = this._getSession(name);
     const history = managed.session.getHistory(GREP_HISTORY_FETCH);
-    const regex = new RE2(pattern, 'i');
+    const regex = compileSafeRegex(pattern, { ignoreCase: true });
     return history
       .filter((ev) => regex.test(JSON.stringify(ev)))
       .slice(0, limit)
@@ -1650,9 +2229,8 @@ export class SessionManager {
     }
 
     const oldConfig = { ...managed.config };
-    this._unwireNativeIdentity(managed);
-    await managed.session.stop();
-    this.sessions.delete(name);
+    managed.session.stop();
+    this._removeSession(name);
 
     try {
       return await this.startSession({
@@ -1671,6 +2249,180 @@ export class SessionManager {
       }
       throw new Error(`Failed to switch model for '${name}': ${(err as Error).message}`);
     }
+  }
+
+  // ─── Claude accounts ─────────────────────────────────────────────────────
+
+  /** The accounts file as last read, keyed by path and mtime so an edit is picked up. */
+  private _accounts: { file: string; mtimeMs: number; pool: ClaudeAccountPool | null } | undefined;
+  /** Per-account usage, kept across reloads of the accounts file. */
+  private readonly _accountState = new Map<string, AccountState>();
+
+  /** The account pool from `claude-accounts.json`, or null without one. Throws on an invalid file. */
+  private _accountPool(): ClaudeAccountPool | null {
+    const file = claudeAccountsFile();
+    let mtimeMs = -1;
+    try {
+      mtimeMs = fs.statSync(file).mtimeMs;
+    } catch {
+      /* no file: no accounts */
+    }
+    if (this._accounts?.file === file && this._accounts.mtimeMs === mtimeMs) return this._accounts.pool;
+    const config = mtimeMs < 0 ? null : loadClaudeAccounts(file);
+    const pool = config ? new ClaudeAccountPool(config, Date.now, this._accountState) : null;
+    this._accounts = { file, mtimeMs, pool };
+    return pool;
+  }
+
+  /**
+   * The account a starting claude session runs under; its credential is read by the caller.
+   *
+   * An account means a Claude model reached with the account's own credential,
+   * so it does not combine with a `baseUrl`, a non-Claude model (served through
+   * the built-in proxy) or `CLAWO_CLAUDE_GATEWAY`. Asking for one there is an
+   * error; the file's `default` simply does not apply. A named account the pool
+   * already knows is spent starts the session on the next one in the rotation.
+   */
+  private _pickStartAccount(config: SessionConfig): ClaudeAccount | undefined {
+    const explicit = config.claudeAccount;
+    let pool: ClaudeAccountPool | null;
+    try {
+      pool = this._accountPool();
+    } catch (err) {
+      if (explicit !== undefined) throw err;
+      this.logger.warn(`[SessionManager] Claude accounts ignored: ${(err as Error).message}`);
+      return undefined;
+    }
+    const want = explicit ?? pool?.defaultAccount;
+    if (want === undefined) return undefined;
+    const direct =
+      !config.baseUrl && !claudeGatewayMode() && (!config.resolvedModel || isClaudeModel(config.resolvedModel));
+    if (!direct) {
+      if (explicit === undefined) return undefined;
+      throw new Error(
+        `claudeAccount '${explicit}' runs a Claude model under the account's own credential; it cannot be combined with baseUrl, a non-Claude model, or CLAWO_CLAUDE_GATEWAY`,
+      );
+    }
+    if (!pool) throw new Error(`Claude account '${want}' requested, but ${claudeAccountsFile()} does not exist`);
+    let name = want === 'auto' ? (pool.pick() ?? pool.rotation[0]) : want;
+    if (want !== 'auto' && pool.inRotation(name) && !pool.available(name)) name = pool.pick(name) ?? name;
+    const account = pool.account(name);
+    if (!account) throw new Error(`Unknown Claude account '${name}' (not in ${claudeAccountsFile()})`);
+    return account;
+  }
+
+  /**
+   * The pool, when this session can move between accounts: it runs under an
+   * account in the rotation, and its conversation is saved, so another process
+   * can resume it. A session started with `noSessionPersistence` keeps no
+   * transcript, and moving it would silently drop its history.
+   */
+  private _rotationPool(managed: ManagedSession): ClaudeAccountPool | null {
+    if (!managed.account || !(managed.session instanceof PersistentClaudeSession)) return null;
+    if (managed.config.noSessionPersistence) return null;
+    let pool: ClaudeAccountPool | null;
+    try {
+      pool = this._accountPool();
+    } catch {
+      return null;
+    }
+    return pool?.inRotation(managed.account) ? pool : null;
+  }
+
+  private _rotationSize(): number {
+    try {
+      return this._accountPool()?.rotation.length ?? 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /** Before a turn: leave an account the pool knows is spent, when another is available. */
+  private _rotateBeforeTurn(name: string, managed: ManagedSession): Promise<void> | undefined {
+    const pool = this._rotationPool(managed);
+    if (!pool || pool.available(managed.account!)) return undefined;
+    return (async () => {
+      for (let next = pool.pick(managed.account); next; next = pool.pick(managed.account)) {
+        if (await this._switchAccount(name, managed, pool, next)) return;
+      }
+    })();
+  }
+
+  /**
+   * After a turn: record what it reported about the account's usage, and when
+   * the account refused the turn, move the session to the next available account.
+   * True when it moved, so the caller sends the turn again.
+   */
+  private async _rotateAfterTurn(name: string, managed: ManagedSession): Promise<boolean> {
+    if (!managed.account || !(managed.session instanceof PersistentClaudeSession)) return false;
+    const usage = managed.session.accountUsage;
+    if (!usage) return false;
+    let pool: ClaudeAccountPool | null;
+    try {
+      pool = this._accountPool();
+    } catch {
+      return false;
+    }
+    pool?.record(managed.account, usage);
+    if (!usage.limited) return false;
+    const rotation = this._rotationPool(managed);
+    if (!rotation) return false;
+    for (let next = rotation.pick(managed.account); next; next = rotation.pick(managed.account)) {
+      if (await this._switchAccount(name, managed, rotation, next)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Restart the session's CLI under `next`, resuming the same conversation. An
+   * account whose credential cannot be read, or whose process does not start,
+   * is set aside for an hour; a failed start puts the session back on the account
+   * it had, so a session is never left without a process.
+   */
+  private async _switchAccount(
+    name: string,
+    managed: ManagedSession,
+    pool: ClaudeAccountPool,
+    next: string,
+  ): Promise<boolean> {
+    const session = managed.session as PersistentClaudeSession;
+    const from = managed.account;
+    const target = pool.account(next);
+    if (!target) return false;
+    let env: Record<string, string>;
+    try {
+      env = accountEnv(target, await readAccountSecret(target));
+    } catch (err) {
+      this.logger.warn(`[SessionManager] ${name}: Claude account '${next}' unusable: ${(err as Error).message}`);
+      pool.record(next, { limited: true });
+      return false;
+    }
+    try {
+      await session.switchAccount(env);
+    } catch (err) {
+      this.logger.warn(
+        `[SessionManager] ${name}: moving to Claude account '${next}' failed: ${(err as Error).message}`,
+      );
+      pool.record(next, { limited: true });
+      const back = from ? pool.account(from) : undefined;
+      if (!back) throw err;
+      await session.switchAccount(accountEnv(back, await readAccountSecret(back)));
+      this._trackPid(name, session);
+      return false;
+    }
+    managed.account = next;
+    this._trackPid(name, session);
+    this.logger.info(`[SessionManager] ${name}: Claude account '${from}' -> '${next}'`);
+    return true;
+  }
+
+  /** Record a session's current process for orphan cleanup, after it was replaced. */
+  private _trackPid(name: string, session: ISession): void {
+    if (!session.pid) return;
+    this._activePids.set(name, session.pid);
+    const command = processCommand(session.pid);
+    if (command) this._pidCommands.set(session.pid, command);
+    this._savePids();
   }
 
   /**
@@ -1730,9 +2482,8 @@ export class SessionManager {
       if (newDisallowed) newDisallowed = newDisallowed.filter((t) => !removeSet.has(t));
     }
 
-    this._unwireNativeIdentity(managed);
-    await managed.session.stop();
-    this.sessions.delete(name);
+    managed.session.stop();
+    this._removeSession(name);
 
     try {
       return await this.startSession({
@@ -1930,13 +2681,11 @@ export class SessionManager {
       costUsd: number;
       contextPercent: number;
       lastActivity: string | null;
-      health?: SessionHealth;
     }>;
     circuitBreakers: Record<string, { failures: number; backoffUntil: string | null }>;
   } {
     const details = Array.from(this.sessions.entries()).map(([name, managed]) => {
       const stats = managed.session.getStats();
-      const health = this._healthOf(managed);
       return {
         name,
         ready: stats.isReady,
@@ -1947,7 +2696,6 @@ export class SessionManager {
         costUsd: stats.costUsd,
         contextPercent: stats.contextPercent,
         lastActivity: stats.lastActivity,
-        ...(health ? { health } : {}),
       };
     });
 
@@ -1994,109 +2742,88 @@ export class SessionManager {
     // Stop all sessions
     for (const [name, managed] of this.sessions) {
       try {
-        this._unwireNativeIdentity(managed);
-        await managed.session.stop();
+        managed.session.stop();
       } catch {
         // Best-effort — session may already be dead; must not block cleanup
       }
       this.logger.info(`Stopped session: ${name}`);
     }
     this.sessions.clear();
+    for (const adapter of this._claudeGoals.values()) adapter.detach();
+    this._claudeGoals.clear();
     // Clear PID tracking
     this._activePids.clear();
+    this._pidCommands.clear();
     this._savePids();
     // Stop proxy server
     if (this._proxyServer) {
       this._proxyServer.close();
       this._proxyServer = null;
       this._proxyPort = null;
+      this._proxyToken = null;
     }
     // Persist final state (TTL-expired sessions already removed by cleanup)
-    savePersistedSessions(this.persistedSessions, this.logger, this._persistFile);
+    this._savePersisted();
   }
 
-  // ─── Codex /goal helpers (codex-app engine only) ─────────────────────
+  // ─── Codex goals (codex-app engine only) ─────────────────────────────
+
+  /** The live `codex-app` session behind `name`, for the kernel's `goal` node. */
+  codexGoalSession(name: string): GoalSession | undefined {
+    const session = this.sessions.get(name)?.session;
+    return session instanceof PersistentCodexAppServerSession ? session : undefined;
+  }
 
   /**
-   * Drive `thread/goal/set|get|clear` on a `codex-app` session. `slashArgs`
-   * keeps the old command words: empty reads, `pause` / `resume` / `clear`
-   * change status, and any other text sets an active objective.
+   * The goal surface of the session behind `name`: a `codex-app` session as it
+   * is, a `claude` session through `ClaudeGoalSession` (one per session, made on
+   * first use with what the node knows of the thread). Other engines have none.
+   */
+  goalSession(name: string, open?: ClaudeGoalOpen): GoalSession | undefined {
+    const session = this.sessions.get(name)?.session;
+    if (session instanceof PersistentCodexAppServerSession) return session;
+    if (!(session instanceof PersistentClaudeSession)) return undefined;
+    let adapter = this._claudeGoals.get(name);
+    // A session replaced under the same name (model switch, tool update) gets a new adapter.
+    if (adapter && adapter.host !== session) {
+      adapter.detach();
+      adapter = undefined;
+    }
+    if (!adapter) {
+      adapter = new ClaudeGoalSession(session, open);
+      this._claudeGoals.set(name, adapter);
+    }
+    return adapter;
+  }
+
+  /**
+   * Act on a `codex-app` session's goal through the app-server's
+   * `thread/goal/*` RPCs. Used by the `codex_goal_*` tools; `get` asks the
+   * server rather than a cache.
    *
-   * Errors clearly when called against a non-`codex-app` session — those
-   * sessions have no goal RPC (the `codex exec` path has no goal surface).
+   * Errors clearly when called against a non-`codex-app` session — `codex
+   * exec` has no goal surface.
    */
-  async codexGoalCommand(
+  async codexGoal(
     name: string,
-    slashArgs: string,
-    timeoutMs?: number,
-  ): Promise<{ ok: true; text: string; goal: unknown }> {
-    const managed = this.sessions.get(name);
-    if (!managed) throw new Error(`Session not found: ${name}`);
-    const session = managed.session as ISession & {
-      sendGoalCommand?: (args: string, timeoutMs?: number) => Promise<{ text: string; goal: unknown }>;
-    };
-    if (typeof session.sendGoalCommand !== 'function') {
-      const engine = managed.config.engine || 'claude';
-      throw new Error(
-        `Session "${name}" uses engine "${engine}" which does not support /goal. ` +
-          `Start a session with engine: "codex-app" to use the goal tools.`,
-      );
+    op:
+      | { action: 'set'; objective: string; tokenBudget?: number | null }
+      | { action: 'pause' | 'resume' | 'clear' | 'get' },
+  ): Promise<{ ok: true; goal: ThreadGoal | null }> {
+    const session = this._getCodexAppSession(name, '/goal');
+    switch (op.action) {
+      case 'set':
+        return { ok: true, goal: await session.setGoal({ objective: op.objective, tokenBudget: op.tokenBudget }) };
+      case 'pause':
+        return { ok: true, goal: await session.setGoal({ status: 'paused' }) };
+      case 'resume':
+        return { ok: true, goal: await session.setGoal({ status: 'active' }) };
+      case 'clear':
+        await session.clearGoal();
+        return { ok: true, goal: null };
+      case 'get':
+        return { ok: true, goal: await session.getGoal() };
     }
-    const result = await session.sendGoalCommand(slashArgs, timeoutMs);
-    return { ok: true, text: result.text, goal: result.goal };
-  }
-
-  /**
-   * Read the goal from the app-server (`thread/goal/get`). Does not start a
-   * model turn. Returns null when the thread has no goal.
-   */
-  async codexGoalGet(name: string): Promise<{ ok: true; goal: unknown }> {
-    const managed = this.sessions.get(name);
-    if (!managed) throw new Error(`Session not found: ${name}`);
-    const session = managed.session as ISession & {
-      goal?: unknown;
-      refreshGoal?: () => Promise<unknown>;
-    };
-    if (typeof session.refreshGoal === 'function') {
-      return { ok: true, goal: await session.refreshGoal() };
-    }
-    if (!('goal' in session)) {
-      const engine = managed.config.engine || 'claude';
-      throw new Error(
-        `Session "${name}" uses engine "${engine}" which does not track goal state. ` +
-          `Start a session with engine: "codex-app" to use the goal tools.`,
-      );
-    }
-    return { ok: true, goal: session.goal ?? null };
-  }
-
-  /**
-   * Ask one question on an ephemeral fork (`thread/fork` + boundary item).
-   * The parent thread id stays, and a parent turn already in flight is not
-   * completed by the side answer.
-   */
-  async codexSide(
-    name: string,
-    prompt: string,
-    timeoutMs?: number,
-  ): Promise<{ ok: true; text: string; sideThreadId: string; parentThreadId: string }> {
-    const managed = this.sessions.get(name);
-    if (!managed) throw new Error(`Session not found: ${name}`);
-    const session = managed.session as ISession & {
-      side?: (
-        prompt: string,
-        timeoutMs?: number,
-      ) => Promise<{ text: string; sideThreadId: string; parentThreadId: string }>;
-    };
-    if (typeof session.side !== 'function') {
-      const engine = managed.config.engine || 'claude';
-      throw new Error(
-        `Session "${name}" uses engine "${engine}" which does not support /side. ` +
-          `Start a session with engine: "codex-app".`,
-      );
-    }
-    const result = await session.side(prompt, timeoutMs);
-    return { ok: true, ...result };
   }
 
   // ─── Codex app-server v2 RPCs (codex-app engine only, Codex 0.137) ────────
@@ -2196,15 +2923,6 @@ export class SessionManager {
     return await this.sendMessage(name, '/goal', { timeout: timeoutMs });
   }
 
-  // ─── Cursor /goal (cursor-agent headless, cursor engine only) ────────
-  //
-  // Cursor's TUI `/goal` command submits the user message `/goal <objective>`.
-  // There is no separate goal RPC and no `/goal clear` or bare status command.
-  // In headless `-p` mode the same text is the prompt. Continuation stays
-  // inside that process: the CLI keeps working while a goal is active unless
-  // `--single-turn` is set, which this engine never passes. The timeout
-  // therefore covers the whole pursuit, not one model turn.
-
   private _assertCursorSession(name: string): void {
     const managed = this.sessions.get(name);
     if (!managed) throw new Error(`Session not found: ${name}`);
@@ -2223,6 +2941,20 @@ export class SessionManager {
     if (!trimmed) throw new Error('Cursor /goal requires an objective');
     this._assertCursorSession(name);
     return await this.sendMessage(name, `/goal ${trimmed}`, { timeout: timeoutMs });
+  }
+
+  /** Ask one question on an ephemeral Codex side fork. The parent thread stays put. */
+  async codexSide(name: string, prompt: string, timeoutMs?: number): Promise<Record<string, unknown>> {
+    const managed = this.sessions.get(name);
+    if (!managed) throw new Error(`Session not found: ${name}`);
+    const session = managed.session as {
+      side?: (prompt: string, timeoutMs?: number) => Promise<Record<string, unknown>>;
+    };
+    if (typeof session.side !== 'function') {
+      throw new Error(`Session "${name}" does not support Codex /side. Start it with engine: "codex-app".`);
+    }
+    const result = await session.side(prompt, timeoutMs);
+    return { ok: true, ...result };
   }
 
   // ─── Plugin Details (CLI 2.1.139) ─────────────────────────────────────
@@ -2375,7 +3107,7 @@ export class SessionManager {
     args.push('--skip-git-repo-check', '--json');
     if (opts.model) args.push('--model', opts.model);
     args.push(opts.message);
-    const { stdout } = await execFileAsync(this._codexBin(), args, {
+    const { stdout } = await execEngine(this._codexBin(), args, {
       cwd: opts.cwd ? path.resolve(opts.cwd) : undefined,
       maxBuffer: 32 * 1024 * 1024,
       timeout: opts.timeout || 300_000,
@@ -2428,7 +3160,7 @@ export class SessionManager {
     if (opts.title) args.push('--title', opts.title);
     if (opts.model) args.push('-c', `model="${opts.model}"`);
     if (opts.prompt) args.push(opts.prompt);
-    const { stdout, stderr } = await execFileAsync(this._codexBin(), args, {
+    const { stdout, stderr } = await execEngine(this._codexBin(), args, {
       cwd: opts.cwd ? path.resolve(opts.cwd) : undefined,
       maxBuffer: 16 * 1024 * 1024,
       timeout: opts.timeout || 600_000,
@@ -2511,6 +3243,11 @@ export class SessionManager {
     return this._proxyStartPromise;
   }
 
+  /** The base URL a session reaches the auto-proxy at: the port plus this process's secret path segment. */
+  private _proxyBaseUrl(port: number): string {
+    return this._proxyToken ? `http://127.0.0.1:${port}/${this._proxyToken}` : `http://127.0.0.1:${port}`;
+  }
+
   private async _startProxyServer(): Promise<number | null> {
     // Auto-detect gateway config
     const gwConfig = this._readGatewayConfig();
@@ -2532,16 +3269,68 @@ export class SessionManager {
       gatewayKey,
     });
 
+    // The proxy forwards with the host's provider and gateway credentials, so
+    // loopback alone is not enough: any local process could spend them. Each
+    // request must carry this process's secret as its first path segment, which
+    // only the sessions given _proxyBaseUrl() know, and it is checked before
+    // the body is read. Bodies are bounded and, for POST, must be JSON.
+    const token = randomBytes(24).toString('hex');
+    const expected = Buffer.from(token);
+    const refuse = (res: http.ServerResponse, status: number, error: string) => {
+      res.statusCode = status;
+      res.setHeader('Content-Type', 'application/json');
+      res.setHeader('Connection', 'close');
+      res.end(JSON.stringify({ error }));
+    };
+
     return new Promise((resolve) => {
       const server = http.createServer((req, res) => {
+        const rawUrl = req.url || '/';
+        const segment = rawUrl.split('/')[1] ?? '';
+        const presented = Buffer.from(segment.split('?')[0]);
+        if (presented.length !== expected.length || !timingSafeEqual(presented, expected)) {
+          refuse(res, 401, 'Unauthorized');
+          req.destroy();
+          return;
+        }
+        const method = req.method || 'GET';
+        if (method !== 'POST' && method !== 'GET' && method !== 'HEAD') {
+          refuse(res, 405, 'Method not allowed');
+          req.destroy();
+          return;
+        }
+        if (method === 'POST') {
+          const contentType = (req.headers['content-type'] || '').split(';')[0].trim().toLowerCase();
+          if (contentType !== 'application/json') {
+            refuse(res, 415, 'Content-Type must be application/json');
+            req.destroy();
+            return;
+          }
+          if (Number(req.headers['content-length'] || 0) > PROXY_MAX_BODY_BYTES) {
+            refuse(res, 413, 'Payload too large');
+            req.destroy();
+            return;
+          }
+        }
         let body = '';
+        let size = 0;
+        let aborted = false;
         req.on('data', (chunk: Buffer) => {
+          if (aborted) return;
+          size += chunk.length;
+          if (size > PROXY_MAX_BODY_BYTES) {
+            aborted = true;
+            refuse(res, 413, 'Payload too large');
+            req.destroy();
+            return;
+          }
           body += chunk.toString();
         });
         req.on('end', () => {
+          if (aborted) return;
           const httpReq = {
-            method: req.method || 'GET',
-            url: req.url || '/',
+            method,
+            url: rawUrl.slice(token.length + 1) || '/',
             headers: req.headers as Record<string, string>,
             json: async () => JSON.parse(body),
           };
@@ -2569,6 +3358,7 @@ export class SessionManager {
       server.listen(0, '127.0.0.1', () => {
         const addr = server.address() as { port: number };
         this._proxyServer = server;
+        this._proxyToken = token;
         this._proxyPort = addr.port;
         this.logger.info(`Auto-proxy started on port ${addr.port} (gateway: ${gatewayUrl})`);
         resolve(addr.port);
@@ -2583,24 +3373,43 @@ export class SessionManager {
 
   // ─── Private ───────────────────────────────────────────────────────────
 
+  /** Names this process has set or deleted since its last save; see savePersistedSessions. */
+  private readonly _persistDirty = new Set<string>();
+
+  private _forgetPersisted(name: string): void {
+    this.persistedSessions.delete(name);
+    this._persistDirty.add(name);
+  }
+
+  /** Merge this process's changes into the shared file and adopt the merged view. */
+  private _savePersisted(): void {
+    if (this._persistDirty.size === 0) return;
+    const merged = savePersistedSessions(this.persistedSessions, this._persistDirty, this.logger, this._persistFile);
+    if (merged) this.persistedSessions = merged;
+  }
+
   private _persistSession(name: string, managed: ManagedSession): void {
     const resumeSessionId = this._managedResumeId(managed);
-    if (!resumeSessionId && managed.config.engine === 'agy') {
-      if (this.persistedSessions.delete(name)) this._debouncedSave();
+    if (!resumeSessionId) {
+      if (managed.config.engine === 'agy' && this.persistedSessions.has(name)) {
+        this._forgetPersisted(name);
+        this._debouncedSave();
+      }
       return;
     }
+    managed.claudeSessionId = resumeSessionId;
     const existing = this.persistedSessions.get(name);
-    if (resumeSessionId) managed.claudeSessionId = resumeSessionId;
+    this._persistDirty.add(name);
     this.persistedSessions.set(name, {
       name,
-      // Persist engine/sandbox configuration independently from native
-      // identity. Cursor announces a resumable id on system init of the first
-      // turn; until then a stop/restart must not silently become Claude.
-      claudeSessionId: resumeSessionId || existing?.claudeSessionId || '',
+      claudeSessionId: resumeSessionId,
       cwd: managed.cwd,
       model: managed.config.resolvedModel || managed.config.model,
       engine: managed.config.engine,
       sandboxMode: managed.config.sandboxMode,
+      autoCompactPercent: managed.config.autoCompactPercent,
+      chrome: managed.config.chrome,
+      claudeAccount: managed.config.claudeAccount,
       originalCreated: existing?.originalCreated || managed.created,
       lastResumed: new Date().toISOString(),
       lastActivity: managed.lastActivity,
@@ -2611,6 +3420,21 @@ export class SessionManager {
   // ─── PID Tracking ──────────────────────────────────────────────────────
 
   private static PID_FILE = path.join(os.homedir(), '.openclaw', 'session-pids.json');
+
+  /** Take a session out of memory, with the goal adapter listening to it. */
+  private _removeSession(name: string): void {
+    const managed = this.sessions.get(name);
+    if (managed) this._unwireNativeIdentity(managed);
+    this._claudeGoals.get(name)?.detach();
+    this._claudeGoals.delete(name);
+    this.sessions.delete(name);
+  }
+
+  private _forgetPid(name: string): void {
+    const pid = this._activePids.get(name);
+    if (pid !== undefined) this._pidCommands.delete(pid);
+    this._activePids.delete(name);
+  }
 
   private _savePids(): void {
     try {
@@ -2627,7 +3451,7 @@ export class SessionManager {
       } catch {
         /* missing or malformed — start fresh */
       }
-      const merged: Record<string, { pid: number; ownerPid: number; since: string }> = {};
+      const merged: Record<string, { pid: number; ownerPid: number; since: string; command?: string }> = {};
       const now = new Date().toISOString();
       // Keep entries from OTHER LIVE owners untouched. Entries whose
       // ownerPid is a dead process are stale bookkeeping — drop them so
@@ -2637,7 +3461,7 @@ export class SessionManager {
       // before the first save).
       for (const [name, raw] of Object.entries(existing)) {
         if (typeof raw === 'number') continue; // legacy format — drop on first save
-        const entry = raw as { pid?: number; ownerPid?: number; since?: string };
+        const entry = raw as { pid?: number; ownerPid?: number; since?: string; command?: string };
         if (typeof entry.pid !== 'number' || typeof entry.ownerPid !== 'number') continue;
         if (entry.ownerPid === process.pid) continue; // ours; we're about to rewrite
         try {
@@ -2649,11 +3473,13 @@ export class SessionManager {
           pid: entry.pid,
           ownerPid: entry.ownerPid,
           since: entry.since ?? now,
+          ...(typeof entry.command === 'string' ? { command: entry.command } : {}),
         };
       }
       // Add OUR current entries
       for (const [name, pid] of this._activePids) {
-        merged[name] = { pid, ownerPid: process.pid, since: now };
+        const command = this._pidCommands.get(pid);
+        merged[name] = { pid, ownerPid: process.pid, since: now, ...(command ? { command } : {}) };
       }
       fs.writeFileSync(this._pidFile, JSON.stringify(merged));
     } catch {
@@ -2665,7 +3491,7 @@ export class SessionManager {
    * Verify that a PID belongs to a known coding CLI before killing it.
    * Prevents killing unrelated processes if the OS recycled the PID.
    */
-  private _isKnownCliProcess(pid: number): boolean {
+  private _isKnownCliProcess(pid: number, recordedCommand?: string): boolean {
     // Match known CLI binaries by basename to avoid false positives
     // (e.g., 'agent' must not match 'ssh-agent' or 'gpg-agent')
     // Anchor each name to executable/path position ((?:^|[/\s])name(?:[\s/]|$))
@@ -2680,15 +3506,12 @@ export class SessionManager {
       ...ENGINE_BINARY_NAMES.map((bin) => new RegExp(`(?:^|[/\\s])${bin}(?:[\\s/]|$)`)),
       /(?:^|\/)agent(?:[\s/]|$)/, // 'agent' only as executable/after a slash (not ssh-agent)
     ];
-    try {
-      const cmd = execFileSync('ps', ['-p', String(pid), '-o', 'command='], {
-        encoding: 'utf8',
-        timeout: 3_000,
-      }).trim();
-      return knownPatterns.some((pattern) => pattern.test(cmd));
-    } catch {
-      return false; // ps failed — process likely dead or not accessible
-    }
+    const cmd = processCommand(pid);
+    if (cmd === undefined) return false; // ps failed — process likely dead or not accessible
+    // The same command line as when it was recorded: the process itself, not a
+    // recycled pid — whatever binary it runs.
+    if (recordedCommand && cmd === recordedCommand) return true;
+    return knownPatterns.some((pattern) => pattern.test(cmd));
   }
 
   private _cleanupOrphanedPids(): void {
@@ -2699,14 +3522,16 @@ export class SessionManager {
         // Resolve entry shape: legacy = number; current = { pid, ownerPid, since }.
         let pid: number;
         let ownerPid: number | null;
+        let recordedCommand: string | undefined;
         if (typeof raw === 'number') {
           pid = raw;
           ownerPid = null; // unknown owner — treat conservatively (skip kill)
         } else if (raw && typeof raw === 'object') {
-          const e = raw as { pid?: number; ownerPid?: number };
+          const e = raw as { pid?: number; ownerPid?: number; command?: string };
           if (typeof e.pid !== 'number') continue;
           pid = e.pid;
           ownerPid = typeof e.ownerPid === 'number' ? e.ownerPid : null;
+          recordedCommand = typeof e.command === 'string' ? e.command : undefined;
         } else {
           continue;
         }
@@ -2736,7 +3561,7 @@ export class SessionManager {
         try {
           process.kill(pid, 0); // check if alive
           // Alive — but verify it's actually a coding CLI, not a recycled PID
-          if (!this._isKnownCliProcess(pid)) {
+          if (!this._isKnownCliProcess(pid, recordedCommand)) {
             this.logger.info(`PID ${pid} (session: ${name}) is alive but not a known CLI — skipping kill`);
             continue;
           }
@@ -2792,7 +3617,6 @@ export class SessionManager {
     const resumeSessionId = this._managedResumeId(managed);
     if (resumeSessionId) managed.claudeSessionId = resumeSessionId;
     const costUsd = this._spentUsd(managed);
-    const health = this._healthOf(managed);
     const info: SessionInfo = {
       name,
       claudeSessionId: resumeSessionId,
@@ -2802,19 +3626,16 @@ export class SessionManager {
       paused: false,
       stats,
       costUsd: Math.round(costUsd * 10000) / 10000,
-      ...(health ? { health } : {}),
-      engine: managed.config.engine,
-      orchestrationRunId: managed.orchestration.runId,
-      orchestrationAgentKey: managed.orchestration.agentKey,
-      localName: name,
-      ...(managed.orchestration.parentMachineId ? { parentMachineId: managed.orchestration.parentMachineId } : {}),
-      ...(managed.orchestration.parentSessionId ? { parentSessionId: managed.orchestration.parentSessionId } : {}),
-      ...(managed.orchestration.parentToolId ? { parentToolId: managed.orchestration.parentToolId } : {}),
-      ...(managed.orchestration.originHost ? { originHost: managed.orchestration.originHost } : {}),
-      ...(managed.orchestration.executionHost ? { executionHost: managed.orchestration.executionHost } : {}),
-      ...(managed.orchestration.remoteSessionHandle
-        ? { remoteSessionHandle: managed.orchestration.remoteSessionHandle }
+      ...(managed.account ? { claudeAccount: managed.account } : {}),
+      ...(managed.orchestration
+        ? { orchestrationRunId: managed.orchestration.runId, orchestrationAgentKey: managed.orchestration.agentKey }
         : {}),
+      ...(managed.config.parentMachineId ? { parentMachineId: managed.config.parentMachineId } : {}),
+      ...(managed.config.parentSessionId ? { parentSessionId: managed.config.parentSessionId } : {}),
+      ...(managed.config.parentToolId ? { parentToolId: managed.config.parentToolId } : {}),
+      ...(managed.config.originHost ? { originHost: managed.config.originHost } : {}),
+      ...(managed.config.executionHost ? { executionHost: managed.config.executionHost } : {}),
+      ...(managed.config.remoteSessionHandle ? { remoteSessionHandle: managed.config.remoteSessionHandle } : {}),
     };
     if (managed.config.maxBudgetUsd) {
       info.budgetUsd = managed.config.maxBudgetUsd;
@@ -2861,7 +3682,7 @@ export class SessionManager {
   }
 
   private _noteDelegateMarker(managed: ManagedSession, message: string): void {
-    if (managed.orchestration.parentSessionId) return;
+    if (!managed.orchestration || managed.orchestration.parentSessionId) return;
     const parentSessionId = parentSessionIdFromDelegateMarker(message);
     if (!parentSessionId) return;
     managed.orchestration = { ...managed.orchestration, parentSessionId };
@@ -2881,81 +3702,22 @@ export class SessionManager {
     this._orchestrationEvents.emit('run.status', context, { runStatus: status });
   }
 
-  /**
-   * Give a session an `error` listener for its whole life.
-   *
-   * `EventEmitter` throws an `error` event that nobody listens for, and the throw
-   * happens inside whichever stdout or readline callback raised it, so it is an
-   * uncaught exception that ends the process. The broker hosts every session on
-   * the machine, so one engine reporting one error used to take all of them down
-   * (observed: a codex app-server `error` notification restarted the broker six
-   * times in one morning). Every session this manager creates or resumes goes
-   * through here, whatever its engine, so no session can do that again.
-   *
-   * What an error means is left to the session that raised it: its own pending
-   * send is settled by the session (claude and custom reject through their own
-   * `error` listeners, codex-app on `turn/completed` or process exit). This guard
-   * only keeps the process alive and records the event where status can show it.
-   * It must never throw itself.
-   */
-  private _guardSessionEvents(name: string, session: ISession, health: SessionHealthRecord): void {
+  private _guardSessionEvents(name: string, session: ISession): void {
     session.on(SESSION_EVENT.ERROR, (...args: unknown[]) => {
       try {
-        this._recordSessionError(name, session, health, args[0]);
-      } catch (guardErr) {
-        // A failure to record is not worth the process; say so and carry on.
-        try {
-          this.logger.error(`[Session:${name}] error guard failed: ${(guardErr as Error)?.message}`);
-        } catch {
-          /* logging must not throw out of an event handler either */
-        }
+        const err = args[0];
+        const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+        const message = sanitizeSecrets(raw || 'engine reported an error without a message').slice(0, 500);
+        this.logger.warn(`[Session:${name}] engine error: ${message}`);
+      } catch {
+        /* an error listener must not throw; that is the crash this guard exists to stop */
       }
     });
-  }
-
-  /**
-   * Record an engine error on the session's health.
-   *
-   * The session is marked `failed` when its engine is no longer ready, and
-   * `degraded` when it is: Codex reports conditions it survives (an MCP server
-   * that cannot be reached) through the same channel as fatal ones, and a session
-   * that is still serving must not be killed on a notification's say-so. The next
-   * clean turn returns a `degraded` session to `ok`; `failed` stays until the
-   * session is restarted.
-   */
-  private _recordSessionError(name: string, session: ISession, health: SessionHealthRecord, err: unknown): void {
-    const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
-    const message = sanitizeSecrets(raw || 'engine reported an error without a message').slice(
-      0,
-      MAX_RECORDED_ERROR_CHARS,
-    );
-    health.errorCount++;
-    health.lastError = message;
-    health.lastErrorAt = new Date().toISOString();
-    health.state = health.state === 'failed' || (!health.starting && !session.isReady) ? 'failed' : 'degraded';
-    this.logger.warn?.(`[Session:${name}] engine error (${health.state}, #${health.errorCount}): ${message}`);
-  }
-
-  /** Health as reported in session info; absent until an error has been recorded. */
-  private _healthOf(managed: ManagedSession): SessionHealth | undefined {
-    const h: SessionHealth = {
-      state: managed.health.state,
-      errorCount: managed.health.errorCount,
-      ...(managed.health.lastError !== undefined ? { lastError: managed.health.lastError } : {}),
-      ...(managed.health.lastErrorAt !== undefined ? { lastErrorAt: managed.health.lastErrorAt } : {}),
-    };
-    if (h.errorCount === 0) return undefined;
-    // A session whose engine has since gone away is failed even if the error that
-    // preceded it was recorded as survivable.
-    const state = h.state === 'degraded' && !managed.session.isReady ? 'failed' : h.state;
-    return { ...h, state };
   }
 
   private _wireNativeIdentity(managed: ManagedSession): void {
     if (managed.nativeIdentityListener) return;
     const listener = (..._args: unknown[]): void => {
-      // Ignore events from a session that has already been replaced (model
-      // switch / tool restart) or removed from the map.
       if (this.sessions.get(managed.config.name) !== managed) return;
       this._bindOrchestrationIdentity(managed);
     };
@@ -2971,12 +3733,11 @@ export class SessionManager {
   }
 
   private _bindOrchestrationIdentity(managed: ManagedSession): void {
+    if (!managed.orchestration) return;
     const nativeSessionId = this._managedResumeId(managed);
     if (!nativeSessionId || nativeSessionId === managed.orchestrationBoundNativeId) return;
     managed.orchestrationBoundNativeId = nativeSessionId;
-    if (!managed.skipPersistence) {
-      this._persistSession(managed.config.name, managed);
-    }
+    if (!managed.skipPersistence) this._persistSession(managed.config.name, managed);
     this._orchestrationEvents.emit('agent.identity_bound', managed.orchestration, {
       nativeSessionId,
       agentStatus: managed.orchestrationLastStatus,
@@ -2984,6 +3745,7 @@ export class SessionManager {
   }
 
   private _setOrchestrationAgentStatus(managed: ManagedSession, status: OrchestrationAgentStatus): void {
+    if (!managed.orchestration) return;
     managed.orchestrationLastStatus = status;
     this._orchestrationEvents.emit('agent.status', managed.orchestration, {
       nativeSessionId: managed.orchestrationBoundNativeId,
@@ -2991,7 +3753,16 @@ export class SessionManager {
     });
   }
 
-  /** Record a run-level terminal state after fanout/council has joined its children. */
+  private _finishOrchestration(managed: ManagedSession): void {
+    if (!managed.orchestration) return;
+    const status: OrchestrationAgentStatus = managed.orchestrationLastStatus === 'failed' ? 'failed' : 'completed';
+    this._setOrchestrationAgentStatus(managed, status);
+    if (managed.orchestration.runKind === 'session') {
+      this._emitOrchestrationRunStatus(managed.orchestration, status === 'failed' ? 'failed' : 'completed');
+    }
+    this._unwireNativeIdentity(managed);
+  }
+
   recordOrchestrationRunStatus(
     runId: string,
     runKind: OrchestrationAgentContext['runKind'],
@@ -3023,7 +3794,7 @@ export class SessionManager {
 
   /**
    * Return only IDs that can actually resume the engine. Agy and Codex expose
-   * harvested conversation/thread IDs; legacy wrapper sessionId values are
+   * harvested conversation/thread IDs; their BaseOneShot sessionId values are
    * synthetic wrapper identifiers and must never be persisted for resume.
    */
   private _sessionResumeId(engine: EngineType | undefined, session: ISession): string | undefined {
@@ -3034,14 +3805,15 @@ export class SessionManager {
     if (engine === 'codex') {
       return (session as { threadId?: string }).threadId;
     }
+    // `sessionId` on a codex-app session is a label of ours; `thread/resume`
+    // needs the app-server's own thread id, and silently opened a new thread
+    // when handed the label.
     if (engine === 'codex-app') {
       return (session as { codexThreadId?: string }).codexThreadId;
     }
-    if (engine === 'cursor') {
-      return session.getStats().cursorChatId;
-    }
-    if (engine === 'opencode') {
-      return session.getStats().opencodeSessionId;
+    // Likewise an ACP session's `sessionId` is ours; the agent resumes its own.
+    if (engine === 'acp') {
+      return (session as { agentSessionId?: string }).agentSessionId;
     }
     return session.sessionId;
   }
@@ -3049,11 +3821,9 @@ export class SessionManager {
   private _storedResumeId(engine: EngineType | undefined, id: string | undefined): string | undefined {
     if (engine === 'agy') return isAgyConversationId(id) ? id : undefined;
     if (engine === 'codex') return id && !/^codex-\d+-/.test(id) ? id : undefined;
-    if (engine === 'codex-app') return id && !id.startsWith('codex-app-') ? id : undefined;
-    if (engine === 'opencode') {
-      return id && !/^opencode-\d+-/.test(id) ? id.replace(/^opencode-live-/, '') : undefined;
-    }
     if (engine === 'grok') return id && !/^grok-\d+-/.test(id) ? id : undefined;
+    if (engine === 'codex-app') return id && !id.startsWith('codex-app-') ? id : undefined;
+    if (engine === 'acp') return id && !id.startsWith('acp-') ? id : undefined;
     return id;
   }
 
@@ -3095,6 +3865,8 @@ export class SessionManager {
       case 'custom':
         if (!config.customEngine) throw new Error('customEngine config is required for engine type "custom"');
         return new PersistentCustomSession(config);
+      case 'acp':
+        return new PersistentAcpSession(config);
       case 'claude':
       default:
         return new PersistentClaudeSession(config, this.pluginConfig.claudeBin);
@@ -3171,11 +3943,25 @@ export class SessionManager {
     );
   }
 
-  councilAbort(id: string): void {
+  /**
+   * Abort a council running in this process. One that is not — finished, or
+   * running elsewhere — is left alone and the result says so: its worktrees are
+   * either awaiting accept/reject or in use by the process that runs it.
+   */
+  councilAbort(id: string): { aborted: boolean; state?: RunState; reason?: string } {
     // Cancel the run first so the kernel stops advancing, then abort the engine
     // so the current round tears down its worktrees.
-    if (!this.kernel.cancel(id) && !loadRun(id)) throw new Error(`Council '${id}' not found`);
-    this.kernel.handle<Council>(id, LEGACY_NODE)?.abort();
+    if (this.kernel.cancel(id)) {
+      this.kernel.handle<Council>(id, LEGACY_NODE)?.abort();
+      return { aborted: true };
+    }
+    const record = loadRun(id);
+    if (!record) throw new Error(`Council '${id}' not found`);
+    return {
+      aborted: false,
+      state: record.state,
+      reason: `Council '${id}' is ${record.state} and not running in this process — nothing was aborted`,
+    };
   }
 
   councilInject(id: string, message: string): void {
@@ -3187,11 +3973,33 @@ export class SessionManager {
   }
 
   async councilAccept(id: string): Promise<CouncilAcceptResult> {
-    return this._councilForPostProcessing(id).accept();
+    const result = await this._councilForPostProcessing(id).accept();
+    this._recordCouncilDecision(id, 'accepted');
+    return result;
   }
 
   async councilReject(id: string, feedback: string): Promise<CouncilRejectResult> {
-    return this._councilForPostProcessing(id).reject(feedback);
+    const result = await this._councilForPostProcessing(id).reject(feedback);
+    this._recordCouncilDecision(id, 'rejected');
+    return result;
+  }
+
+  /**
+   * Write the decision onto the run, which is where `council_status` reads it.
+   * The `Council` that took it is usually rebuilt from the record and dropped,
+   * so its own status would go nowhere.
+   */
+  private _recordCouncilDecision(id: string, status: 'accepted' | 'rejected'): void {
+    // A council live in this process carries the status on its own session.
+    if (this.kernel.handle<Council>(id, LEGACY_NODE)) return;
+    let recorded = false;
+    let why = 'the run has not finished';
+    try {
+      recorded = this.kernel.amendFinishedNode(id, LEGACY_NODE, { councilStatus: status }, `council ${status}`);
+    } catch (err) {
+      why = (err as Error).message;
+    }
+    if (!recorded) this.logger.warn(`[council] ${id}: ${status}, but the status could not be recorded (${why})`);
   }
 
   /**
@@ -3241,6 +4049,7 @@ export class SessionManager {
         synthesize: config.synthesize,
         synthesisEngine: config.synthesisEngine,
         synthesisModel: config.synthesisModel,
+        synthesisAcpAgent: config.synthesisAcpAgent,
         synthesisPermissionMode: config.synthesisPermissionMode,
         maxTurnsPerAgent: config.maxTurnsPerAgent,
         maxBudgetUsd: config.maxBudgetUsd,
@@ -3270,7 +4079,31 @@ export class SessionManager {
       getSession: (name) => this.sessions.get(name),
       exists: (name) => this.sessions.has(name),
       allNames: () => this.sessions.keys(),
+      deliver: (name, text) => this._deliverInboxTurn(name, text),
     };
+  }
+
+  /**
+   * An inbox delivery is a turn like any other — capped, written to the run
+   * ledger and kept in the handoff record — that its sender does not wait on.
+   * Resolves once the turn reaches the engine; a refusal before that (spend cap,
+   * session stopped) rejects so the inbox queues the message instead. A failure
+   * after it belongs to the turn and is recorded with it.
+   */
+  private _deliverInboxTurn(name: string, text: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      let dispatched = false;
+      this._sendTurn(name, text, {}, () => {
+        dispatched = true;
+        resolve();
+      }).then(
+        () => resolve(),
+        (err: Error) => {
+          if (!dispatched) reject(err);
+          else this.logger.warn(`[SessionManager] inbox turn on '${name}' failed: ${err.message}`);
+        },
+      );
+    });
   }
 
   async sessionSendTo(
@@ -3328,7 +4161,7 @@ export class SessionManager {
   /** Latest role selection per run, published into the node payload. */
   private _autoloopSelection = new Map<string, unknown>();
   /** Per-run checkpoint refreshers, registered by the autoloop node executor. */
-  private _autoloopPublishers = new Map<string, () => void>();
+  private _autoloopPublishers = new Map<string, () => boolean>();
 
   async ultraplanStart(
     task: string,
@@ -3375,16 +4208,18 @@ export class SessionManager {
       engines?: EngineType[];
     },
   ): Promise<UltrareviewResult> {
-    // Every reviewer runs read-only (see below). grok refuses a read-only session
-    // rather than approximate one, and a custom reviewer has no config to start
-    // from, so both are turned away here instead of failing one reviewer at a time.
-    const unsupported = (opts?.engines ?? []).filter((e) => e === 'grok' || e === 'custom');
-    if (unsupported.length) {
+    // Every reviewer runs read-only (see below). A custom reviewer has no config
+    // to start from, so it is turned away here instead of failing one reviewer
+    // at a time. (grok was turned away too until its read-only mode moved onto
+    // grok's OS sandbox.) An ACP agent cannot be held read-only at all: its tools
+    // run inside the agent, so the session would refuse to start.
+    if ((opts?.engines ?? []).includes('custom')) {
       throw new Error(
-        `ultrareview cannot use ${[...new Set(unsupported)].join(', ')}: reviewers run read-only, which ${
-          unsupported.includes('grok') ? 'grok refuses' : 'a custom engine cannot be configured for here'
-        }`,
+        'ultrareview cannot use custom: reviewers run read-only, which a custom engine cannot be configured for here',
       );
+    }
+    if ((opts?.engines ?? []).includes('acp')) {
+      throw new Error('ultrareview cannot use acp: reviewers run read-only, which an ACP agent cannot be held to');
     }
     const id = `ultrareview-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     const agentCount = Math.min(20, Math.max(1, opts?.agentCount || 5));
@@ -3539,9 +4374,10 @@ export class SessionManager {
       // Review is read-only: reviewers analyse and report without modifying the
       // very code they review. Unlike council, fan-out shares the project dir —
       // there is no worktree to contain an edit — so this has to hold on every
-      // engine. `plan` constrains Claude only; `sandboxMode: 'read-only'` is the
-      // engine-agnostic setting, which codex, agy and opencode map to their own
-      // read-only modes. Before it was set, a codex reviewer ran workspace-write.
+      // engine. `plan` reaches only the engines with a plan mode (Claude, Grok);
+      // `sandboxMode: 'read-only'` is the engine-agnostic setting, which codex,
+      // agy and opencode map to their own read-only modes. Before it was set, a
+      // codex reviewer ran workspace-write.
       permissionMode: 'plan',
       sandboxMode: 'read-only',
     }));
@@ -3666,11 +4502,17 @@ export class SessionManager {
     _resumeTimeoutMigration?: boolean;
     /** In-memory commit barrier for a prepared append-only migration record. */
     _commitTimeoutMigration?: () => void;
+    /** Internal fresh-boot marker from kernel visits===1. Never stored. */
+    _freshStart?: boolean;
+    /** Validated accepted-chat fields from the stored checkpoint. Never stored as config. */
+    _restoredInput?: AutoloopInputSnapshot;
   }): Promise<{
     runner: AutoloopRunner;
     dispatcher: ClaudeAgentDispatcher;
     ledgerDir: string;
     pushPolicy: PushPolicy;
+    abort: () => void;
+    afterPublishReconcile: () => Promise<void>;
   }> {
     const plannerEngine = validateAutoloopRole('planner', opts.plannerEngine, opts.plannerCustomEngine);
     const coderEngine = validateAutoloopRole('coder', opts.coderEngine, opts.coderCustomEngine);
@@ -3685,8 +4527,18 @@ export class SessionManager {
       }
     }
     const ledgerDir = path.join(opts.workspace, 'tasks', opts.runId);
+    if (opts._freshStart === true) {
+      applyAutoloopFreshStartBoundary(opts.workspace, opts.runId, { invalidRunId: 'refuse' });
+    }
     if (!fs.existsSync(ledgerDir)) {
       fs.mkdirSync(ledgerDir, { recursive: true });
+    }
+    // Non-fresh boots: restore typed progress from the contiguous closed ledger
+    // prefix before any dispatcher/runner/session work. Refusal throws here so
+    // no Planner start or checkpoint publish occurs.
+    let closedLedgerRestore: ClosedLedgerRestore | null = null;
+    if (opts._freshStart !== true) {
+      closedLedgerRestore = readClosedLedgerRestore(ledgerDir);
     }
     // Per-run policy object — mutable so Planner's update_push_policy is visible
     // to the runner without re-wiring.
@@ -3734,6 +4586,10 @@ export class SessionManager {
       run_id: opts.runId,
       workspace: opts.workspace,
       ledger_dir: ledgerDir,
+      persistCheckpoint: () => {
+        const publish = this._autoloopPublishers.get(runId);
+        return publish ? publish() : false;
+      },
       push_policy: pushPolicy,
       notifyUser: async (level: PushLevel, summary: string, detail, channel: PushChannel) => {
         const result = await notifyUserFallbackChain({
@@ -3760,13 +4616,17 @@ export class SessionManager {
       activityLeaseMs: opts.activityLeaseMs,
       autoloopHardTimeoutMs: opts.autoloopHardTimeoutMs,
     });
-    runnerRef = runner;
-    // The runner emits `error` for background failures (hard-deadline expiry, a
-    // drain that threw, an overflowing parked buffer). Nothing else listens, and an
-    // unlistened `error` event ends the process that hosts every other session.
+    // Background resume/deadline/stall paths emit 'error' after a void catch.
+    // Without a listener, Node turns that into an unhandled rejection.
     runner.on('error', (err: unknown) => {
-      this.logger.error(`[autoloop/${runId}] runner error: ${err instanceof Error ? err.message : String(err)}`);
+      this.logger.error?.(`[autoloop/${runId}] background runner task failed: ${boundedErrorReason(err)}`);
     });
+    runnerRef = runner;
+    if (closedLedgerRestore) {
+      runner.state.iter = closedLedgerRestore.iter;
+      runner.state.metric_history = closedLedgerRestore.metric_history.slice();
+    }
+    if (opts._restoredInput) runner.loadRestoredInput(opts._restoredInput);
     try {
       await runner.start();
       // A reconstructed migration becomes externally visible only after its
@@ -3785,7 +4645,78 @@ export class SessionManager {
       runner.stop();
       throw err;
     }
-    return { runner, dispatcher, ledgerDir, pushPolicy };
+    // Committed-iteration recovery runs after publisher registration, the
+    // initial-publish check and notice reconciliation (see afterPublishReconcile
+    // in makeAutoloopExecutor) — never inside boot before that gate.
+    return {
+      runner,
+      dispatcher,
+      ledgerDir,
+      pushPolicy,
+      abort: () => runner.markCancelledByKernel(),
+      afterPublishReconcile: () =>
+        this._recoverCommittedCoderIteration(opts.workspace, ledgerDir, runId, runner, dispatcher),
+    };
+  }
+
+  /**
+   * If the durable ledger has a committed Coder iteration with no Reviewer
+   * verdict, and HEAD still names that iter, deliver it to Reviewer once.
+   * Git failure or a subject mismatch leaves this resume as a Planner-only boot.
+   */
+  private async _recoverCommittedCoderIteration(
+    workspace: string,
+    ledgerDir: string,
+    runId: string,
+    runner: AutoloopRunner,
+    dispatcher: ClaudeAgentDispatcher,
+  ): Promise<void> {
+    const iterRoot = path.join(ledgerDir, 'iter');
+    if (!fs.existsSync(iterRoot)) return;
+    const iters = fs
+      .readdirSync(iterRoot)
+      .filter((name) => /^\d+$/.test(name))
+      .map((name) => Number(name));
+    if (iters.length === 0) return;
+    const n = Math.max(...iters);
+    const artifacts = ['directive.json', 'eval_output.json', 'coder_summary.txt', 'diff.patch'];
+    const iterDir = path.join(iterRoot, String(n));
+    if (artifacts.some((name) => !fs.existsSync(path.join(iterDir, name)))) return;
+    if (fs.existsSync(path.join(iterDir, 'verdict.json'))) return;
+    for (let i = 0; i < n; i++) {
+      if (!fs.existsSync(path.join(iterRoot, String(i), 'verdict.json'))) return;
+    }
+    let subject: string;
+    try {
+      subject = execFileSync('git', ['-C', workspace, 'log', '-1', '--format=%s'], {
+        encoding: 'utf8',
+      }).trim();
+    } catch {
+      return;
+    }
+    if (!subject.startsWith(`autoloop/iter-${n}:`)) return;
+
+    this.logger.info?.(`[autoloop/${runId}] recovering committed iter ${n} into Reviewer`);
+    await dispatcher.ensureReviewerForCommittedRecovery();
+    // Keep a reconciled chat_notice_pending pause so Planner-bound follow-ups
+    // park until the notice is recorded; live spawn_subagents stays unchanged.
+    runner.markSubagentsSpawned({ preservePause: true });
+    runner.state.iter = n;
+    // Queue only — never await the physical Reviewer turn. Readiness and the
+    // cancellation observer must install before any model transport settles.
+    void runner
+      .send(
+        AutoloopMsg.reviewRequest(n, {
+          iter: n,
+          ledger_path: ledgerDir,
+          prior_metrics: runner.state.metric_history.slice(-10),
+        }),
+      )
+      .catch((err: unknown) => {
+        this.logger.warn?.(
+          `[autoloop/${runId}] recovered review_request failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      });
   }
 
   /**
@@ -3839,6 +4770,8 @@ export class SessionManager {
       }
     }
 
+    applyAutoloopFreshStartBoundary(opts.workspace, opts.runId, { invalidRunId: 'defer' });
+
     const tag = `${opts.runId}:${randomUUID()}`;
     const ready = new Promise<{ plannerSession: string; state: AutoloopState }>((resolve, reject) => {
       this._autoloopReady.set(tag, { resolve, reject });
@@ -3887,11 +4820,21 @@ export class SessionManager {
   }
 
   /**
+   * Durably accept a chat message for a live run's Planner and return the
+   * envelope to deliver. Throws, with nothing accepted, when the run cannot
+   * checkpoint it. Internal: callers pass the result to `runner.send`.
+   */
+  acceptAutoloopChat(runId: string, text: string): AnyAutoloopMessage {
+    return this._liveAutoloop(runId).runner.acceptChat(text);
+  }
+
+  /**
    * Inject a user chat message into a v2 run's Planner. Returns the Planner's
    * natural-language reply.
    */
   async autoloopChat(runId: string, text: string): Promise<{ reply: string }> {
     const ctx = this._liveAutoloop(runId);
+    const env = this.acceptAutoloopChat(runId, text);
     let reply = '';
     const onReply = (...args: unknown[]) => {
       const t = args[0];
@@ -3899,7 +4842,7 @@ export class SessionManager {
     };
     ctx.dispatcher.on('planner_reply', onReply);
     try {
-      await ctx.runner.send(AutoloopMsg.chat(ctx.runner.state.iter, { text }));
+      await ctx.runner.send(env);
     } finally {
       ctx.dispatcher.off('planner_reply', onReply);
     }
@@ -4037,7 +4980,16 @@ export class SessionManager {
       LEGACY_NODE,
     );
     if (live) {
-      if (!hasTimeoutIncrease) return live.runner.state;
+      if (!hasTimeoutIncrease) {
+        // Ordinary and activity-lease pauses have no uncertain in-flight
+        // dispatch. A pending send timeout stays the historical no-op until
+        // an explicit timeout increase names that dispatch.
+        if (live.runner.state.status === 'paused' && live.runner.state.pending_dispatch === null) {
+          live.runner.resumePaused();
+          this._autoloopPublishers.get(runId)?.();
+        }
+        return live.runner.state;
+      }
 
       const pending = live.runner.state.pending_dispatch;
       if (live.runner.state.status !== 'paused' || !pending) {
@@ -4264,10 +5216,8 @@ export class SessionManager {
       } catch {
         /* session not in memory — fine */
       }
-      this.persistedSessions.delete(`autoloop-${runId}-planner`);
-      this.persistedSessions.delete(`autoloop-${runId}-coder`);
-      this.persistedSessions.delete(`autoloop-${runId}-reviewer`);
-      savePersistedSessions(this.persistedSessions, this.logger, this._persistFile);
+      for (const role of ['planner', 'coder', 'reviewer']) this._forgetPersisted(`autoloop-${runId}-${role}`);
+      this._savePersisted();
     }
     // No registry to scrub: the run record IS the registry, and removing it is
     // the delete. The ledger directory under tasks/<runId>/ is deliberately left
@@ -4289,48 +5239,28 @@ export class SessionManager {
     return handle ? { runner: handle.runner, dispatcher: handle.dispatcher } : undefined;
   }
 
-  holdSession(name: string): void {
-    this._sessionHolds.set(name, (this._sessionHolds.get(name) ?? 0) + 1);
-  }
-
-  releaseSessionHold(name: string): void {
-    const next = (this._sessionHolds.get(name) ?? 0) - 1;
-    if (next <= 0) this._sessionHolds.delete(name);
-    else this._sessionHolds.set(name, next);
-  }
-
-  hasLiveSession(name: string): boolean {
-    return this.sessions.has(name);
-  }
-
-  isSessionBusy(name: string): boolean {
-    return this.sessions.get(name)?.session.isBusy ?? false;
-  }
-
   private _cleanupIdleSessions(): void {
     const ttlMs = this.pluginConfig.sessionTtlMinutes * 60_000;
     const now = Date.now();
     let pidsChanged = false;
     for (const [name, managed] of this.sessions) {
-      if ((this._sessionHolds.get(name) ?? 0) > 0) continue;
-      if (managed.sendChain) continue;
-      if (managed.session.isBusy) continue;
+      if (this._sessionHolds.has(name) || managed.sendChain || managed.session.isBusy) continue;
       if (now - managed.lastActivity > ttlMs) {
         this.logger.info(`Cleaning up idle in-memory session: ${name}`);
         try {
-          this._unwireNativeIdentity(managed);
+          this._finishOrchestration(managed);
           managed.session.stop();
         } catch {
           // Best-effort — session may already be dead; must not block TTL cleanup
         }
-        this.sessions.delete(name);
+        this._removeSession(name);
         // The child is gone, so its PID must go too — `stopSession` does this
         // and the TTL path did not, so `_activePids` only ever grew and the
         // next `_savePids()` rewrote those dead PIDs to disk under the current
         // owner. After an unclean exit `_cleanupOrphanedPids()` reads them back
         // and probes each one; a PID the OS has since recycled to a
         // coding-CLI-shaped process gets killed.
-        this._activePids.delete(name);
+        this._forgetPid(name);
         pidsChanged = true;
         // NOTE: do NOT delete from persistedSessions — idle cleanup is
         // in-memory only. Persisted entries survive for PERSIST_DISK_TTL_MS
@@ -4342,10 +5272,34 @@ export class SessionManager {
     let pruned = false;
     for (const [name, entry] of this.persistedSessions) {
       if (now - entry.lastActivity > PERSIST_DISK_TTL_MS) {
-        this.persistedSessions.delete(name);
+        this._forgetPersisted(name);
         pruned = true;
       }
     }
-    if (pruned) savePersistedSessionsAsync(this.persistedSessions, this.logger, this._persistFile);
+    if (pruned) this._debouncedSave();
+  }
+}
+
+/**
+ * Node kinds only UltraApp's own build pipeline places. Their fields (the app's
+ * directories, slug and version) are trusted as UltraApp wrote them, so a
+ * caller's spec may not use them, directly or inside an inline subflow, and a
+ * subflow may not name a stored run that does.
+ */
+const INTERNAL_NODE_KINDS: ReadonlySet<string> = new Set(['ultraapp_synth', 'ultraapp_deploy']);
+
+function hasInternalNodes(spec: WorkflowSpec): boolean {
+  return (spec.nodes ?? []).some(
+    (n) =>
+      INTERNAL_NODE_KINDS.has(n.kind) ||
+      (n.kind === 'subflow' && typeof n.workflow === 'object' && n.workflow !== null && hasInternalNodes(n.workflow)),
+  );
+}
+
+function refuseInternalNodes(spec: WorkflowSpec): void {
+  if (spec && Array.isArray(spec.nodes) && hasInternalNodes(spec)) {
+    throw new Error(
+      `Workflow '${spec.name}' uses a node kind internal to UltraApp (${[...INTERNAL_NODE_KINDS].join(', ')})`,
+    );
   }
 }
