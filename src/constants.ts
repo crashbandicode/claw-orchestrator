@@ -134,7 +134,16 @@ export type SessionEventName = (typeof SESSION_EVENT)[keyof typeof SESSION_EVENT
 
 /** Default model when the OpenAI-compat request omits `model` */
 export const OPENAI_COMPAT_DEFAULT_MODEL = 'claude-sonnet-4-6';
-/** Context utilization % threshold for auto-compact */
+/**
+ * Context % at which a session compacts itself before the next send when the
+ * caller does not name `autoCompactPercent`. An explicit 1–99 still wins, as
+ * does a threshold already stored for that session.
+ */
+export const DEFAULT_AUTO_COMPACT_PERCENT = 95;
+/**
+ * Separate context % gate for the OpenAI-compat bridge. It compacts before
+ * the request reaches the session, in addition to `autoCompactPercent`.
+ */
 export const OPENAI_COMPAT_AUTO_COMPACT_THRESHOLD = 80;
 /**
  * Turn timeout for OpenAI-compat requests. A gateway agent can spend well over

@@ -403,7 +403,7 @@ const plugin = {
             minimum: 1,
             maximum: 99,
             description:
-              'Compact the conversation before a send once context use reaches this percentage. Off by default; for long-lived sessions, where cost grows with context size',
+              'Compact the conversation before a send once context use reaches this percentage (1–99). Defaults to 95. For long-lived sessions, where cost grows with context size',
           },
           systemPrompt: { type: 'string', description: 'Replace system prompt' },
           appendSystemPrompt: {

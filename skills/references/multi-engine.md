@@ -362,6 +362,7 @@ await manager.startSession({
 Wraps the [OpenCode](https://github.com/anomalyco/opencode) CLI with `run --format json`. Each `send()` spawns a new process. Tested with `opencode` **1.19.5**.
 
 - Conversation continuity: the session id from the event envelope is captured and passed back as `--session <id>` on later sends, so the model sees prior turns. `--continue` is deliberately not used: it means "the last session on this machine", which collides between concurrent sessions.
+- Compaction uses OpenCode's own API. When the background `opencode serve` is alive, that is the server `opencode run` is already using, so compaction POSTs `/api/session/<id>/compact` there (no body and no summary) and leaves the service running. Otherwise a private serve is started for the request and stopped afterwards. It waits until the session is idle and `time.compacting` has cleared. Until a turn has produced an OpenCode session id there is nothing to compact. A `/goal` server already running for this session is reused.
 - NDJSON event stream with envelope `{ type, timestamp, sessionID, ... }`
 - Event types: `text`, `reasoning`, `tool_use`, `step_start`, `step_finish`, `error`
 - `text` and `tool_use` are **cumulative snapshots** keyed by `part.id` / `part.callID`; the wrapper diffs them to produce streaming deltas for `onText` callbacks and counts each tool invocation once

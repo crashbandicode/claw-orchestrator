@@ -275,6 +275,7 @@ import {
   STOP_SIGKILL_DELAY_MS,
   SESSION_EVENT,
   DEFAULT_HISTORY_LIMIT,
+  DEFAULT_AUTO_COMPACT_PERCENT,
 } from './constants.js';
 
 // ─── Internal Types ──────────────────────────────────────────────────────────
@@ -1307,6 +1308,12 @@ export class SessionManager {
       ...config,
       ...(resumeId ? { resumeSessionId: resumeId } : {}),
     };
+    // Applied after the spread: an omitted key and an explicit `undefined`
+    // both mean "use the default". A number from the caller or the persisted
+    // registry is left alone. There is no separate off switch.
+    if (fullConfig.autoCompactPercent == null) {
+      fullConfig.autoCompactPercent = DEFAULT_AUTO_COMPACT_PERCENT;
+    }
 
     // Resolve model alias
     if (fullConfig.model) {
@@ -1469,16 +1476,17 @@ export class SessionManager {
 
       // Compact before the send rather than after the previous reply, so the
       // caller is never kept waiting for it, and inside the send chain, so no
-      // other send can interleave. Best effort: a failed or unsupported compact
-      // must not cost the caller their turn.
+      // other send can interleave. Best effort: a stats read or compact that
+      // throws must not cost the caller their turn. The threshold is always
+      // set, so this read happens on every send.
       const compactAt = managed.config.autoCompactPercent;
-      if (compactAt && managed.session.getStats().contextPercent >= compactAt) {
-        try {
+      try {
+        if (compactAt && managed.session.getStats().contextPercent >= compactAt) {
           await managed.session.compact();
           this.logger.info(`[SessionManager] ${name}: context at or above ${compactAt}% — compacted before send`);
-        } catch (err) {
-          this.logger.warn(`[SessionManager] ${name}: auto-compact failed: ${(err as Error).message}`);
         }
+      } catch (err) {
+        this.logger.warn(`[SessionManager] ${name}: auto-compact failed: ${(err as Error).message}`);
       }
 
       // Leave an account the pool already knows is spent before the turn hits it.

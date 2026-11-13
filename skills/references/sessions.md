@@ -222,18 +222,20 @@ unset), so it only grows (and a one-shot `custom` engine reports 0).
 has been billed for in total, which only ever grows.
 
 `compactSession()` runs `/compact` (with the optional summary) on `claude` and a
-persistent `custom` engine, and starts the thread's own compaction on `codex-app`.
-It is a no-op on the one-shot engines whose CLI has no compaction command (`codex`,
-`agy`, `grok`, `opencode`), which log a warning the first time it is called, and a
-silent no-op on `acp` agents, which manage their own context, and on one-shot
-`custom` engines.
+persistent `custom` engine, starts the thread's own compaction on `codex-app`,
+and asks OpenCode to compact through `POST /api/session/{id}/compact` on the
+background OpenCode service `opencode run` is already using. That endpoint
+takes no summary. It is a no-op on the one-shot engines whose CLI has
+no compaction command (`codex`, `agy`, `grok`), which log a warning the first
+time it is called, and a silent no-op on `acp` agents, which manage their own
+context, and on one-shot `custom` engines.
 
-A long-lived session can compact itself: start it with `autoCompactPercent`
-(1–99, off by default) and, before each send, the session is compacted first
-if `contextPercent` has reached that value. Every call in a turn re-reads the
-whole context from cache, so cost grows with context size; compacting earlier
-trades detail of older turns for cheaper ones. The setting survives a restart
-of the server, and a failed compaction never costs the send.
+Before each send, the session is compacted if `contextPercent` has reached
+`autoCompactPercent` (1–99). The default is 95; pass a number to use another
+threshold. Every call in a turn re-reads the whole context from cache, so cost
+grows with context size; compacting earlier trades detail of older turns for
+cheaper ones. The setting survives a restart of the server, and a failed
+compaction never costs the send.
 
 ```typescript
 await manager.startSession({ name: 'assistant', cwd: '/srv/bot', autoCompactPercent: 85 });

@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.22.1-memento.3] - 2026-11-13
+
+### Changed
+
+- **`autoCompactPercent` defaults to 95.** A session that does not name a threshold, and a resumed session that never stored one, compacts before the next send once context use reaches 95%. An explicit 1–99, including one restored from the registry, still wins.
+
+### Fixed
+
+- **OpenCode uses its own compaction.** `compact()` and the auto-compact gate POST `/api/session/{id}/compact`. A running background `opencode serve` is used, because that is the server `opencode run` already talks to; otherwise a private serve is started and stopped. The call waits until the session is idle. A summary is not forwarded: the endpoint accepts none. With no OpenCode session id yet, compaction does not pretend the engine cannot compact.
+
 ## [7.22.1-memento.2] - 2026-11-12
 
 ### Added

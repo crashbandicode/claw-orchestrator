@@ -890,16 +890,26 @@ describe('SessionManager', () => {
       expect(mock.sendCalls.map((c) => c.message)).toEqual(['hello']);
     });
 
-    it('leaves the session alone below the threshold or when unset', async () => {
+    it('leaves the session alone below an explicit threshold', async () => {
       await mgr.startSession({ name: 'ac-below', cwd: '/tmp', autoCompactPercent: 85 });
       lastMock().contextPercentOverride = 84;
       await mgr.sendMessage('ac-below', 'hello');
       expect(lastMock().compactCalls).toEqual([]);
+    });
 
-      await mgr.startSession({ name: 'ac-off', cwd: '/tmp' });
-      lastMock().contextPercentOverride = 99;
-      await mgr.sendMessage('ac-off', 'hello');
+    it('defaults an omitted threshold to 95 and compacts at that line', async () => {
+      await mgr.startSession({ name: 'ac-default-below', cwd: '/tmp', autoCompactPercent: undefined });
+      expect(createdConfigs.at(-1)?.autoCompactPercent).toBe(95);
+      lastMock().contextPercentOverride = 94;
+      await mgr.sendMessage('ac-default-below', 'hello');
       expect(lastMock().compactCalls).toEqual([]);
+
+      await mgr.startSession({ name: 'ac-default-hit', cwd: '/tmp' });
+      expect(createdConfigs.at(-1)?.autoCompactPercent).toBe(95);
+      lastMock().contextPercentOverride = 95;
+      await mgr.sendMessage('ac-default-hit', 'hello');
+      expect(lastMock().compactCalls).toEqual(['']);
+      expect(lastMock().sendCalls.map((c) => c.message)).toEqual(['hello']);
     });
 
     it('still sends when the compact fails', async () => {

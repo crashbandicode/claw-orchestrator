@@ -9,6 +9,9 @@
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { EventEmitter } from 'node:events';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { Readable } from 'node:stream';
 
 // Mock child_process before importing the session
@@ -25,9 +28,8 @@ vi.mock('../engine-spawn.js', async (importOriginal) => ({
   },
 }));
 
-const { PersistentOpencodeSession, isOpencodeV2, opencodeGoalArguments, opencodeModelRef } = await import(
-  '../persistent-opencode-session.js'
-);
+const { PersistentOpencodeSession, isOpencodeV2, opencodeGoalArguments, opencodeModelRef, readLiveOpencodeService } =
+  await import('../persistent-opencode-session.js');
 
 // ─── Mock Process Helper ────────────────────────────────────────────────────
 
@@ -710,7 +712,7 @@ describe('PersistentOpencodeSession', () => {
       expect(session.isReady).toBe(false);
     });
 
-    it('compact() returns no-op message', async () => {
+    it('compact() does not claim the engine cannot compact before a session exists', async () => {
       const session = new PersistentOpencodeSession({
         name: 'test',
         cwd: '/tmp',
@@ -719,7 +721,87 @@ describe('PersistentOpencodeSession', () => {
       await session.start();
 
       const result = await session.compact();
-      expect(result.text).toContain('does not support compaction');
+      expect(result.text).toContain('no conversation to compact');
+      expect(result.text).not.toContain('does not support compaction');
+      expect(mockSpawn).not.toHaveBeenCalled();
+    });
+
+    it('compact() posts OpenCode /compact and waits until the session is idle', async () => {
+      expect(process.env.VITEST).toBeTruthy();
+      versions['opencode-compact'] = 'opencode v2.2.5';
+      const session = new PersistentOpencodeSession(
+        {
+          name: 'test',
+          cwd: '/tmp',
+          permissionMode: 'bypassPermissions',
+          resumeSessionId: 'ses_real',
+        },
+        'opencode-compact',
+      );
+      const serve = createMockProcess();
+      mockSpawn.mockReset();
+      mockSpawn.mockImplementation(() => {
+        setTimeout(() => serve.stdout.push('opencode server listening\n'), 0);
+        return serve;
+      });
+      const calls: string[] = [];
+      let sessionGets = 0;
+      const fetchMock = vi.fn(async (url: string, init?: RequestInit) => {
+        const path = new URL(url).pathname;
+        calls.push(`${init?.method ?? 'GET'} ${path}`);
+        const headers = new Headers(init?.headers);
+        expect(headers.get('authorization')).toMatch(/^Basic /);
+        expect(headers.get('x-opencode-directory')).toBe('/tmp');
+        if (path.endsWith('/compact')) expect(init?.body).toBe('{}');
+        else expect(init?.body).toBeUndefined();
+        if (path.endsWith('/compact')) return new Response(null, { status: 204 });
+        if (path.endsWith('/wait')) return new Response('{}', { status: 200 });
+        sessionGets += 1;
+        const compacting = sessionGets === 1 ? 1 : undefined;
+        return new Response(JSON.stringify({ time: { created: 1, updated: 2, compacting } }), { status: 200 });
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      try {
+        await session.start();
+        const result = await session.compact('focus on the failing test');
+        expect(result.text).toBe('OpenCode compacted the session');
+        expect(calls).toEqual([
+          'POST /api/session/ses_real/compact',
+          'POST /api/session/ses_real/wait',
+          'GET /api/session/ses_real',
+          'GET /api/session/ses_real',
+        ]);
+        expect(mockSpawn.mock.calls[0][1]).toEqual(['serve', '--hostname', '127.0.0.1', '--port', expect.any(String)]);
+        expect(serve.kill).toHaveBeenCalledWith('SIGTERM');
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it('stops the serve it started when OpenCode rejects compact', async () => {
+      const session = new PersistentOpencodeSession({
+        name: 'test',
+        cwd: '/tmp',
+        permissionMode: 'bypassPermissions',
+        resumeSessionId: 'ses_busy',
+      });
+      const serve = createMockProcess();
+      mockSpawn.mockReset();
+      mockSpawn.mockImplementation(() => {
+        setTimeout(() => serve.stdout.push('listening\n'), 0);
+        return serve;
+      });
+      vi.stubGlobal(
+        'fetch',
+        vi.fn(async () => new Response(JSON.stringify({ message: 'busy' }), { status: 503 })),
+      );
+      try {
+        await session.start();
+        await expect(session.compact()).rejects.toThrow('busy');
+        expect(serve.kill).toHaveBeenCalledWith('SIGTERM');
+      } finally {
+        vi.unstubAllGlobals();
+      }
     });
 
     it('getCost() uses opencode-default model label', async () => {
@@ -757,6 +839,33 @@ describe('PersistentOpencodeSession', () => {
       expect(logs.some((l) => l.includes('ANTHROPIC_API_KEY=***'))).toBe(true);
       expect(logs.some((l) => l.includes('sk-abcdef'))).toBe(false);
     });
+  });
+});
+
+describe('OpenCode background service', () => {
+  it('reads a live loopback service and ignores a dead or remote one', () => {
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), 'c23-oc-service-'));
+    const dir = path.join(stateHome, 'opencode');
+    fs.mkdirSync(dir);
+    const file = path.join(dir, 'service.json');
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ url: 'http://127.0.0.1:49374', password: 'secret', pid: process.pid, version: '2.2.5' }),
+    );
+    expect(readLiveOpencodeService(stateHome)).toEqual({ port: 49374, password: 'secret' });
+
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ url: 'http://127.0.0.1:49374', password: 'secret', pid: 2_147_483_646, version: '2.2.5' }),
+    );
+    expect(readLiveOpencodeService(stateHome)).toBeUndefined();
+
+    fs.writeFileSync(
+      file,
+      JSON.stringify({ url: 'http://10.0.0.8:49374', password: 'secret', pid: process.pid, version: '2.2.5' }),
+    );
+    expect(readLiveOpencodeService(stateHome)).toBeUndefined();
+    fs.rmSync(stateHome, { recursive: true, force: true });
   });
 });
 
