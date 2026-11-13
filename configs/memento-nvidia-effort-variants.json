@@ -1,0 +1,3654 @@
+{
+  "schemaVersion": 1,
+  "checkedAt": "2026-09-29",
+  "sources": [
+    "https://models.dev/api.json",
+    "https://inference-api.nvidia.com/openapi.json",
+    "https://raw.githubusercontent.com/anomalyco/opencode/v1.18.32/packages/opencode/src/provider/transform.ts",
+    "https://docs.litellm.ai/docs/providers/gemini",
+    "https://community.perplexity.ai/t/sonar-deep-research-async-mode-and-reasoning-effort-now-live/4736"
+  ],
+  "models": {
+    "aws/anthropic/bedrock-claude-opus-4-6": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "aws/anthropic/bedrock-claude-opus-4-7": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "aws/anthropic/bedrock-claude-opus-4-8": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "aws/anthropic/bedrock-claude-opus-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "aws/anthropic/bedrock-claude-opus-5-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "aws/anthropic/bedrock-claude-sonnet-4-6": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "aws/anthropic/bedrock-claude-sonnet-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "aws/anthropic/claude-opus-4-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          },
+          "effort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-opus-4-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          },
+          "effort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-opus-4-6": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-opus-4-7": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-opus-4-8": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-opus-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-opus-5-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-sonnet-4-6": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-sonnet-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "low": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "low"
+        },
+        "medium": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "medium"
+        },
+        "high": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "high"
+        },
+        "xhigh": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "xhigh"
+        },
+        "max": {
+          "thinking": {
+            "type": "adaptive"
+          },
+          "effort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5-mini": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5-nano": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.1": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.1-codex": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.1-codex-max": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.1-codex-mini": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.2": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.2-codex": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.3-codex": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.4": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.4-mini": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.4-nano": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.6-luna": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.6-sol": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-5.6-terra": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-6-astra": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-6-luna": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/gpt-6-sol": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/o1": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/o3": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/o3-mini": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/openai/o4-mini": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-3-flash-preview": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-3.1-flash-lite": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-3.1-pro-preview": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-3.5-flash": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-3.5-flash-lite": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-3.6-flash": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-3.7-flash": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-3.8-flash": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/nvidia/nemotron-3-ultra-nvfp4": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/nvidia/nemotron-3.5-lightning": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/qwen/qwen3-32b": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/qwen/qwen3-5-397b-a17b": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/qwen/qwen3.5-35b-a3b": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/qwen/qwen3.6-27b": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "default": {
+          "reasoningEffort": "default"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "high": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/qwen/qwen3.6-35b-a3b": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/qwen/qwen3.8-27b": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "default": {
+          "reasoningEffort": "default"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/qwen/qwen3.8-flash-next": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "high": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/thinkingmachines/inkling-small": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/zai-org/glm-5.2": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/zai-org/glm-5.3": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "nvidia/zai-org/glm-5.3-flash": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5-mini": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5-nano": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "none": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.1": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.2": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.3-codex": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.4": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.4-mini": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.4-nano": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.4-pro": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.6-luna": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.6-sol": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-5.6-terra": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-6-astra": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-6-luna": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "openai/openai/gpt-6-sol": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "perplexity/perplexity/sonar-deep-research": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "perplexity/perplexity/sonar-reasoning-pro": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "xai/xai/grok-4.3": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "xai/xai/grok-4.6": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "xai/xai/grok-4.7": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "z-ai/glm-5.3-flash": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "z-ai/glm-5.2": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "z-ai/glm-5.3": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "deepseek-ai/deepseek-v4-flash": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "deepseek-ai/deepseek-v4-pro": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "moonshotai/kimi-k3": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "qwen/qwen3.5-122b-a10b": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "thinkingmachines/inkling": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "minimal": {
+          "reasoningEffort": "minimal"
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "reasoningEffort": "xhigh"
+        },
+        "max": {
+          "reasoningEffort": "max"
+        },
+        "default": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "aws/anthropic/bedrock-claude-sonnet-4-5-v1": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "high": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          }
+        },
+        "max": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 31999
+          }
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "aws/anthropic/claude-haiku-4-5-v1": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "high": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          }
+        },
+        "max": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 31999
+          }
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-haiku-4-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "high": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          }
+        },
+        "max": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 31999
+          }
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "azure/anthropic/claude-sonnet-4-5": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/anthropic"
+      },
+      "variants": {
+        "high": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 16384
+          }
+        },
+        "max": {
+          "thinking": {
+            "type": "enabled",
+            "budgetTokens": 31999
+          }
+        },
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "disabled": true
+        },
+        "medium": {
+          "disabled": true
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-2.5-pro": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "disabled": true
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-2.5-flash": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    },
+    "gcp/google/gemini-2.5-flash-lite": {
+      "reasoning": true,
+      "provider": {
+        "npm": "@ai-sdk/openai-compatible"
+      },
+      "variants": {
+        "none": {
+          "reasoningEffort": "none"
+        },
+        "minimal": {
+          "disabled": true
+        },
+        "default": {
+          "disabled": true
+        },
+        "low": {
+          "reasoningEffort": "low"
+        },
+        "medium": {
+          "reasoningEffort": "medium"
+        },
+        "high": {
+          "reasoningEffort": "high"
+        },
+        "xhigh": {
+          "disabled": true
+        },
+        "max": {
+          "disabled": true
+        },
+        "ultra": {
+          "disabled": true
+        }
+      }
+    }
+  }
+}

@@ -9,6 +9,7 @@
  */
 
 import { spawn } from 'node:child_process';
+import { guardChildStreams } from '../child-process-guard.js';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
@@ -50,6 +51,9 @@ async function runCmd(argv: string[], opts: { timeoutMs?: number; stdin?: string
     let stderr = '';
     let timedOut = false;
 
+    // EPIPE on the stdin write below when the command exits first would
+    // otherwise be an uncaught exception.
+    guardChildStreams(child);
     child.stdout?.on('data', (b) => (stdout += b.toString()));
     child.stderr?.on('data', (b) => (stderr += b.toString()));
 

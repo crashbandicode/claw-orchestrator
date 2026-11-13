@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Cursor effort.** A requested effort selects a catalog model id, including parameterized models discovered without opening a chat.
 - **Native session identity and an orchestration outbox.** Claude, Cursor, and OpenCode publish the id they can resume. Fanout and council children are recorded as part of their run.
 - **Codex `/side`.** `codex_side` asks one question on an ephemeral fork and leaves the parent thread in place. The broker method is `session.side`.
+- **Autoloop notifications survive a closed pipe.** The notifier guards the child streams so an early exit cannot end the process.
 
 ## [7.22.1-memento.1] - 2026-11-12
 
