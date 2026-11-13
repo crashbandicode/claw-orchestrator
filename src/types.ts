@@ -351,8 +351,9 @@ export interface SessionConfig {
   maxBudgetUsd?: number;
   /**
    * Compact the conversation before a send once context use reaches this
-   * percentage (1–99). Off when unset. For long-lived sessions, where every
-   * call re-reads the whole context from cache and cost grows with its size.
+   * percentage (1–99). Defaults to 95 when omitted. For long-lived sessions,
+   * where every call re-reads the whole context from cache and cost grows
+   * with its size.
    */
   autoCompactPercent?: number;
   // System prompts

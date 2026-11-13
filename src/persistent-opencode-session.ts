@@ -35,14 +35,17 @@
 
 import { execEngine, killEngineTree, spawnEngine } from './engine-spawn.js';
 import type { ChildProcess } from 'node:child_process';
+import * as fs from 'node:fs';
 import * as net from 'node:net';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import * as readline from 'node:readline';
 
 import type { EffortLevel, SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
 import { estimateTokens } from './models.js';
 import { sanitizeSecrets } from './sanitize.js';
-import { SESSION_EVENT } from './constants.js';
+import { COMPACT_TIMEOUT_MS, SESSION_EVENT } from './constants.js';
 import { BaseOneShotSession } from './base-oneshot-session.js';
 
 /**
@@ -181,6 +184,33 @@ export function opencodeModelRef(
   return variant ? { id, providerID, variant } : { id, providerID };
 }
 
+/**
+ * The OpenCode CLI's background service, when that process is still alive.
+ *
+ * `opencode run` talks to this server. Compaction has to use the same one:
+ * a second `opencode serve` does not own the session and would open the same
+ * database beside the service. Callers under Vitest skip this so a test
+ * does not attach to the machine's service.
+ */
+export function readLiveOpencodeService(
+  stateHome = process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'),
+): { port: number; password: string } | undefined {
+  try {
+    const file = path.join(stateHome, 'opencode', 'service.json');
+    const data = JSON.parse(fs.readFileSync(file, 'utf8')) as { url?: unknown; password?: unknown; pid?: unknown };
+    if (typeof data.url !== 'string' || typeof data.password !== 'string' || !data.password) return undefined;
+    const url = new URL(data.url);
+    if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost') return undefined;
+    const port = Number(url.port);
+    const pid = Number(data.pid);
+    if (!Number.isInteger(port) || port <= 0 || !Number.isInteger(pid) || pid <= 0) return undefined;
+    process.kill(pid, 0);
+    return { port, password: data.password };
+  } catch {
+    return undefined;
+  }
+}
+
 // ─── PersistentOpencodeSession ──────────────────────────────────────────────
 
 export class PersistentOpencodeSession extends BaseOneShotSession {
@@ -200,8 +230,12 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
   private opencodeV2 = false;
   /** Numeric major used to recognize `/goal`. Beta `0.0.0` stays at 1. */
   private opencodeMajor = 1;
-  /** Private `opencode serve` used only while a 2.x `/goal` command is in flight. */
-  private goalApi?: { port: number; password: string; proc: ChildProcess };
+  /**
+   * HTTP API used by a 2.x `/goal` or by compaction.
+   * `proc` is set only when this session started the server and must stop it.
+   * A background OpenCode service has no `proc` here and is left running.
+   */
+  private goalApi?: { port: number; password: string; proc?: ChildProcess };
   private lastGoalEvent = '';
 
   /**
@@ -350,6 +384,100 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
     headers.set('x-opencode-directory', this.options.cwd || process.cwd());
     if (init.body) headers.set('Content-Type', 'application/json');
     return fetch(`http://127.0.0.1:${api.port}${path}`, { ...init, headers });
+  }
+
+  /**
+   * OpenCode compacts through `POST /api/session/{id}/compact` (204, no body).
+   * A summary cannot be forwarded: the endpoint accepts none. The request goes
+   * to the background OpenCode service when that process is alive, because
+   * that is the server `opencode run` is using. Otherwise a private serve is
+   * started and stopped afterwards. A `/goal` server already running for this
+   * session is reused and left up.
+   */
+  override async compact(_summary?: string): Promise<TurnResult> {
+    const id = this.opencodeSessionId;
+    if (!id) {
+      const message = 'OpenCode has no conversation to compact yet';
+      return { text: message, event: { type: 'result', result: message } };
+    }
+    const startedHere = !this.goalApi;
+    // A normal `opencode run` session lives on the background service. Attach
+    // to that server instead of opening a second one on its database.
+    const service = startedHere && !process.env.VITEST ? readLiveOpencodeService() : undefined;
+    if (service) this.goalApi = { port: service.port, password: service.password };
+    const deadline = Date.now() + COMPACT_TIMEOUT_MS;
+    const signal = (): AbortSignal => AbortSignal.timeout(Math.max(1, deadline - Date.now()));
+    const sessionPath = `/api/session/${encodeURIComponent(id)}`;
+    try {
+      await this._startGoalServer();
+      // The live server rejects a missing body with 400 "Expected object".
+      // An empty object is the whole payload; there is no summary field.
+      const compactResponse = await this._goalFetch(`${sessionPath}/compact`, {
+        method: 'POST',
+        body: '{}',
+        signal: signal(),
+      });
+      const compactText = await compactResponse.text();
+      if (!compactResponse.ok) {
+        const detail = sanitizeSecrets(this._errorMessage(compactText));
+        throw new Error(detail || `OpenCode compact failed (${compactResponse.status})`);
+      }
+
+      const waitResponse = await this._goalFetch(`${sessionPath}/wait`, { method: 'POST', signal: signal() });
+      if (!waitResponse.ok && waitResponse.status !== 404) {
+        const detail = sanitizeSecrets(await this._responseMessage(waitResponse));
+        throw new Error(detail || `OpenCode compact did not finish (${waitResponse.status})`);
+      }
+      await waitResponse.body?.cancel().catch(() => undefined);
+
+      let finished = false;
+      while (Date.now() <= deadline) {
+        const status = await this._goalFetch(sessionPath, { method: 'GET', signal: signal() });
+        const text = await status.text();
+        if (!status.ok) {
+          throw new Error(
+            sanitizeSecrets(text).slice(0, 500) || `OpenCode compact could not read the session (${status.status})`,
+          );
+        }
+        if (this._compactingAt(text) === undefined) {
+          finished = true;
+          break;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 200));
+      }
+      if (!finished) throw new Error('OpenCode compaction did not finish');
+
+      const message = 'OpenCode compacted the session';
+      this.emit(SESSION_EVENT.LOG, message);
+      return { text: message, event: { type: 'result', result: message } };
+    } finally {
+      if (service) this.goalApi = undefined;
+      else if (startedHere) this._stopGoalServer();
+    }
+  }
+
+  private _errorMessage(text: string): string {
+    if (!text) return '';
+    try {
+      const body = JSON.parse(text) as { message?: unknown };
+      return typeof body.message === 'string' ? body.message : text.slice(0, 500);
+    } catch {
+      return text.slice(0, 500);
+    }
+  }
+
+  /** `time.compacting` while OpenCode is still summarizing the session. */
+  private _compactingAt(text: string): number | undefined {
+    let body: unknown;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      throw new Error('OpenCode compact returned an unreadable session');
+    }
+    if (!body || typeof body !== 'object') return undefined;
+    const record = body as { time?: { compacting?: unknown }; data?: { time?: { compacting?: unknown } } };
+    const value = record.time?.compacting ?? record.data?.time?.compacting;
+    return typeof value === 'number' ? value : undefined;
   }
 
   private async _responseMessage(response: Response): Promise<string> {
