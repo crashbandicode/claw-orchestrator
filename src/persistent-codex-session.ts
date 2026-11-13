@@ -15,6 +15,7 @@
  */
 
 import { killEngineTree, spawnEngine } from './engine-spawn.js';
+import { resolveCodexMcpDisableArgs, validateCodexMcpSelection } from './codex-mcp.js';
 import {
   writeFileSync,
   unlinkSync,
@@ -333,6 +334,26 @@ export class PersistentCodexSession extends BaseOneShotSession {
    * First turn:    `codex exec [--sandbox W] --skip-git-repo-check --json --model M -C cwd <msg>`
    * Resume turns:  `codex exec resume <thread_id> [--sandbox W] --skip-git-repo-check --json --model M -C cwd <msg>`
    */
+  private _mcpDisableArgs?: string[];
+
+  override async start(): Promise<this> {
+    await this._refreshMcpDisableArgs();
+    return super.start();
+  }
+
+  private async _refreshMcpDisableArgs(): Promise<void> {
+    const selection = validateCodexMcpSelection(this.options, 'codex');
+    if (this.options.ignoreUserConfig !== true || !selection || selection.length === 0) {
+      this._mcpDisableArgs = undefined;
+      return;
+    }
+    this._mcpDisableArgs = await resolveCodexMcpDisableArgs({
+      codexBin: this.engineBin,
+      cwd: this.options.cwd,
+      keep: selection,
+    });
+  }
+
   private _buildArgs(): string[] {
     const args: string[] = ['exec'];
     const isResume = !!this.codexThreadId;
@@ -373,7 +394,8 @@ export class PersistentCodexSession extends BaseOneShotSession {
     // not the orchestrator's: a `model = …` line in it silently decides which
     // model an orchestrated run uses and which one we then price it as. Auth
     // still resolves from CODEX_HOME, so this does not log the session out.
-    if (this.options.ignoreUserConfig) args.push('--ignore-user-config');
+    if (this._mcpDisableArgs) args.push(...this._mcpDisableArgs);
+    else if (this.options.ignoreUserConfig) args.push('--ignore-user-config');
     // Extra writable roots. Rejected by `exec resume` (like --sandbox/-C), and
     // the resumed thread keeps the roots the first turn opened.
     if (!isResume && this.options.addDir?.length) {

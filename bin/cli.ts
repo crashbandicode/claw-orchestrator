@@ -67,6 +67,44 @@ async function api(path: string, method = 'GET', body?: unknown): Promise<Record
   }
 }
 
+async function brokerCall(
+  host: string | undefined,
+  method:
+    | 'session.start'
+    | 'session.send'
+    | 'session.stop'
+    | 'session.list'
+    | 'session.status'
+    | 'session.overview'
+    | 'thread.register'
+    | 'thread.send'
+    | 'thread.read'
+    | 'thread.ack'
+    | 'thread.wait',
+  payload: Record<string, unknown>,
+  opts?: { operationId?: string; waitTimeoutMs?: number },
+): Promise<Record<string, unknown> | undefined> {
+  const { RemoteEndpoint } = await import('../src/remote/endpoint.js');
+  const endpoint = new RemoteEndpoint();
+  try {
+    if (endpoint.routeDecision(host) === 'local') return undefined;
+    return (await endpoint.call(host, method, payload, opts)) as Record<string, unknown>;
+  } finally {
+    await endpoint.close();
+  }
+}
+
+function remoteOptions(opts: { operationId?: string; waitTimeout?: string }): {
+  operationId?: string;
+  waitTimeoutMs?: number;
+} {
+  const waitTimeoutMs = opts.waitTimeout ? parseInt(opts.waitTimeout, 10) : undefined;
+  return {
+    ...(opts.operationId ? { operationId: opts.operationId } : {}),
+    ...(waitTimeoutMs !== undefined && !Number.isNaN(waitTimeoutMs) ? { waitTimeoutMs } : {}),
+  };
+}
+
 // ─── CLI ─────────────────────────────────────────────────────────────────────
 
 /**
@@ -180,6 +218,78 @@ program
     };
     process.on('SIGINT', shutdown);
     process.on('SIGTERM', shutdown);
+  });
+
+program
+  .command('remote-broker')
+  .description('Run the execution-host broker on an owner-only Unix socket. One process owns the SessionManager.')
+  .option('-c, --config <path>', 'remote-hosts.json (default ~/.claw-orchestrator/remote-hosts.json)')
+  .option('--ttl-minutes <n>', 'Idle session TTL in minutes. Active turns and accepted operations are kept.', '120')
+  .option(
+    '--max-sessions <n>',
+    'Maximum open sessions. Omit to use CLAWO_MAX_CONCURRENT_SESSIONS or 5. 0 is unlimited.',
+  )
+  .action(async (opts: { config?: string; ttlMinutes: string; maxSessions?: string }) => {
+    process.env.CLAWO_REMOTE_EXECUTION_BROKER = '1';
+    if (opts.config) process.env.CLAWO_REMOTE_CONFIG = opts.config;
+    const { loadRemoteHostsConfig } = await import('../src/remote/config.js');
+    const { RemoteBroker, prepareBrokerOwnership } = await import('../src/remote/broker.js');
+    const { OperationStore } = await import('../src/remote/operation-store.js');
+    const { DurableMailbox } = await import('../src/remote/mailbox.js');
+    const { sessionManagerHost } = await import('../src/remote/host-adapter.js');
+    const { SessionManager } = await import('../src/session-manager.js');
+    const config = loadRemoteHostsConfig();
+    if (!config) {
+      console.error('Remote sockets are disabled. Set "enabled": true in remote-hosts.json.');
+      process.exit(1);
+    }
+    const ttl = parseInt(opts.ttlMinutes, 10);
+    if (!Number.isInteger(ttl) || ttl <= 0) {
+      console.error('--ttl-minutes must be a positive integer');
+      process.exit(1);
+    }
+    const max = opts.maxSessions !== undefined ? parseInt(opts.maxSessions, 10) : undefined;
+    if (max !== undefined && (!Number.isInteger(max) || max < 0)) {
+      console.error('--max-sessions must be a non-negative integer');
+      process.exit(1);
+    }
+    const root = path.join(os.homedir(), '.claw-orchestrator', 'remote-broker');
+    const operations = new OperationStore(path.join(root, 'operations'));
+    try {
+      await prepareBrokerOwnership(config.socketPath, operations);
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+    const mailbox = new DurableMailbox(path.join(root, 'mailbox'));
+    const manager = new SessionManager({
+      sessionTtlMinutes: ttl,
+      stateDirectory: root,
+      ...(max !== undefined ? { maxConcurrentSessions: max } : {}),
+    });
+    const broker = new RemoteBroker(sessionManagerHost(manager), {
+      localHost: config.localHost,
+      operations,
+      mailbox,
+    });
+    try {
+      await broker.listen(config.socketPath);
+    } catch (err) {
+      operations.releaseOwner();
+      await manager.shutdown();
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+    console.error(`Claw remote broker listening on ${config.socketPath} as ${config.localHost}`);
+    let stopping = false;
+    const shutdown = async (): Promise<void> => {
+      if (stopping) return;
+      stopping = true;
+      await broker.closeOwned();
+      process.exit(0);
+    };
+    process.on('SIGINT', () => void shutdown());
+    process.on('SIGTERM', () => void shutdown());
   });
 
 // Session commands
@@ -1096,6 +1206,110 @@ program
       maxRepairs: Math.max(0, parseInt(opts.maxRepairs, 10) || 0),
     });
     await startWorkflow(spec, cwd, contract, opts);
+  });
+
+program
+  .command('thread-register <name>')
+  .description('Register a manually opened native thread. session-start of that name takes it over later.')
+  .requiredOption('--native-session-id <id>', 'Exact native thread id')
+  .option('--host <alias>', 'Configured execution-host alias')
+  .option('--parent-tool-id <id>', 'codex, claude_code, cursor, or opencode')
+  .option('--operation-id <id>', 'Stable broker operation id')
+  .action(async (name, opts) => {
+    const body = {
+      name,
+      nativeSessionId: opts.nativeSessionId,
+      ...(opts.host ? { host: opts.host } : {}),
+      ...(opts.parentToolId ? { parentToolId: opts.parentToolId } : {}),
+    };
+    try {
+      const result = await brokerCall(opts.host, 'thread.register', body, remoteOptions(opts));
+      if (!result) {
+        console.error('Manual thread mailboxes require the remote broker');
+        process.exit(1);
+      }
+      console.log(JSON.stringify(result, null, 2));
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('thread-mailbox-send <name> <message>')
+  .description('Queue mail for a registered manual thread, or deliver it when that thread has a live owner')
+  .requiredOption('--from <identity>', 'Sender identity')
+  .option('--host <alias>', 'Configured execution-host alias')
+  .option('--from-host <name>', 'Origin host display name')
+  .option('--message-id <id>', 'Stable message id')
+  .option('--operation-id <id>', 'Stable broker operation id')
+  .action(async (name, message, opts) => {
+    const body = {
+      name,
+      message,
+      from: opts.from,
+      ...(opts.host ? { host: opts.host } : {}),
+      ...(opts.fromHost ? { fromHost: opts.fromHost } : {}),
+      ...(opts.messageId ? { messageId: opts.messageId } : {}),
+    };
+    try {
+      const result = await brokerCall(opts.host, 'thread.send', body, remoteOptions(opts));
+      if (!result) {
+        console.error('Manual thread mailboxes require the remote broker');
+        process.exit(1);
+      }
+      console.log(JSON.stringify(result, null, 2));
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('thread-mailbox-wait <name>')
+  .description('Wait until a registered manual thread has mail, or the wait expires')
+  .option('--host <alias>', 'Configured execution-host alias')
+  .option('--wait-timeout <ms>', 'Broker wait in ms', '30000')
+  .option('--operation-id <id>', 'Stable broker operation id')
+  .action(async (name, opts) => {
+    const body = {
+      name,
+      waitTimeout: parseInt(opts.waitTimeout, 10),
+      ...(opts.host ? { host: opts.host } : {}),
+    };
+    try {
+      const result = await brokerCall(opts.host, 'thread.wait', body, {
+        ...(opts.operationId ? { operationId: opts.operationId } : {}),
+      });
+      if (!result) {
+        console.error('Manual thread mailboxes require the remote broker');
+        process.exit(1);
+      }
+      console.log(JSON.stringify(result, null, 2));
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
+  });
+
+program
+  .command('thread-mailbox-ack <messageId>')
+  .description('Acknowledge one mailbox message as read')
+  .option('--host <alias>', 'Configured execution-host alias')
+  .option('--operation-id <id>', 'Stable broker operation id')
+  .action(async (messageId, opts) => {
+    const body = { messageId, ...(opts.host ? { host: opts.host } : {}) };
+    try {
+      const result = await brokerCall(opts.host, 'thread.ack', body, remoteOptions(opts));
+      if (!result) {
+        console.error('Manual thread mailboxes require the remote broker');
+        process.exit(1);
+      }
+      console.log(JSON.stringify(result, null, 2));
+    } catch (err) {
+      console.error((err as Error).message);
+      process.exit(1);
+    }
   });
 
 // An action that throws (an unreadable --message-file, a contract that is not

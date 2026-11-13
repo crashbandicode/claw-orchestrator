@@ -30,6 +30,7 @@
  */
 import crossSpawn from 'cross-spawn';
 import { statSync } from 'node:fs';
+import { guardChildStreams } from './child-process-guard.js';
 import { isAbsolute, join, resolve as resolvePath } from 'node:path';
 import { execFileSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
 
@@ -154,13 +155,20 @@ export function spawnEngine(
   // directory, and some engines trust PWD: opencode resolves its project from
   // it, so a session started by a server ran in the server's directory.
   const env = cwd ? { ...(spawnOptions.env ?? process.env), PWD: resolvePath(cwd) } : (spawnOptions.env ?? process.env);
-  if (launcher && launcher.length > 0) {
-    // The launcher is what gets spawned, so it decides whether this argv goes
-    // through cmd.exe.
-    const [head, ...rest] = launcher;
-    return crossSpawn(head, prepareArgs(head, [...rest, bin, ...args], env, cwd), { ...spawnOptions, env });
-  }
-  return crossSpawn(bin, prepareArgs(bin, args, env, cwd), { ...spawnOptions, env });
+  const child =
+    launcher && launcher.length > 0
+      ? // The launcher is what gets spawned, so it decides whether this argv goes
+        // through cmd.exe.
+        crossSpawn(
+          launcher[0],
+          prepareArgs(launcher[0], [...launcher.slice(1), bin, ...args], env, cwd),
+          { ...spawnOptions, env },
+        )
+      : crossSpawn(bin, prepareArgs(bin, args, env, cwd), { ...spawnOptions, env });
+  // A stream `error` with no listener is an uncaught exception. The broker hosts
+  // every session, so one closed pipe must not end the process.
+  guardChildStreams(child);
+  return child;
 }
 
 export interface ExecEngineOptions {
@@ -214,6 +222,7 @@ export function execEngine(bin: string, args: string[], opts: ExecEngineOptions 
         stdio: ['ignore', 'pipe', 'pipe'],
         windowsHide: true,
       });
+      guardChildStreams(child);
     } catch (e) {
       reject(e instanceof Error ? e : new Error(String(e)));
       return;

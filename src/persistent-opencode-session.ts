@@ -34,9 +34,12 @@
  */
 
 import { execEngine, killEngineTree, spawnEngine } from './engine-spawn.js';
+import type { ChildProcess } from 'node:child_process';
+import * as net from 'node:net';
+import { randomBytes } from 'node:crypto';
 import * as readline from 'node:readline';
 
-import type { SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
+import type { EffortLevel, SessionConfig, SessionSendOptions, StreamEvent, TurnResult } from './types.js';
 import { estimateTokens } from './models.js';
 import { sanitizeSecrets } from './sanitize.js';
 import { SESSION_EVENT } from './constants.js';
@@ -127,14 +130,55 @@ function opencodeVersion(bin: string): Promise<string | undefined> {
  *   - no `step_finish` event, so a turn reports no tokens and no cost;
  *   - the read-only agent could not be verified: with it, OpenCode's free
  *     tier answers 403 ("can only be used from within OpenCode").
- * Refusing up front is the honest answer until a stable V2 is wired and
- * measured; running it would silently drop effort, cost, and a read-only label.
+ * Stable 2.x puts effort on `provider/model#variant` and serves `/goal` over
+ * its HTTP API. A beta build still uses the variant form so `--variant` is not
+ * passed to a CLI that rejects it.
  */
 export function isOpencodeV2(version: string | undefined): boolean {
   if (!version) return false;
   if (/\b0\.0\.0-(beta|next|dev)/.test(version) || /\bopencode2\b/.test(version)) return true;
-  const m = version.match(/\b(\d+)\.\d+\.\d+/);
-  return !!m && Number(m[1]) >= 2;
+  return opencodeMajorFromVersion(version) >= 2;
+}
+
+/**
+ * Numeric major from `opencode --version`. `1.19.0` and `opencode v2.2.5` both
+ * count. A `0.0.0-beta` build stays on the 1.x command set: `/goal` is a 2.x
+ * stable command, and that beta string is not major 2.
+ */
+export function opencodeMajorFromVersion(version: string | undefined): number {
+  if (!version) return 1;
+  const match = /(?:^|\s)v?(\d+)\.\d+\.\d+/.exec(version);
+  if (!match) return 1;
+  const major = Number(match[1]);
+  return Number.isInteger(major) && major > 0 ? major : 1;
+}
+
+/**
+ * Arguments of an OpenCode 2 `/goal` command.
+ *
+ * `undefined` means the message is an ordinary prompt. An empty string is the
+ * status query. OpenCode 1 has no goal command, so the same text stays a prompt.
+ */
+export function opencodeGoalArguments(message: string, major: number): string | undefined {
+  if (major < 2) return undefined;
+  const match = /^\/goal(?:\s+([\s\S]*))?$/.exec(message.trim());
+  if (!match) return undefined;
+  return (match[1] ?? '').trim();
+}
+
+/** Split `provider/model` and an effort into the 2.x model reference. */
+export function opencodeModelRef(
+  model: string | undefined,
+  effort: EffortLevel | undefined,
+): { id: string; providerID: string; variant?: string } | undefined {
+  if (!model || !model.includes('/')) return undefined;
+  const base = model.split('#')[0];
+  const slash = base.indexOf('/');
+  const providerID = base.slice(0, slash);
+  const id = base.slice(slash + 1);
+  if (!providerID || !id) return undefined;
+  const variant = effort && effort !== 'auto' ? effort : undefined;
+  return variant ? { id, providerID, variant } : { id, providerID };
 }
 
 // ─── PersistentOpencodeSession ──────────────────────────────────────────────
@@ -152,6 +196,13 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
    * conversation of its own.
    */
   private opencodeSessionId?: string;
+  /** True when `opencode --version` is 2.x or a 0.0.0-beta/next build. */
+  private opencodeV2 = false;
+  /** Numeric major used to recognize `/goal`. Beta `0.0.0` stays at 1. */
+  private opencodeMajor = 1;
+  /** Private `opencode serve` used only while a 2.x `/goal` command is in flight. */
+  private goalApi?: { port: number; password: string; proc: ChildProcess };
+  private lastGoalEvent = '';
 
   /**
    * Spend opencode reported itself, summed over every `step_finish.cost`.
@@ -167,12 +218,8 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
 
   override async start(): Promise<this> {
     const version = await opencodeVersion(this.engineBin);
-    if (isOpencodeV2(version)) {
-      throw new Error(
-        `OpenCode 2 (${version}) is not supported yet: it drops the per-turn usage events and the --variant flag ` +
-          'this engine relies on, and its read-only agent is unverified. claw-orchestrator is tested with OpenCode 1.x.',
-      );
-    }
+    this.opencodeV2 = isOpencodeV2(version);
+    this.opencodeMajor = opencodeMajorFromVersion(version);
     return super.start();
   }
 
@@ -209,7 +256,306 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
     super._cleanupProc();
   }
 
+  private _modelArgs(turnEffort?: EffortLevel): string[] {
+    const configured = this.options.model && this.options.model.includes('/') ? this.options.model : undefined;
+    const effort = turnEffort ?? this.options.effort;
+    const variant = effort && effort !== 'auto' ? effort : undefined;
+    if (this.opencodeV2) {
+      if (!configured) return [];
+      const base = configured.split('#')[0];
+      return ['--model', variant ? `${base}#${variant}` : configured];
+    }
+    const args: string[] = [];
+    if (configured) args.push('--model', configured);
+    if (variant) args.push('--variant', variant);
+    return args;
+  }
+
+  private _autoApproves(): boolean {
+    const readOnly = this.options.sandboxMode === 'read-only';
+    return (
+      !readOnly &&
+      this.options.permissionMode !== 'plan' &&
+      (this.options.permissionMode === 'bypassPermissions' ||
+        this.options.permissionMode === 'auto' ||
+        !!this.options.dangerouslySkipPermissions ||
+        !!this.options.enableAutoMode)
+    );
+  }
+
+  private _stopGoalServer(): void {
+    const proc = this.goalApi?.proc;
+    this.goalApi = undefined;
+    if (!proc || proc.killed) return;
+    killEngineTree(proc);
+  }
+
+  private async _startGoalServer(): Promise<void> {
+    if (this.goalApi) return;
+    const port = await new Promise<number>((resolve, reject) => {
+      const server = net.createServer();
+      server.once('error', reject);
+      server.listen(0, '127.0.0.1', () => {
+        const address = server.address();
+        const chosen = address && typeof address === 'object' ? address.port : 0;
+        server.close(() => resolve(chosen));
+      });
+    });
+    const password = randomBytes(16).toString('hex');
+    const proc = spawnEngine(this.engineBin, ['serve', '--hostname', '127.0.0.1', '--port', String(port)], {
+      launcher: this.options.launcher,
+      cwd: this.options.cwd,
+      env: {
+        ...process.env,
+        OPENCODE_SERVER_PASSWORD: password,
+        OPENCODE_DISABLE_PROJECT_CONFIG: '1',
+      },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stderr = '';
+    let ready = false;
+    proc.stderr?.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
+    this.goalApi = { port, password, proc };
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error('OpenCode serve did not start')), 20_000);
+        let stdout = '';
+        proc.stdout?.on('data', (chunk: Buffer) => {
+          stdout += chunk.toString();
+          if (!ready && stdout.includes('listening')) {
+            ready = true;
+            clearTimeout(timer);
+            resolve();
+          }
+        });
+        proc.once('exit', (code) => {
+          if (ready) return;
+          clearTimeout(timer);
+          reject(new Error(sanitizeSecrets(stderr).slice(0, 500) || `OpenCode serve exited ${code}`));
+        });
+      });
+    } catch (error) {
+      this._stopGoalServer();
+      throw error;
+    }
+  }
+
+  private async _goalFetch(path: string, init: RequestInit = {}): Promise<Response> {
+    const api = this.goalApi;
+    if (!api) throw new Error('OpenCode goal server is not running');
+    const headers = new Headers(init.headers);
+    headers.set('Authorization', `Basic ${Buffer.from(`opencode:${api.password}`).toString('base64')}`);
+    headers.set('x-opencode-directory', this.options.cwd || process.cwd());
+    if (init.body) headers.set('Content-Type', 'application/json');
+    return fetch(`http://127.0.0.1:${api.port}${path}`, { ...init, headers });
+  }
+
+  private async _responseMessage(response: Response): Promise<string> {
+    const text = await response.text();
+    if (!text) return '';
+    try {
+      const body = JSON.parse(text) as { message?: unknown };
+      return typeof body.message === 'string' ? body.message : text.slice(0, 500);
+    } catch {
+      return text.slice(0, 500);
+    }
+  }
+
+  private _sessionIdFrom(body: unknown): string | undefined {
+    if (!body || typeof body !== 'object') return undefined;
+    const record = body as { id?: unknown; data?: { id?: unknown } };
+    if (typeof record.id === 'string') return record.id;
+    if (typeof record.data?.id === 'string') return record.data.id;
+    return undefined;
+  }
+
+  private async _ensureGoalSession(): Promise<void> {
+    if (this.opencodeSessionId) return;
+    const response = await this._goalFetch('/api/session', {
+      method: 'POST',
+      body: JSON.stringify({
+        title: this.options.name || 'opencode-goal',
+        location: { directory: this.options.cwd || process.cwd() },
+      }),
+    });
+    const text = await response.text();
+    let body: unknown = {};
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = {};
+    }
+    const id = this._sessionIdFrom(body);
+    if (!response.ok || !id) {
+      throw new Error(sanitizeSecrets(text).slice(0, 500) || `OpenCode did not create a session (${response.status})`);
+    }
+    this.opencodeSessionId = id;
+    if (!this.sessionId?.startsWith('opencode-live-')) {
+      this.sessionId = `opencode-live-${id}`;
+      this.emit(SESSION_EVENT.NATIVE_IDENTITY, id);
+    }
+  }
+
+  private async _selectGoalModel(effort: EffortLevel | undefined): Promise<void> {
+    const ref = opencodeModelRef(this.options.model, effort ?? this.options.effort);
+    if (!ref || !this.opencodeSessionId) return;
+    const response = await this._goalFetch(`/api/session/${this.opencodeSessionId}/model`, {
+      method: 'POST',
+      body: JSON.stringify({ model: ref }),
+    });
+    if (!response.ok) {
+      throw new Error(
+        sanitizeSecrets(await this._responseMessage(response)) || `OpenCode rejected the model (${response.status})`,
+      );
+    }
+  }
+
+  private async _goalStatusMessage(): Promise<string> {
+    const response = await this._goalFetch(`/api/session/${this.opencodeSessionId}/command`, {
+      method: 'POST',
+      body: JSON.stringify({ name: 'goal', text: '' }),
+    });
+    return this._responseMessage(response);
+  }
+
+  private async _postGoal(text: string, signal: AbortSignal): Promise<string> {
+    const response = await this._goalFetch(`/api/session/${this.opencodeSessionId}/command`, {
+      method: 'POST',
+      body: JSON.stringify({ name: 'goal', text }),
+      signal,
+    });
+    const message = await this._responseMessage(response);
+    if (!response.ok && !message.startsWith('Goal ') && !message.startsWith('No ') && !message.startsWith('Usage:')) {
+      throw new Error(sanitizeSecrets(message) || `OpenCode /goal failed (${response.status})`);
+    }
+    return message;
+  }
+
+  private async _approveGoalPermission(event: { type?: string; data?: Record<string, unknown> }): Promise<void> {
+    if (!this._autoApproves() || event.type !== 'permission.asked' || !event.data) return;
+    const id = event.data.id;
+    const sessionID = event.data.sessionID;
+    if (typeof id !== 'string' || typeof sessionID !== 'string' || sessionID !== this.opencodeSessionId) return;
+    const response = await this._goalFetch(`/api/session/${sessionID}/permission/${id}/reply`, {
+      method: 'POST',
+      body: JSON.stringify({ decision: 'once' }),
+    });
+    if (!response.ok) {
+      throw new Error(
+        sanitizeSecrets(await this._responseMessage(response)) || `OpenCode permission reply failed (${response.status})`,
+      );
+    }
+  }
+
+  private async _watchGoal(signal: AbortSignal, ready: () => boolean): Promise<string> {
+    const response = await this._goalFetch('/api/event', { signal });
+    if (!response.ok || !response.body) throw new Error(`OpenCode event stream failed (${response.status})`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    try {
+      while (!signal.aborted) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const chunks = buffer.split('\n\n');
+        buffer = chunks.pop() ?? '';
+        for (const chunk of chunks) {
+          const data = chunk
+            .split('\n')
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trim())
+            .join('');
+          if (!data) continue;
+          let event: { type?: string; data?: Record<string, unknown> };
+          try {
+            event = JSON.parse(data) as { type?: string; data?: Record<string, unknown> };
+          } catch {
+            continue;
+          }
+          if (event.type) this.lastGoalEvent = event.type;
+          const sessionID = event.data?.sessionID;
+          if (typeof sessionID === 'string' && sessionID !== this.opencodeSessionId) continue;
+          await this._approveGoalPermission(event);
+          if (!ready()) continue;
+          if (
+            event.type !== 'session.idle' &&
+            event.type !== 'session.execution.succeeded' &&
+            event.type !== 'session.execution.failed' &&
+            event.type !== 'session.execution.interrupted'
+          ) {
+            continue;
+          }
+          const message = await this._goalStatusMessage();
+          if (!message.startsWith('Goal active')) return message;
+        }
+      }
+    } finally {
+      await reader.cancel().catch(() => undefined);
+    }
+    const message = await this._goalStatusMessage();
+    if (!message.startsWith('Goal active')) return message;
+    throw new Error(`OpenCode goal is still active (${this.lastGoalEvent || 'no events'})`);
+  }
+
+  private _finishGoal(text: string): TurnResult {
+    this._recordTurnComplete(true);
+    this._addHistory({ text, code: 0 });
+    const event: StreamEvent = { type: 'result', result: text, stop_reason: 'end_turn' };
+    this.emit(SESSION_EVENT.RESULT, event);
+    this.emit(SESSION_EVENT.TURN_COMPLETE, event);
+    return { text, event };
+  }
+
+  private async _runGoal(text: string, options: SessionSendOptions): Promise<TurnResult> {
+    const timeout = options.timeout || 300_000;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
+    let posted = false;
+    let watching: Promise<string> = Promise.resolve('');
+    try {
+      await this._startGoalServer();
+      await this._ensureGoalSession();
+      await this._selectGoalModel(options.effort);
+      watching = this._watchGoal(controller.signal, () => posted).catch((error: unknown) => {
+        if (controller.signal.aborted) return '';
+        throw error;
+      });
+      const message = await this._postGoal(text, controller.signal);
+      posted = true;
+      const immediate = text === '' || /^(?:pause|clear)$/i.test(text);
+      const status = immediate ? message : await this._goalStatusMessage();
+      if (immediate || !status.startsWith('Goal active')) {
+        controller.abort();
+        await watching;
+        return this._finishGoal(status || message);
+      }
+      const settled = await watching;
+      return this._finishGoal(settled || status);
+    } catch (error) {
+      const timedOut = controller.signal.aborted;
+      controller.abort();
+      await watching.catch(() => undefined);
+      if (this.opencodeSessionId && this.goalApi) {
+        await this._goalFetch(`/api/session/${this.opencodeSessionId}/interrupt`, { method: 'POST' }).catch(
+          () => undefined,
+        );
+      }
+      this._recordTurnComplete(false);
+      const reason = error instanceof Error ? error.message : String(error);
+      if (timedOut) throw new Error(`Timeout waiting for OpenCode goal (${this.lastGoalEvent || 'no events'})`);
+      throw new Error(sanitizeSecrets(reason));
+    } finally {
+      clearTimeout(timer);
+      this._stopGoalServer();
+    }
+  }
+
   protected _run(message: string, options: SessionSendOptions): Promise<TurnResult> {
+    const goalText = opencodeGoalArguments(message, this.opencodeMajor);
+    if (goalText !== undefined) return this._runGoal(goalText, options);
     // opencode run --format json [--session <id>], with the message on stdin.
     // On Windows `opencode` is an npm `.cmd` shim that runs through cmd.exe,
     // which would cut a message at its first newline; stdin carries it unchanged.
@@ -231,21 +577,11 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
       // edit/bash/external_directory outright, so read-only is enforced by the
       // permission engine rather than requested politely.
       args.push('--agent', READ_ONLY_AGENT);
+    } else if (this._autoApproves()) {
+      args.push('--auto');
     }
 
-    // opencode wants `provider/model` format. Only pass through if it looks correct.
-    if (this.options.model && this.options.model.includes('/')) {
-      args.push('--model', this.options.model);
-    }
-
-    // `--variant` is opencode's reasoning-effort knob ("provider-specific
-    // reasoning effort, e.g., high, max, minimal"). Before this the engine
-    // received no effort at all and every caller's setting was dropped on the
-    // floor. opencode does not validate the value — an unknown one runs the
-    // turn at the provider's default rather than failing — so the level a
-    // provider does not offer degrades instead of erroring.
-    const effort = options.effort ?? this.options.effort;
-    if (effort && effort !== 'auto') args.push('--variant', effort);
+    args.push(...this._modelArgs(options.effort));
 
     const timeout = options.timeout || 300_000;
 
@@ -399,7 +735,10 @@ export class PersistentOpencodeSession extends BaseOneShotSession {
     // id is kept separately because that is the form `--session` expects; the
     // prefixed one is our display/persistence handle.
     const sid = (event.sessionID as string) || (event.sessionId as string) || (event.session_id as string);
-    if (sid && !this.opencodeSessionId) this.opencodeSessionId = sid;
+    if (sid && !this.opencodeSessionId) {
+      this.opencodeSessionId = sid;
+      this.emit(SESSION_EVENT.NATIVE_IDENTITY, sid);
+    }
     if (sid && !this.sessionId?.startsWith('opencode-live-')) {
       this.sessionId = `opencode-live-${sid}`;
     }

@@ -227,6 +227,17 @@ export class Fanout {
         maxBudgetUsd: this.config.maxBudgetUsd,
         customEngine: spec.customEngine,
         ...(spec.acpAgent === undefined ? {} : { acpAgent: spec.acpAgent }),
+        orchestration: {
+          runId: this.session.id,
+          runKind: 'fanout',
+          agentKey: spec.name,
+          agentName: spec.name,
+          codename: spec.name,
+          engine,
+          model: spec.model,
+          effort: spec.effort,
+          cwd,
+        },
       });
       const before = this._stats(sessionName);
       const result = await this.manager.sendMessage(sessionName, agentMessage(spec, this.config.task), {
@@ -311,6 +322,16 @@ export class Fanout {
         engine: this.config.synthesisEngine || 'claude',
         model: this.config.synthesisModel,
         ...(this.config.synthesisAcpAgent === undefined ? {} : { acpAgent: this.config.synthesisAcpAgent }),
+        orchestration: {
+          runId: this.session.id,
+          runKind: 'fanout',
+          agentKey: 'synthesis',
+          agentName: 'synthesis',
+          codename: 'synthesis',
+          engine: this.config.synthesisEngine || 'claude',
+          model: this.config.synthesisModel,
+          cwd: this.config.projectDir,
+        },
         permissionMode: this.config.synthesisPermissionMode ?? 'bypassPermissions',
         maxTurns: this.config.maxTurnsPerAgent ?? DEFAULT_MAX_TURNS,
         maxBudgetUsd: this.config.maxBudgetUsd,

@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.22.1-memento.2] - 2026-11-12
+
+### Added
+
+- **OpenCode 2 `/goal`.** A `/goal` message on OpenCode 2 starts a private local `opencode serve` and drives the goal command over its HTTP API. Ordinary prompts stay on stdin. Effort on 2.x is `provider/model#variant`.
+- **Codex MCP keep-list.** `codexMcpServers` with `ignoreUserConfig` keeps named servers and disables the rest. A bad selection does not trip the engine circuit breaker.
+- **Cursor effort.** A requested effort selects a catalog model id, including parameterized models discovered without opening a chat.
+- **Native session identity and an orchestration outbox.** Claude, Cursor, and OpenCode publish the id they can resume. Fanout and council children are recorded as part of their run.
+- **Codex `/side`.** `codex_side` asks one question on an ephemeral fork and leaves the parent thread in place. The broker method is `session.side`.
+
+## [7.22.1-memento.1] - 2026-11-12
+
+### Added
+
+- **A registered manual thread can be started.** `session.start` on a mailbox name resumes that thread's native session and becomes its managed owner. `inbox.deliver` starts the thread when its provider is known, then delivers queued mail. `thread.send` to a live owner delivers instead of refusing. A second live owner of the same name or native session is still refused.
+- **The execution-host broker on upstream 7.22.1.** `clawo remote-broker` owns one SessionManager on an owner-only Unix socket, with durable mailbox mail and remote routing for session and inbox tools.
+- **`cursor_goal_set`.** Sends `/goal <objective>` to a cursor session.
+- **Windows Cursor launch without PowerShell 5.1.** A `cursor-agent.cmd` / `.ps1` wrapper is resolved to that install's `node.exe` and `index.js`.
+
+### Fixed
+
+- **One closed engine pipe does not end the process.** Spawned engine CLIs listen for stream errors.
+- **Cross-session mail keeps its host and message id** on the envelope when the broker has them.
+
 ## [Unreleased]
 
 ### Fixed

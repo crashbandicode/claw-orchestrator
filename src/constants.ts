@@ -124,6 +124,8 @@ export const SESSION_EVENT = {
   USER_ECHO: 'user_echo',
   ASSISTANT: 'assistant',
   EVENT: 'event',
+  /** The engine published the native session id it can resume. */
+  NATIVE_IDENTITY: 'native_identity',
 } as const;
 
 export type SessionEventName = (typeof SESSION_EVENT)[keyof typeof SESSION_EVENT];

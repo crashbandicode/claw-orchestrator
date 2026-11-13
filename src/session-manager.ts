@@ -61,10 +61,10 @@ interface PersistedSession {
   lastActivity: number;
 }
 
-function loadPersistedSessions(): Map<string, PersistedSession> {
+function loadPersistedSessions(file: string = PERSIST_FILE): Map<string, PersistedSession> {
   try {
-    if (!fs.existsSync(PERSIST_FILE)) return new Map();
-    const raw = fs.readFileSync(PERSIST_FILE, 'utf8');
+    if (!fs.existsSync(file)) return new Map();
+    const raw = fs.readFileSync(file, 'utf8');
     const arr: PersistedSession[] = JSON.parse(raw);
     const now = Date.now();
     // Filter out entries older than disk TTL
@@ -93,20 +93,21 @@ function savePersistedSessions(
   mine: Map<string, PersistedSession>,
   dirty: Set<string>,
   logger?: Logger,
+  file: string = PERSIST_FILE,
 ): Map<string, PersistedSession> | undefined {
   const log = logger || createConsoleLogger('SessionManager');
   try {
-    fs.mkdirSync(PERSIST_DIR, { recursive: true });
-    const result = withFileLock(`${PERSIST_FILE}.lock`, () => {
-      const merged = loadPersistedSessions();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    const result = withFileLock(`${file}.lock`, () => {
+      const merged = loadPersistedSessions(file);
       for (const name of dirty) {
         const entry = mine.get(name);
         if (entry) merged.set(name, entry);
         else merged.delete(name);
       }
-      const tmp = `${PERSIST_FILE}.${process.pid}.tmp`;
+      const tmp = `${file}.${process.pid}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify(Array.from(merged.values()), null, 2));
-      fs.renameSync(tmp, PERSIST_FILE);
+      fs.renameSync(tmp, file);
       return merged;
     });
     if (!result.ok) {
@@ -206,6 +207,11 @@ import {
   type SessionConfig,
   type SessionInfo,
   type SendOptions,
+  type OrchestrationAgentContext,
+  type OrchestrationAgentStatus,
+  type OrchestrationRunStatus,
+  PARENT_TOOL_IDS,
+  type ParentToolId,
   type PermissionDenial,
   type GeneratedImage,
   type SendResult,
@@ -236,7 +242,10 @@ import { isAgyConversationId } from './agy-conversation.js';
 import { Council } from './council.js';
 import { Fanout, type FanoutConfig, type FanoutSession, type FanoutAgentSpec } from './fanout.js';
 import { AutoloopRunner, type AutoloopInputSnapshot } from './autoloop/runner.js';
-import { boundedErrorReason } from './sanitize.js';
+import { boundedErrorReason, sanitizeSecrets } from './sanitize.js';
+import { OrchestrationEventWriter } from './orchestration-events.js';
+import { CodexMcpConfigError, validateCodexMcpSelection } from './codex-mcp.js';
+import { parentSessionIdFromDelegateMarker } from './remote/delegate-marker.js';
 import { ClaudeAgentDispatcher, type ClaudeAgentDispatcherConfig } from './autoloop/dispatcher.js';
 import type { AutoloopState, PushPolicy } from './autoloop/types.js';
 import {
@@ -289,6 +298,10 @@ interface ManagedSession {
    * thrown send still unblocks waiters.
    */
   sendChain?: Promise<unknown>;
+  orchestration?: OrchestrationAgentContext;
+  orchestrationBoundNativeId?: string;
+  orchestrationLastStatus?: OrchestrationAgentStatus;
+  nativeIdentityListener?: (...args: unknown[]) => void;
   /**
    * Latched once cumulative spend reaches `config.maxBudgetUsd`. The gate in
    * sendMessage re-derives this from getCost() anyway; the flag exists so the
@@ -1087,9 +1100,37 @@ export class SessionManager {
   private _ultraappManager: UltraappManager | null = null;
   private _ultraappRouter: UltraappRouter | null = null;
   private _ultraappRuntimeMode: 'host' | 'docker' = 'host';
+  private readonly _persistFile: string;
+  private readonly _pidFile: string;
+  private readonly _sessionHolds = new Map<string, number>();
+  private _orchestrationEvents!: OrchestrationEventWriter;
+  private readonly _startedOrchestrationRuns = new Map<string, OrchestrationAgentContext>();
 
-  constructor(config?: Partial<PluginConfig>, logger?: Logger) {
+  constructor(config?: Partial<PluginConfig> & { stateDirectory?: string }, logger?: Logger) {
+    if (config?.stateDirectory !== undefined) {
+      if (!path.isAbsolute(config.stateDirectory)) throw new Error('stateDirectory must be an absolute path');
+      this._persistFile = path.join(config.stateDirectory, 'claude-sessions.json');
+      this._pidFile = path.join(config.stateDirectory, 'session-pids.json');
+    } else {
+      this._persistFile = PERSIST_FILE;
+      this._pidFile = SessionManager.PID_FILE;
+    }
+    const fromEnv = process.env.CLAWO_MAX_CONCURRENT_SESSIONS?.trim();
+    const maxConcurrentSessions =
+      config?.maxConcurrentSessions ?? (fromEnv === undefined || fromEnv === '' ? 5 : Number(fromEnv));
+    if (!Number.isSafeInteger(maxConcurrentSessions) || maxConcurrentSessions < 0) {
+      throw new Error(
+        'maxConcurrentSessions / CLAWO_MAX_CONCURRENT_SESSIONS must be a non-negative integer (0 = unlimited)',
+      );
+    }
     this.logger = logger || createConsoleLogger('SessionManager');
+    const outbox =
+      process.env.CLAWO_MEMENTO_OUTBOX ||
+      (process.env.VITEST ? path.join(os.tmpdir(), `clawo-memento-events-${process.pid}`, 'events.jsonl') : undefined);
+    this._orchestrationEvents = new OrchestrationEventWriter(
+      { orchestratorVersion: getPluginVersion(), ...(outbox ? { outboxFile: outbox } : {}) },
+      this.logger,
+    );
     this.pluginConfig = {
       // CLAUDE_BIN is what PersistentClaudeSession already honours when it gets no
       // explicit binary; the manager always passed one, so the variable was dead.
@@ -1097,7 +1138,7 @@ export class SessionManager {
       defaultModel: config?.defaultModel,
       defaultPermissionMode: config?.defaultPermissionMode || 'acceptEdits',
       defaultEffort: config?.defaultEffort || 'auto',
-      maxConcurrentSessions: config?.maxConcurrentSessions || 5,
+      maxConcurrentSessions,
       sessionTtlMinutes: config?.sessionTtlMinutes || 120,
     };
 
@@ -1107,7 +1148,7 @@ export class SessionManager {
     }
 
     // Load persisted session registry from disk
-    this.persistedSessions = loadPersistedSessions();
+    this.persistedSessions = loadPersistedSessions(this._persistFile);
     // Clean up orphaned child processes from a previous unclean exit
     this._cleanupOrphanedPids();
     // Debounced async writer — at most one write per 5 seconds on hot paths
@@ -1195,8 +1236,9 @@ export class SessionManager {
     }
   }
 
-  /** Session slots a new start could take right now. */
+  /** Session slots a new start could take right now. Zero means unlimited. */
   freeSessionSlots(): number {
+    if (this.pluginConfig.maxConcurrentSessions === 0) return Number.POSITIVE_INFINITY;
     return Math.max(0, this.pluginConfig.maxConcurrentSessions - this.sessions.size - this._startsInFlight);
   }
 
@@ -1275,9 +1317,23 @@ export class SessionManager {
     // config (agy resume-id lookups, _persistSession's registry entry) see the
     // real engine even when it came from the persisted registry.
     fullConfig.engine = engine;
+    const orchestration = this._normalizeOrchestrationContext(name, fullConfig, engine);
+    fullConfig.orchestration = orchestration;
+    this._ensureOrchestrationRunStarted(orchestration);
+    this._orchestrationEvents.emit('agent.declared', orchestration, { agentStatus: 'declared' });
+    const failOrchestration = (): void => {
+      this._orchestrationEvents.emit('agent.status', orchestration, { agentStatus: 'failed' });
+      if (orchestration.runKind === 'session') this._emitOrchestrationRunStatus(orchestration, 'failed');
+    };
 
     // Circuit breaker — reject early if engine is in backoff
-    this._circuitBreaker.check(engine);
+    try {
+      this._circuitBreaker.check(engine);
+      validateCodexMcpSelection(fullConfig, engine);
+    } catch (err) {
+      failOrchestration();
+      throw err;
+    }
 
     // The Claude account the session runs under, resolved before anything spawns:
     // a missing credential fails the start instead of falling back to another login.
@@ -1298,15 +1354,23 @@ export class SessionManager {
         }
       }
     }
-    const session = this._createSession(engine, fullConfig);
+    let session: ISession;
+    try {
+      session = this._createSession(engine, fullConfig);
+    } catch (err) {
+      failOrchestration();
+      throw err;
+    }
     if (account && session instanceof PersistentClaudeSession) session.setAccountEnv(account.env);
 
     session.on(SESSION_EVENT.LOG, (...args: unknown[]) => this.logger.info(`[Session:${name}]`, ...args));
+    this._guardSessionEvents(name, session);
 
     try {
       await session.start();
     } catch (err) {
-      this._circuitBreaker.recordFailure(engine);
+      if (!(err instanceof CodexMcpConfigError)) this._circuitBreaker.recordFailure(engine);
+      failOrchestration();
       throw err;
     }
 
@@ -1330,6 +1394,8 @@ export class SessionManager {
       claudeSessionId: this._sessionResumeId(engine, session),
       skipPersistence: skipPersist,
       ...(account ? { account: account.name } : {}),
+      orchestration,
+      orchestrationLastStatus: 'idle',
     };
 
     release();
@@ -1340,6 +1406,10 @@ export class SessionManager {
     if (!skipPersist) {
       this._persistSession(name, managed);
     }
+
+    this._wireNativeIdentity(managed);
+    this._bindOrchestrationIdentity(managed);
+    this._setOrchestrationAgentStatus(managed, 'idle');
 
     return this._toSessionInfo(name, managed);
   }
@@ -1457,6 +1527,8 @@ export class SessionManager {
       let turnError: string | undefined;
 
       try {
+        if (managed.orchestration) this._noteDelegateMarker(managed, message);
+        if (managed.orchestration) this._setOrchestrationAgentStatus(managed, 'running');
         // A session handed off from another engine carries that conversation in
         // front of its first message; after that the engine holds it itself.
         const outgoing = managed.pendingHandoff ? `${managed.pendingHandoff}\n\n${message}` : message;
@@ -1537,6 +1609,7 @@ export class SessionManager {
         turnError = (err as Error).message;
         throw err;
       } finally {
+        if (managed.orchestration) this._setOrchestrationAgentStatus(managed, turnError ? 'failed' : 'idle');
         this._recordRunTurn(name, managed, ledgerBefore, startedAt, turnError, options.parentRunId, {
           nodeKind: options.nodeKind,
           taskKind: options.taskKind,
@@ -1878,6 +1951,17 @@ export class SessionManager {
           },
         }),
       );
+      kernel.on('kernel-event', ({ runId, event }: { runId: string; event: KernelEvent }) => {
+        if (event.type !== 'run_state' || !['completed', 'failed', 'cancelled'].includes(event.state)) return;
+        const context = this._startedOrchestrationRuns.get(runId);
+        const workflow = context?.runKind ?? kernel.get(runId)?.workflow;
+        if (!workflow || !['council', 'fanout', 'autoloop', 'ultraplan', 'ultrareview'].includes(workflow)) return;
+        this.recordOrchestrationRunStatus(
+          runId,
+          workflow as OrchestrationAgentContext['runKind'],
+          event.state === 'cancelled' ? 'aborted' : event.state === 'failed' ? 'failed' : 'completed',
+        );
+      });
       this._kernel = kernel;
     }
     return this._kernel;
@@ -2003,6 +2087,7 @@ export class SessionManager {
 
   async stopSession(name: string, opts: { keepPersisted?: boolean } = {}): Promise<void> {
     const managed = this._getSession(name);
+    this._finishOrchestration(managed);
     managed.session.stop();
     this._removeSession(name);
     // Remove PID tracking
@@ -2023,6 +2108,25 @@ export class SessionManager {
 
   hasSession(name: string): boolean {
     return this.sessions.has(name);
+  }
+
+  /** Keep an idle session alive while a broker operation is delivering to it. */
+  holdSession(name: string): void {
+    this._sessionHolds.set(name, (this._sessionHolds.get(name) ?? 0) + 1);
+  }
+
+  releaseSessionHold(name: string): void {
+    const count = (this._sessionHolds.get(name) ?? 1) - 1;
+    if (count <= 0) this._sessionHolds.delete(name);
+    else this._sessionHolds.set(name, count);
+  }
+
+  hasLiveSession(name: string): boolean {
+    return this.sessions.has(name);
+  }
+
+  isSessionBusy(name: string): boolean {
+    return this.sessions.get(name)?.session.isBusy ?? false;
   }
 
   listSessions(): SessionInfo[] {
@@ -2819,6 +2923,40 @@ export class SessionManager {
     return await this.sendMessage(name, '/goal', { timeout: timeoutMs });
   }
 
+  private _assertCursorSession(name: string): void {
+    const managed = this.sessions.get(name);
+    if (!managed) throw new Error(`Session not found: ${name}`);
+    const engine = managed.config.engine || 'claude';
+    if (engine !== 'cursor') {
+      throw new Error(
+        `Session "${name}" uses engine "${engine}" which does not support Cursor /goal. ` +
+          `Start a session with engine: "cursor" to use cursor_goal_set.`,
+      );
+    }
+  }
+
+  /** Send `/goal <objective>` to a cursor session. The process continues until the goal ends. */
+  async cursorGoalSet(name: string, objective: string, timeoutMs?: number): Promise<unknown> {
+    const trimmed = typeof objective === 'string' ? objective.trim() : '';
+    if (!trimmed) throw new Error('Cursor /goal requires an objective');
+    this._assertCursorSession(name);
+    return await this.sendMessage(name, `/goal ${trimmed}`, { timeout: timeoutMs });
+  }
+
+  /** Ask one question on an ephemeral Codex side fork. The parent thread stays put. */
+  async codexSide(name: string, prompt: string, timeoutMs?: number): Promise<Record<string, unknown>> {
+    const managed = this.sessions.get(name);
+    if (!managed) throw new Error(`Session not found: ${name}`);
+    const session = managed.session as {
+      side?: (prompt: string, timeoutMs?: number) => Promise<Record<string, unknown>>;
+    };
+    if (typeof session.side !== 'function') {
+      throw new Error(`Session "${name}" does not support Codex /side. Start it with engine: "codex-app".`);
+    }
+    const result = await session.side(prompt, timeoutMs);
+    return { ok: true, ...result };
+  }
+
   // ─── Plugin Details (CLI 2.1.139) ─────────────────────────────────────
 
   /**
@@ -3246,7 +3384,7 @@ export class SessionManager {
   /** Merge this process's changes into the shared file and adopt the merged view. */
   private _savePersisted(): void {
     if (this._persistDirty.size === 0) return;
-    const merged = savePersistedSessions(this.persistedSessions, this._persistDirty, this.logger);
+    const merged = savePersistedSessions(this.persistedSessions, this._persistDirty, this.logger, this._persistFile);
     if (merged) this.persistedSessions = merged;
   }
 
@@ -3285,6 +3423,8 @@ export class SessionManager {
 
   /** Take a session out of memory, with the goal adapter listening to it. */
   private _removeSession(name: string): void {
+    const managed = this.sessions.get(name);
+    if (managed) this._unwireNativeIdentity(managed);
     this._claudeGoals.get(name)?.detach();
     this._claudeGoals.delete(name);
     this.sessions.delete(name);
@@ -3298,7 +3438,7 @@ export class SessionManager {
 
   private _savePids(): void {
     try {
-      const dir = path.dirname(SessionManager.PID_FILE);
+      const dir = path.dirname(this._pidFile);
       if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
       // The PID file is host-shared: any SessionManager (gateway, dashboard,
       // standalone test runner) writes here. We MUST NOT overwrite entries
@@ -3307,7 +3447,7 @@ export class SessionManager {
       // they're orphans and kill them. Read-merge-write keyed by ownerPid.
       let existing: Record<string, unknown> = {};
       try {
-        existing = JSON.parse(fs.readFileSync(SessionManager.PID_FILE, 'utf8')) as Record<string, unknown>;
+        existing = JSON.parse(fs.readFileSync(this._pidFile, 'utf8')) as Record<string, unknown>;
       } catch {
         /* missing or malformed — start fresh */
       }
@@ -3341,7 +3481,7 @@ export class SessionManager {
         const command = this._pidCommands.get(pid);
         merged[name] = { pid, ownerPid: process.pid, since: now, ...(command ? { command } : {}) };
       }
-      fs.writeFileSync(SessionManager.PID_FILE, JSON.stringify(merged));
+      fs.writeFileSync(this._pidFile, JSON.stringify(merged));
     } catch {
       /* best effort */
     }
@@ -3376,8 +3516,8 @@ export class SessionManager {
 
   private _cleanupOrphanedPids(): void {
     try {
-      if (!fs.existsSync(SessionManager.PID_FILE)) return;
-      const data = JSON.parse(fs.readFileSync(SessionManager.PID_FILE, 'utf8')) as Record<string, unknown>;
+      if (!fs.existsSync(this._pidFile)) return;
+      const data = JSON.parse(fs.readFileSync(this._pidFile, 'utf8')) as Record<string, unknown>;
       for (const [name, raw] of Object.entries(data)) {
         // Resolve entry shape: legacy = number; current = { pid, ownerPid, since }.
         let pid: number;
@@ -3487,12 +3627,157 @@ export class SessionManager {
       stats,
       costUsd: Math.round(costUsd * 10000) / 10000,
       ...(managed.account ? { claudeAccount: managed.account } : {}),
+      ...(managed.orchestration
+        ? { orchestrationRunId: managed.orchestration.runId, orchestrationAgentKey: managed.orchestration.agentKey }
+        : {}),
+      ...(managed.config.parentMachineId ? { parentMachineId: managed.config.parentMachineId } : {}),
+      ...(managed.config.parentSessionId ? { parentSessionId: managed.config.parentSessionId } : {}),
+      ...(managed.config.parentToolId ? { parentToolId: managed.config.parentToolId } : {}),
+      ...(managed.config.originHost ? { originHost: managed.config.originHost } : {}),
+      ...(managed.config.executionHost ? { executionHost: managed.config.executionHost } : {}),
+      ...(managed.config.remoteSessionHandle ? { remoteSessionHandle: managed.config.remoteSessionHandle } : {}),
     };
     if (managed.config.maxBudgetUsd) {
       info.budgetUsd = managed.config.maxBudgetUsd;
       info.budgetExhausted = managed.budgetExhausted || isBudgetExceeded(costUsd, managed.config.maxBudgetUsd);
     }
     return info;
+  }
+
+  private _normalizeOrchestrationContext(
+    name: string,
+    config: SessionConfig,
+    engine: EngineType,
+  ): OrchestrationAgentContext {
+    const supplied = config.orchestration;
+    const runId = supplied?.runId || `session-${randomUUID().slice(0, 12)}`;
+    const parentToolId = this._knownParentTool(config.parentToolId) ?? this._knownParentTool(supplied?.parentToolId);
+    const parentMachineId = config.parentMachineId || supplied?.parentMachineId;
+    const parentSessionId = config.parentSessionId || supplied?.parentSessionId;
+    const originHost = config.originHost || supplied?.originHost;
+    const executionHost = config.executionHost || supplied?.executionHost;
+    const remoteSessionHandle = config.remoteSessionHandle || supplied?.remoteSessionHandle;
+    return {
+      runId,
+      runKind: supplied?.runKind || 'session',
+      agentKey: supplied?.agentKey || name,
+      agentName: supplied?.agentName || name,
+      ...(supplied?.codename ? { codename: supplied.codename } : {}),
+      engine,
+      model: config.resolvedModel || config.model,
+      effort: config.effort,
+      cwd: config.cwd,
+      ...(parentMachineId ? { parentMachineId } : {}),
+      ...(parentSessionId ? { parentSessionId } : {}),
+      ...(parentToolId ? { parentToolId } : {}),
+      ...(originHost ? { originHost } : {}),
+      ...(executionHost ? { executionHost } : {}),
+      ...(remoteSessionHandle ? { remoteSessionHandle } : {}),
+    };
+  }
+
+  private _knownParentTool(value: ParentToolId | undefined): ParentToolId | undefined {
+    if (!value) return undefined;
+    return (PARENT_TOOL_IDS as readonly string[]).includes(value) ? value : undefined;
+  }
+
+  private _noteDelegateMarker(managed: ManagedSession, message: string): void {
+    if (!managed.orchestration || managed.orchestration.parentSessionId) return;
+    const parentSessionId = parentSessionIdFromDelegateMarker(message);
+    if (!parentSessionId) return;
+    managed.orchestration = { ...managed.orchestration, parentSessionId };
+    this._orchestrationEvents.emit('agent.status', managed.orchestration, {
+      nativeSessionId: managed.orchestrationBoundNativeId,
+      agentStatus: managed.orchestrationLastStatus ?? 'running',
+    });
+  }
+
+  private _ensureOrchestrationRunStarted(context: OrchestrationAgentContext): void {
+    if (this._startedOrchestrationRuns.has(context.runId)) return;
+    this._startedOrchestrationRuns.set(context.runId, context);
+    this._orchestrationEvents.emit('run.started', context, { runStatus: 'running' });
+  }
+
+  private _emitOrchestrationRunStatus(context: OrchestrationAgentContext, status: OrchestrationRunStatus): void {
+    this._orchestrationEvents.emit('run.status', context, { runStatus: status });
+  }
+
+  private _guardSessionEvents(name: string, session: ISession): void {
+    session.on(SESSION_EVENT.ERROR, (...args: unknown[]) => {
+      try {
+        const err = args[0];
+        const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : '';
+        const message = sanitizeSecrets(raw || 'engine reported an error without a message').slice(0, 500);
+        this.logger.warn(`[Session:${name}] engine error: ${message}`);
+      } catch {
+        /* an error listener must not throw; that is the crash this guard exists to stop */
+      }
+    });
+  }
+
+  private _wireNativeIdentity(managed: ManagedSession): void {
+    if (managed.nativeIdentityListener) return;
+    const listener = (..._args: unknown[]): void => {
+      if (this.sessions.get(managed.config.name) !== managed) return;
+      this._bindOrchestrationIdentity(managed);
+    };
+    managed.nativeIdentityListener = listener;
+    managed.session.on(SESSION_EVENT.NATIVE_IDENTITY, listener);
+  }
+
+  private _unwireNativeIdentity(managed: ManagedSession): void {
+    const listener = managed.nativeIdentityListener;
+    if (!listener) return;
+    managed.session.removeListener(SESSION_EVENT.NATIVE_IDENTITY, listener);
+    managed.nativeIdentityListener = undefined;
+  }
+
+  private _bindOrchestrationIdentity(managed: ManagedSession): void {
+    if (!managed.orchestration) return;
+    const nativeSessionId = this._managedResumeId(managed);
+    if (!nativeSessionId || nativeSessionId === managed.orchestrationBoundNativeId) return;
+    managed.orchestrationBoundNativeId = nativeSessionId;
+    if (!managed.skipPersistence) this._persistSession(managed.config.name, managed);
+    this._orchestrationEvents.emit('agent.identity_bound', managed.orchestration, {
+      nativeSessionId,
+      agentStatus: managed.orchestrationLastStatus,
+    });
+  }
+
+  private _setOrchestrationAgentStatus(managed: ManagedSession, status: OrchestrationAgentStatus): void {
+    if (!managed.orchestration) return;
+    managed.orchestrationLastStatus = status;
+    this._orchestrationEvents.emit('agent.status', managed.orchestration, {
+      nativeSessionId: managed.orchestrationBoundNativeId,
+      agentStatus: status,
+    });
+  }
+
+  private _finishOrchestration(managed: ManagedSession): void {
+    if (!managed.orchestration) return;
+    const status: OrchestrationAgentStatus = managed.orchestrationLastStatus === 'failed' ? 'failed' : 'completed';
+    this._setOrchestrationAgentStatus(managed, status);
+    if (managed.orchestration.runKind === 'session') {
+      this._emitOrchestrationRunStatus(managed.orchestration, status === 'failed' ? 'failed' : 'completed');
+    }
+    this._unwireNativeIdentity(managed);
+  }
+
+  recordOrchestrationRunStatus(
+    runId: string,
+    runKind: OrchestrationAgentContext['runKind'],
+    status: OrchestrationRunStatus,
+  ): void {
+    const context: OrchestrationAgentContext = this._startedOrchestrationRuns.get(runId) ?? {
+      runId,
+      runKind,
+      agentKey: '__run__',
+      agentName: runKind,
+      engine: 'claude',
+      cwd: process.cwd(),
+    };
+    this._ensureOrchestrationRunStarted(context);
+    this._emitOrchestrationRunStatus(context, status);
   }
 
   private _resolveModel(alias: string, overrides?: Record<string, string>): string {
@@ -4959,9 +5244,11 @@ export class SessionManager {
     const now = Date.now();
     let pidsChanged = false;
     for (const [name, managed] of this.sessions) {
+      if (this._sessionHolds.has(name) || managed.sendChain || managed.session.isBusy) continue;
       if (now - managed.lastActivity > ttlMs) {
         this.logger.info(`Cleaning up idle in-memory session: ${name}`);
         try {
+          this._finishOrchestration(managed);
           managed.session.stop();
         } catch {
           // Best-effort — session may already be dead; must not block TTL cleanup

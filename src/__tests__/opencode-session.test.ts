@@ -25,7 +25,9 @@ vi.mock('../engine-spawn.js', async (importOriginal) => ({
   },
 }));
 
-const { PersistentOpencodeSession, isOpencodeV2 } = await import('../persistent-opencode-session.js');
+const { PersistentOpencodeSession, isOpencodeV2, opencodeGoalArguments, opencodeModelRef } = await import(
+  '../persistent-opencode-session.js'
+);
 
 // ─── Mock Process Helper ────────────────────────────────────────────────────
 
@@ -763,17 +765,61 @@ describe('OpenCode 2', () => {
     expect(isOpencodeV2('opencode2 v0.0.0-beta-17823')).toBe(true);
     expect(isOpencodeV2('0.0.0-beta-19271')).toBe(true);
     expect(isOpencodeV2('2.0.0')).toBe(true);
+    expect(isOpencodeV2('opencode v2.2.5')).toBe(true);
+    expect(isOpencodeV2('opencode v2.2.5')).toBe(true);
     expect(isOpencodeV2('1.19.0')).toBe(false);
     expect(isOpencodeV2('1.18.35')).toBe(false);
     expect(isOpencodeV2(undefined)).toBe(false);
   });
 
-  // On 0.0.0-beta-17823: no step_finish (no tokens or cost), no --variant, and
-  // the read-only agent unverifiable. Running it would drop all three silently.
-  it('refuses to start against OpenCode 2', async () => {
-    versions['opencode-v2-test'] = 'opencode2 v0.0.0-beta-17823';
-    const s = new PersistentOpencodeSession({ name: 't', cwd: '/tmp' }, 'opencode-v2-test');
-    await expect(s.start()).rejects.toThrow(/OpenCode 2 .*not supported yet/);
+  it('starts OpenCode 2 and folds effort into provider/model#variant', async () => {
+    versions['opencode-v2-effort'] = 'opencode v2.2.5';
+    const session = new PersistentOpencodeSession(
+      { name: 't', cwd: '/tmp', permissionMode: 'bypassPermissions', model: 'nvidia/nemotron', effort: 'high' },
+      'opencode-v2-effort',
+    );
+    const proc = createMockProcess();
+    mockSpawn.mockReset();
+    mockSpawn.mockReturnValue(proc);
+    await session.start();
+    const sendPromise = session.send('hi', { waitForComplete: true });
+    setTimeout(() => closeProc(proc, 0), 10);
+    await sendPromise;
+    const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+    expect(spawnArgs).not.toContain('--variant');
+    expect(spawnArgs[spawnArgs.indexOf('--model') + 1]).toBe('nvidia/nemotron#high');
+  });
+
+  it('recognizes an OpenCode 2 /goal command and leaves 1.x text as a prompt', () => {
+    expect(opencodeGoalArguments('/goal write DONE', 2)).toBe('write DONE');
+    expect(opencodeGoalArguments('/goal', 2)).toBe('');
+    expect(opencodeGoalArguments('/goal pause', 2)).toBe('pause');
+    expect(opencodeGoalArguments('please /goal later', 2)).toBeUndefined();
+    expect(opencodeGoalArguments('/goal write DONE', 1)).toBeUndefined();
+    expect(opencodeModelRef('nvidia/openai/openai/gpt-5.4-nano', 'high')).toEqual({
+      providerID: 'nvidia',
+      id: 'openai/openai/gpt-5.4-nano',
+      variant: 'high',
+    });
+    expect(opencodeModelRef('nvidia/openai/openai/gpt-5.4-nano', 'auto')?.variant).toBeUndefined();
+  });
+
+  it('omits a 2.x variant when no provider/model is selected', async () => {
+    versions['opencode-v2-no-model'] = '2.2.5';
+    const session = new PersistentOpencodeSession(
+      { name: 't', cwd: '/tmp', permissionMode: 'bypassPermissions', effort: 'high' },
+      'opencode-v2-no-model',
+    );
+    const proc = createMockProcess();
+    mockSpawn.mockReset();
+    mockSpawn.mockReturnValue(proc);
+    await session.start();
+    const sendPromise = session.send('hi', { waitForComplete: true });
+    setTimeout(() => closeProc(proc, 0), 10);
+    await sendPromise;
+    const spawnArgs = mockSpawn.mock.calls[0][1] as string[];
+    expect(spawnArgs).not.toContain('--variant');
+    expect(spawnArgs).not.toContain('--model');
   });
 
   it('starts when the version cannot be read', async () => {

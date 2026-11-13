@@ -57,6 +57,10 @@ export const ENGINE_TYPES = [
 ] as const;
 export type EngineType = (typeof ENGINE_TYPES)[number];
 
+/** Native transcript providers a manual thread can be registered under. */
+export const PARENT_TOOL_IDS = ['codex', 'claude_code', 'cursor', 'opencode'] as const;
+export type ParentToolId = (typeof PARENT_TOOL_IDS)[number];
+
 /** Common execution binding shared by every directly configured agent. */
 export interface AgentBinding {
   engine?: EngineType;
@@ -299,6 +303,28 @@ export interface AgentDefinition {
   [field: string]: unknown;
 }
 
+export type OrchestrationRunKind = 'session' | 'fanout' | 'council' | 'autoloop' | 'ultraplan' | 'ultrareview';
+export type OrchestrationRunStatus = 'running' | 'completed' | 'failed' | 'aborted';
+export type OrchestrationAgentStatus = 'declared' | 'idle' | 'running' | 'completed' | 'failed' | 'aborted';
+
+export interface OrchestrationAgentContext {
+  runId: string;
+  runKind: OrchestrationRunKind;
+  agentKey: string;
+  agentName: string;
+  codename?: string;
+  engine: EngineType;
+  model?: string;
+  effort?: EffortLevel;
+  cwd: string;
+  parentMachineId?: string;
+  parentSessionId?: string;
+  parentToolId?: ParentToolId;
+  originHost?: string;
+  executionHost?: string;
+  remoteSessionHandle?: string;
+}
+
 export interface SessionConfig {
   name: string;
   cwd: string;
@@ -342,6 +368,18 @@ export interface SessionConfig {
   sessionName?: string;
   claudeResumeId?: string;
   resumeSessionId?: string;
+  /** Origin parent machine UUID. Configured, not inferred from the destination. */
+  parentMachineId?: string;
+  /** Exact parent native thread or session id. */
+  parentSessionId?: string;
+  /** Parent transcript provider when known. */
+  parentToolId?: ParentToolId;
+  /** Source host display name from administrator config. */
+  originHost?: string;
+  /** Execution host alias that owns the live session. */
+  executionHost?: string;
+  /** Qualified `host::name` handle when the caller is on another machine. */
+  remoteSessionHandle?: string;
   forkSession?: boolean;
   // Directories
   addDir?: string[];
@@ -486,6 +524,20 @@ export interface SessionConfig {
    */
   ignoreUserConfig?: boolean;
   /**
+   * Codex engines (`codex`, `codex-app`) only, and only with `ignoreUserConfig`.
+   * Names of MCP servers to keep from the user's Codex config. With
+   * `ignoreUserConfig` and no selection no MCP server starts; with a selection
+   * exactly the named ones do. A name the config does not define, or that it has
+   * disabled, is rejected. A selection cannot use `--ignore-user-config` (that
+   * drops the selected definitions too), so the other servers are switched off
+   * one by one with `-c` disable overrides and type-matching inert transport
+   * stubs; the rest of the user's config still loads — the caller's explicit
+   * model, sandbox and effort win over it. The resolver uses only server names,
+   * enabled state, and transport type, never configured commands, URLs, headers,
+   * tokens, or env.
+   */
+  codexMcpServers?: string[];
+  /**
    * Claude Code only. Restricted mode (`--restricted`): the CLI removes the
    * built-in tools that run commands or code — Bash, PowerShell, the REPL — plus
    * WebFetch unless `tools` names them, and ignores user, project and local
@@ -515,6 +567,12 @@ export interface SessionConfig {
    * HTTP, as for `customEngine`).
    */
   acpAgent?: AcpAgentConfig | string;
+  /**
+   * Internal, content-free correlation metadata for external transcript
+   * indexers. Public callers normally omit this; fanout and council populate it
+   * so their short-lived native sessions stay linked after Claw cleans them up.
+   */
+  orchestration?: OrchestrationAgentContext;
 }
 
 // ─── Session Stats ───────────────────────────────────────────────────────────
@@ -690,6 +748,16 @@ export interface SessionInfo {
   budgetExhausted?: boolean;
   /** The Claude account the session is running under now, when it runs under one. */
   claudeAccount?: string;
+  engine?: EngineType;
+  localName?: string;
+  parentMachineId?: string;
+  parentSessionId?: string;
+  parentToolId?: ParentToolId;
+  originHost?: string;
+  executionHost?: string;
+  remoteSessionHandle?: string;
+  orchestrationRunId?: string;
+  orchestrationAgentKey?: string;
 }
 
 /** A tool call the engine refused to run during a turn. */
@@ -872,6 +940,10 @@ export interface InboxMessage {
   timestamp: string;
   read: boolean;
   summary?: string;
+  /** Origin host display name. Omitted for a same-machine send. */
+  host?: string;
+  /** Stable receiver-host message id. Omitted for an in-process send. */
+  id?: string;
 }
 
 export interface UltraplanResult {
