@@ -23,7 +23,7 @@ import {
   type ResultFrame,
   type SubmitFrame,
 } from './protocol.js';
-import { assertHostAlias, assertSocketPath, qualifySessionName } from './qualified-name.js';
+import { assertHostAlias, assertSocketPath, isWindowsPipePath, qualifySessionName } from './qualified-name.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TRANSPORT_KEYS = new Set([
@@ -81,28 +81,38 @@ export class RemoteBroker {
   }
 
   private async bind(socketPath: string): Promise<void> {
-    const directory = path.dirname(socketPath);
-    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-    fs.chmodSync(directory, 0o700);
-    if (fs.existsSync(socketPath)) {
-      if (!fs.lstatSync(socketPath).isSocket()) {
-        throw new Error('Refusing to replace a non-socket at the broker path');
+    const pipe = isWindowsPipePath(socketPath);
+    if (!pipe) {
+      const directory = path.dirname(socketPath);
+      fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      fs.chmodSync(directory, 0o700);
+      if (fs.existsSync(socketPath)) {
+        if (!fs.lstatSync(socketPath).isSocket()) {
+          throw new Error('Refusing to replace a non-socket at the broker path');
+        }
+        fs.unlinkSync(socketPath);
       }
-      fs.unlinkSync(socketPath);
     }
     await new Promise<void>((resolve, reject) => {
       const server = net.createServer((socket) => this.onConnection(socket));
       server.once('error', reject);
-      server.listen(socketPath, () => {
-        try {
-          fs.chmodSync(socketPath, 0o600);
-        } catch (err) {
-          reject(err as Error);
-          return;
+      const listening = (): void => {
+        if (!pipe) {
+          try {
+            fs.chmodSync(socketPath, 0o600);
+          } catch (err) {
+            reject(err as Error);
+            return;
+          }
         }
         this.server = server;
         resolve();
-      });
+      };
+      if (pipe) {
+        server.listen({ path: socketPath, readableAll: false, writableAll: false }, listening);
+      } else {
+        server.listen(socketPath, listening);
+      }
     });
   }
 

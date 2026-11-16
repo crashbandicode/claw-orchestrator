@@ -1,6 +1,7 @@
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 
+import { fsyncDirectory } from './durable-fsync.js';
 import { MAX_FRAME_BYTES, type BrokerMethod } from './protocol.js';
 
 export type StoredOperationStatus = 'accepted' | 'running' | 'completed' | 'failed' | 'uncertain';
@@ -187,11 +188,6 @@ export class OperationStore {
     fs.chmodSync(tmp, 0o600);
     fs.renameSync(tmp, file);
     fs.chmodSync(file, 0o600);
-    const dirfd = fs.openSync(this.directory, 'r');
-    try {
-      fs.fsyncSync(dirfd);
-    } finally {
-      fs.closeSync(dirfd);
-    }
+    fsyncDirectory(this.directory);
   }
 }

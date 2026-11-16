@@ -5,6 +5,7 @@ import * as path from 'node:path';
 import { InboxManager } from '../inbox-manager.js';
 import { MAX_INBOX_SIZE } from '../constants.js';
 import type { ParentToolId } from '../types.js';
+import { fsyncDirectory } from './durable-fsync.js';
 import { payloadHash } from './protocol.js';
 
 export type MailStatus = 'queued' | 'delivering' | 'read' | 'uncertain';
@@ -320,12 +321,7 @@ export class DurableMailbox extends EventEmitter {
       fs.chmodSync(tmp, 0o600);
       fs.renameSync(tmp, this.file);
       fs.chmodSync(this.file, 0o600);
-      const dirfd = fs.openSync(path.dirname(this.file), 'r');
-      try {
-        fs.fsyncSync(dirfd);
-      } finally {
-        fs.closeSync(dirfd);
-      }
+      fsyncDirectory(path.dirname(this.file));
       this.committed = snapshot;
     } catch (err) {
       this.state = cloneState(this.committed);
