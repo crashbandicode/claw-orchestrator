@@ -16,6 +16,7 @@ The `id` is lower-case kebab-case, 3–40 characters, and the filename must matc
 | `zcode`     | `engine` | `zcode-claw-adapter` |
 | `kimi-code` | `acp`    | `kimi acp`           |
 | `dsh`       | `acp`    | `dsh --profile acp`  |
+| `devin`     | `acp`    | `devin acp`          |
 
 These are **community** entries. This project validates their schema and ships
 them; it does not claim they work. What stands behind a preset is its

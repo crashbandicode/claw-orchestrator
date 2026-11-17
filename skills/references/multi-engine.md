@@ -395,9 +395,9 @@ await manager.startSession({
 
 ### ACP agents (`engine: 'acp'`)
 
-Drives any agent that serves the [Agent Client Protocol](https://agentclientprotocol.com) on stdio, with no per-agent code. Run through it so far: Kimi Code 2.3.1 (`kimi acp`), DeepSeek's dsh 0.2.1-rc.2 (`dsh --profile acp`) and OpenCode 1.19.4 (`opencode acp`). This is the client side of the protocol; [acp.md](./acp.md) is the other side, where the orchestrator is the agent.
+Drives any agent that serves the [Agent Client Protocol](https://agentclientprotocol.com) on stdio, with no per-agent code. Run through it so far: Kimi Code 2.3.1 (`kimi acp`), DeepSeek's dsh 0.2.1-rc.2 (`dsh --profile acp`), OpenCode 1.19.4 (`opencode acp`), and Devin CLI 3000.12.57 (`devin acp`). This is the client side of the protocol; [acp.md](./acp.md) is the other side, where the orchestrator is the agent.
 
-- `acpAgent` names the agent: a bundled preset id (`kimi-code`, `dsh`; `clawo engines` lists them), or, from a local caller only, an inline `{ name, command, commandEnv?, args?, env?, contextWindow?, pricing? }`. Over HTTP, which includes the `clawo` CLI, only a preset id is accepted, as for `customEngine`.
+- `acpAgent` names the agent: a bundled preset id (`kimi-code`, `dsh`, `devin`; `clawo engines` lists them), or, from a local caller only, an inline `{ name, command, commandEnv?, args?, env?, contextWindow?, pricing? }`. Over HTTP, which includes the `clawo` CLI, only a preset id is accepted, as for `customEngine`.
 - One agent process per session; each send is one `session/prompt` on one ACP session, so the conversation carries over between sends. `initialize` advertises no `fs` or `terminal` capability: the agent reads, writes and runs commands with its own tools.
 - A turn succeeds when the agent ends it with `stopReason: "end_turn"`; any other stop reason (`refusal`, `max_tokens`, `cancelled`, …) fails it. A turn that runs past its timeout is cancelled with `session/cancel`. An agent that exits mid-turn fails the turn and the session.
 - `session/request_permission` is answered at once from `permissionMode`: `bypassPermissions`, `acceptEdits`, `auto` and `dontAsk` pick an allow option, the others a reject option. Nothing waits on a person.
@@ -407,6 +407,7 @@ Drives any agent that serves the [Agent Client Protocol](https://agentclientprot
 - The model and credentials are the agent's own configuration, set in its environment; the session's `model` and `effort` are not sent to the agent, and `compact` is left to it:
   - Kimi Code: `KIMI_MODEL_NAME`, `KIMI_MODEL_API_KEY`, `KIMI_MODEL_BASE_URL`, `KIMI_MODEL_MAX_CONTEXT_SIZE`, `KIMI_MODEL_CAPABILITIES`, or a `kimi` login. `KIMI_BIN` overrides the command.
   - dsh: `DEEPSEEK_API_KEY` (and `DEEPSEEK_BASE_URL`); its profile chooses the model. `DSH_BIN` overrides the command.
+  - Devin: `devin setup` signs the CLI in. `DEVIN_BIN` overrides the command. The session's `model` and `effort` are not sent.
 - ACP has no system-prompt channel, so `systemPrompt` and `appendSystemPrompt` go at the top of the first message of a new session (a council seat's charter travels this way); a resumed session already holds them.
 - `launcher` applies as for every engine.
 - Where an ACP agent runs besides `session_start`: each fan-out and council agent, a workflow `agent` node, `solve`'s implementer and scouts, and a fan-out's synthesis pass (`synthesisAcpAgent`) name it by preset id in `acpAgent`; `session_handoff` takes `acpAgent` as `session_start` does. On the CLI an agent in a list is written `acp:<preset>`. Autoloop roles and ultrareview reviewers refuse `acp`: a role cannot name the agent, and a reviewer must be read-only.
@@ -425,7 +426,7 @@ preset form exists so a third-party CLI is described once and shipped, rather th
 retyped by every caller. A preset carries exactly one of an `engine` block (started
 with `engine: 'custom'`) or an `acp` block (started with `engine: 'acp'`); naming one
 with the other engine fails with a message that says which to use. Bundled today:
-`zcode` (custom), `kimi-code` and `dsh` (ACP). The format is in
+`zcode` (custom), `kimi-code`, `dsh`, and `devin` (ACP). The format is in
 [configs/engines/README.md](../../configs/engines/README.md).
 
 Engines fall into three tiers, decided by how they are verified. Bundled presets
