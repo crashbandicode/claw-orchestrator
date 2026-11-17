@@ -12,6 +12,7 @@ import { execFile, execFileSync } from 'node:child_process';
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
 import { promisify } from 'node:util';
 import { execEngine } from './engine-spawn.js';
+import { devinGoalCommand } from './persistent-acp-session.js';
 
 const execFileAsync = promisify(execFile);
 import * as http from 'node:http';
@@ -2229,7 +2230,7 @@ export class SessionManager {
     // this guard rejected. A provider-qualified string stays accepted because
     // the error message below offers it.
     const resolvedModel = this._resolveModel(model, managed.config.modelOverrides);
-    const looksValid = !!lookupModel(resolvedModel) || resolvedModel.includes('/');
+    const looksValid = this._isDevinSession(managed) || !!lookupModel(resolvedModel) || resolvedModel.includes('/');
     if (!looksValid) {
       throw new Error(
         `Unknown model '${model}' (resolved: '${resolvedModel}'). Use a known alias (opus, sonnet, haiku, gemini-pro, etc.) or a full provider/model string.`,
@@ -2941,6 +2942,44 @@ export class SessionManager {
           `Start a session with engine: "cursor" to use cursor_goal_set.`,
       );
     }
+  }
+
+  private _isDevinSession(managed: { config: SessionConfig }): boolean {
+    if ((managed.config.engine || 'claude') !== 'acp') return false;
+    const agent = managed.config.acpAgent;
+    if (typeof agent === 'string') return agent === 'devin';
+    return agent?.name === 'devin' || agent?.command === 'devin';
+  }
+
+  private _assertDevinSession(name: string): void {
+    const managed = this.sessions.get(name);
+    if (!managed) throw new Error(`Session not found: ${name}`);
+    if (!this._isDevinSession(managed)) {
+      throw new Error(
+        `Session "${name}" is not a Devin session. Start it with engine: "acp" and acpAgent: "devin".`,
+      );
+    }
+  }
+
+  /** Send `/goal <objective>`. Devin keeps working until the goal is complete, blocked, or cleared. */
+  async devinGoalSet(name: string, objective: string, timeoutMs?: number): Promise<unknown> {
+    this._assertDevinSession(name);
+    return await this.sendMessage(name, devinGoalCommand('set', objective), { timeout: timeoutMs });
+  }
+
+  async devinGoalClear(name: string, timeoutMs?: number): Promise<unknown> {
+    this._assertDevinSession(name);
+    return await this.sendMessage(name, devinGoalCommand('clear'), { timeout: timeoutMs });
+  }
+
+  async devinGoalStatus(name: string, timeoutMs?: number): Promise<unknown> {
+    this._assertDevinSession(name);
+    return await this.sendMessage(name, devinGoalCommand('status'), { timeout: timeoutMs });
+  }
+
+  async devinGoalResume(name: string, timeoutMs?: number): Promise<unknown> {
+    this._assertDevinSession(name);
+    return await this.sendMessage(name, devinGoalCommand('resume'), { timeout: timeoutMs });
   }
 
   /** Send `/goal <objective>` to a cursor session. The process continues until the goal ends. */

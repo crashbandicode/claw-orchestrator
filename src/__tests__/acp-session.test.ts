@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PersistentAcpSession } from '../persistent-acp-session.js';
+import { PersistentAcpSession, devinAcpLaunchArgs, devinElicitationResponse, devinGoalCommand } from '../persistent-acp-session.js';
 import { validatePreset, resolveAcpAgent, resolveCustomEngine, _resetEnginePresetCache } from '../engine-presets.js';
 import { __rejectCustomEngineOverHttpForTest as rejectOverHttp } from '../embedded-server.js';
 import type { AcpAgentConfig, SessionConfig, TurnResult } from '../types.js';
@@ -194,6 +194,7 @@ describe('acp presets and the HTTP rule', () => {
   it('resolves the bundled ACP presets, and neither kind as the other', () => {
     _resetEnginePresetCache();
     expect(resolveAcpAgent('kimi-code')).toMatchObject({ command: 'kimi', args: ['acp'] });
+    expect(resolveAcpAgent('devin')).toMatchObject({ command: 'devin', args: ['acp'], commandEnv: 'DEVIN_BIN' });
     expect(() => resolveCustomEngine('kimi-code')).toThrow(/ACP agent/);
     expect(() => resolveAcpAgent('zcode')).toThrow(/custom engine/);
   });
@@ -210,5 +211,36 @@ describe('acp presets and the HTTP rule', () => {
     expect(rejectOverHttp({ agents: [{ name: 'k', engine: 'acp', acpAgent: { name: 'x', command: 'sh' } }] })).toMatch(
       /acpAgent may not be given/,
     );
+  });
+});
+
+describe('Devin goal and model selection', () => {
+  it('builds the slash commands and appends one model flag', () => {
+    expect(devinGoalCommand('set', ' write DONE ')).toBe('/goal write DONE');
+    expect(devinGoalCommand('status')).toBe('/goal');
+    expect(devinGoalCommand('clear')).toBe('/goal clear');
+    expect(devinGoalCommand('resume')).toBe('/goal resume');
+    expect(() => devinGoalCommand('set', '  ')).toThrow(/objective/);
+    expect(devinAcpLaunchArgs(['acp'], 'glm-5.3-flash')).toEqual(['acp', '--model', 'glm-5.3-flash']);
+    expect(devinAcpLaunchArgs(['acp', '--model', 'gpt-6-luna'], 'claude-haiku-5.5')).toEqual([
+      'acp',
+      '--model',
+      'gpt-6-luna',
+    ]);
+  });
+
+  it('answers a form only when the throwaway switch is on', () => {
+    const schema = {
+      properties: {
+        color: { type: 'string', enum: ['red', 'blue'] },
+        name: { type: 'string' },
+        proceed: { type: 'boolean' },
+      },
+    };
+    expect(devinElicitationResponse(schema, false)).toEqual({ action: 'decline' });
+    expect(devinElicitationResponse(schema, true)).toEqual({
+      action: 'accept',
+      content: { color: 'red', name: 'throwaway', proceed: true },
+    });
   });
 });

@@ -167,7 +167,7 @@ const AUTOLOOP_ENGINES = ENGINE_TYPES.filter((e) => e !== 'acp');
 
 const ACP_AGENT_ID_SCHEMA = {
   type: 'string',
-  description: 'With engine "acp": the id of a bundled ACP agent preset (`clawo engines`), such as kimi-code or dsh.',
+  description: 'With engine "acp": the id of a bundled ACP agent preset (`clawo engines`), such as kimi-code, dsh, or devin.',
 };
 
 const CUSTOM_ENGINE_SCHEMA = {
@@ -1063,6 +1063,47 @@ const plugin = {
         return await getManager().claudeGoalStatus(args.name as string, args.timeout as number | undefined);
       },
     });
+
+    for (const [action, summary] of [
+      ['set', 'Set a durable goal on a Devin session. Sends `/goal <objective>`. Devin keeps working across turns until the goal is complete, blocked, or cleared. Requires engine: "acp" and acpAgent: "devin".'],
+      ['clear', 'Clear the active goal on a Devin session. Sends `/goal clear`.'],
+      ['status', 'Show the active Devin goal. Sends `/goal`.'],
+      ['resume', 'Resume a Devin goal after an interrupt. Sends `/goal resume`.'],
+    ] as const) {
+      registerTool({
+        name: `devin_goal_${action}`,
+        description: summary,
+        parameters: {
+          type: 'object',
+          properties: {
+            name: { type: 'string', description: 'Session name (must be a Devin ACP session).' },
+            ...(action === 'set'
+              ? { objective: { type: 'string', description: 'The objective Devin pursues until it is done.' } }
+              : {}),
+            timeout: {
+              type: 'number',
+              description: 'Timeout in ms for the slash command. A set covers the whole pursuit.',
+            },
+            ...REMOTE_CALL_PROPERTIES,
+          },
+          required: action === 'set' ? ['name', 'objective'] : ['name'],
+        },
+        execute: async (_id, args) => {
+          const name = args.name as string;
+          const timeout = args.timeout as number | undefined;
+          if (action === 'set') {
+            const objective = typeof args.objective === 'string' ? args.objective.trim() : '';
+            if (!objective) throw new Error('Devin /goal requires an objective');
+            return callRouted('session.send', { ...args, message: `/goal ${objective}` }, async () =>
+              getManager().devinGoalSet(name, objective, timeout),
+            );
+          }
+          const message = action === 'clear' ? '/goal clear' : action === 'resume' ? '/goal resume' : '/goal';
+          const method = action === 'clear' ? 'devinGoalClear' : action === 'resume' ? 'devinGoalResume' : 'devinGoalStatus';
+          return callRouted('session.send', { ...args, message }, async () => getManager()[method](name, timeout));
+        },
+      });
+    }
 
     registerTool({
       name: 'cursor_goal_set',

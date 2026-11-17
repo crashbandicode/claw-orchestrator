@@ -1,0 +1,17 @@
+{
+  "id": "devin",
+  "tier": "community",
+  "description": "Cognition's Devin CLI, served over the Agent Client Protocol (`devin acp`). Start with engine 'acp'. Sign in with `devin setup` before the first session.",
+  "provenance": {
+    "maintainer": "intpa",
+    "verifiedAgainst": "3000.12.57",
+    "verifiedOn": "2026-11-16",
+    "sourceUrl": "https://docs.devin.ai/cli"
+  },
+  "acp": {
+    "name": "devin",
+    "command": "devin",
+    "commandEnv": "DEVIN_BIN",
+    "args": ["acp"]
+  }
+}

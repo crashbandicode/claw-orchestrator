@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [7.22.1-memento.4] - 2026-11-16
+
+### Added
+
+- **Devin ACP preset.** `acpAgent: "devin"` starts `devin acp`. `DEVIN_BIN` overrides the command. Sign in with `devin setup` before the first session.
+- **Devin `/goal`.** `devin_goal_set`, `devin_goal_status`, `devin_goal_clear`, and `devin_goal_resume` send Devin's goal commands. A session `model` is passed as `devin acp --model`. Form questions are declined unless `CLAWO_DEVIN_ANSWER_ELICITATION=1`.
+
 ## [7.22.1-memento.3] - 2026-11-13
 
 ### Changed

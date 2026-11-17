@@ -44,6 +44,52 @@ import { sanitizeSecrets } from './sanitize.js';
 
 const DEFAULT_TURN_TIMEOUT_MS = 600_000;
 
+/** Append Devin's model flag without replacing a preset that already chose one. */
+export function devinAcpLaunchArgs(args: readonly string[] | undefined, model: string | undefined): string[] {
+  const base = [...(args ?? [])];
+  const selected = model?.trim();
+  if (!selected || base.includes('--model')) return base;
+  return [...base, '--model', selected];
+}
+
+/** The slash text Devin's `/goal` command expects. */
+export function devinGoalCommand(action: 'set' | 'status' | 'clear' | 'resume', objective?: string): string {
+  if (action === 'status') return '/goal';
+  if (action === 'clear') return '/goal clear';
+  if (action === 'resume') return '/goal resume';
+  const trimmed = objective?.trim() ?? '';
+  if (!trimmed) throw new Error('Devin /goal requires an objective');
+  return `/goal ${trimmed}`;
+}
+
+/**
+ * Fill one advertised form so a throwaway can answer Devin's questions.
+ * A real session declines unless CLAWO_DEVIN_ANSWER_ELICITATION=1.
+ */
+export function devinElicitationResponse(
+  requestedSchema: unknown,
+  answer: boolean,
+): { action: 'accept'; content: Record<string, unknown> } | { action: 'decline' } {
+  if (!answer) return { action: 'decline' };
+  const schema = requestedSchema && typeof requestedSchema === 'object' ? (requestedSchema as Record<string, unknown>) : {};
+  const properties = schema.properties && typeof schema.properties === 'object' ? (schema.properties as Record<string, unknown>) : {};
+  const content: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(properties)) {
+    const field = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+    const enumValues = Array.isArray(field.enum) ? field.enum : undefined;
+    const oneOf = Array.isArray(field.oneOf) ? field.oneOf : undefined;
+    if (enumValues?.length) content[key] = enumValues[0];
+    else if (oneOf?.length && oneOf[0] && typeof oneOf[0] === 'object') {
+      const option = oneOf[0] as Record<string, unknown>;
+      content[key] = option.const ?? option.enum;
+    } else if (field.type === 'boolean') content[key] = true;
+    else if (field.type === 'integer' || field.type === 'number') content[key] = 1;
+    else if (field.type === 'array') content[key] = enumValues?.length ? [enumValues[0]] : [];
+    else content[key] = 'throwaway';
+  }
+  return { action: 'accept', content };
+}
+
 /** Permission modes under which the agent may act without asking. */
 const ALLOWING_MODES = new Set(['bypassPermissions', 'acceptEdits', 'auto', 'dontAsk']);
 
@@ -133,7 +179,8 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
     this.options.cwd = cwd;
 
     const command = (this.agent.commandEnv && process.env[this.agent.commandEnv]) || this.agent.command;
-    const proc = spawnEngine(command, this.agent.args ?? [], {
+    const args = command === 'devin' ? devinAcpLaunchArgs(this.agent.args, this.options.model) : [...(this.agent.args ?? [])];
+    const proc = spawnEngine(command, args, {
       launcher: this.options.launcher,
       cwd,
       env: { ...process.env, ...this.agent.env },
@@ -164,6 +211,7 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
     this.conn = acp
       .client({ name: 'claw-orchestrator' })
       .onRequest(acp.methods.client.session.requestPermission, (ctx) => this._answerPermission(ctx.params))
+      .onRequest(acp.methods.client.elicitation.create, (ctx) => this._answerElicitation(ctx.params))
       .onNotification(acp.methods.client.session.update, (ctx) => this._onUpdate(ctx.params))
       .connect(stream);
     // A closed connection is a dead session, whether or not the exit has been reported yet.
@@ -176,7 +224,7 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
     const init = await Promise.race([
       agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: {},
+        clientCapabilities: { elicitation: { form: {} } },
         clientInfo: { name: 'claw-orchestrator', version: '1' },
       }),
       exited,
@@ -342,11 +390,32 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
     this._addHistory({
       time: new Date().toISOString(),
       type: 'permission',
-      event: { tool: params.toolCall.title, answer: option?.kind ?? 'cancelled' },
+      event: {
+        tool: params.toolCall.title,
+        options: params.options.slice(0, 8).map((item) => item.name || item.kind),
+        answer: option?.kind ?? 'cancelled',
+      },
     });
     return option
       ? { outcome: { outcome: 'selected', optionId: option.optionId } }
       : { outcome: { outcome: 'cancelled' } };
+  }
+
+  private _answerElicitation(params: acp.CreateElicitationRequest): acp.CreateElicitationResponse {
+    const response = devinElicitationResponse(
+      'requestedSchema' in params ? params.requestedSchema : undefined,
+      process.env.CLAWO_DEVIN_ANSWER_ELICITATION === '1',
+    );
+    this._addHistory({
+      time: new Date().toISOString(),
+      type: 'elicitation',
+      event: {
+        message: typeof params.message === 'string' ? params.message.slice(0, 500) : '',
+        mode: 'mode' in params ? params.mode : '',
+        action: response.action,
+      },
+    });
+    return response;
   }
 
   private _onUpdate(params: acp.SessionNotification): void {
