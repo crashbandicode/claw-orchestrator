@@ -82,6 +82,8 @@ const UNCHANGED_TOOLS = [
   'devin_goal_clear',
   'devin_goal_status',
   'devin_goal_resume',
+  'devin_btw',
+  'devin_resume',
   'council_start',
   'council_status',
   'council_abort',

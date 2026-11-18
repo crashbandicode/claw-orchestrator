@@ -127,6 +127,8 @@ describe('rendering a handoff', () => {
 /** An engine that records every message it receives and replies from a script. */
 class RecordingSession extends EventEmitter implements ISession {
   sessionId?: string;
+  opencodeSessionId?: string;
+  cursorChatId?: string;
   received: string[] = [];
   failNext = false;
   constructor(readonly engine: string) {
@@ -280,10 +282,22 @@ describe('handoffSession', () => {
     await manager.sendMessage('a-codex', 'thanks');
     const [first, second] = engines.get('a-codex')!.received;
 
+    expect(first.startsWith('MEMENTO-HANDOFF-FROM: claude-1\n')).toBe(true);
     expect(first).toContain('<conversation_history>');
     expect(first).toContain('PLANTED: the release codename is heron');
     expect(first.endsWith('what is the codename?')).toBe(true);
     expect(second).toBe('thanks');
+  });
+
+  it('marks an OpenCode source with its native session id', async () => {
+    await manager.startSession({ name: 'oc', cwd: FAKE_HOME, engine: 'opencode' });
+    const source = engines.get('oc')!;
+    source.sessionId = 'opencode-live-ses_nativeid';
+    source.opencodeSessionId = 'ses_nativeid';
+    await manager.sendMessage('oc', 'PLANTED: native id');
+    await manager.handoffSession('oc', { engine: 'cursor' });
+    await manager.sendMessage('oc-cursor', 'continue');
+    expect(engines.get('oc-cursor')!.received[0].startsWith('MEMENTO-HANDOFF-FROM: ses_nativeid\n')).toBe(true);
   });
 
   it('leaves the source running and its record unchanged', async () => {

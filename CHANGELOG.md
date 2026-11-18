@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+## [7.22.1-memento.5] - 2026-11-18
+
+### Added
+
+- **Devin `/btw`.** `devin_btw` asks one side question and leaves the parent thread in place. A native `/btw` that Devin accepts is used; otherwise a hidden read-only session answers and is closed. The broker method is `session.btw`.
+- **Devin resume.** `devin_resume` resumes a Devin session by its id. Bypass is the permission mode when the caller does not name one, and the ACP session is set to that mode after it loads.
+- **Handoff links.** A handoff's first prompt starts with `MEMENTO-HANDOFF-FROM:` and the source's native session id. OpenCode contributes its `ses_` id and Cursor its chat id, not the `opencode-live-` or `cursor-live-` wrapper.
+- **Devin Fusion subagents.** A Devin session model of `fusion`, or a `fusion-…-sidekick-…` id, is passed to `devin acp --model`. The same pairing is written to `agent.subagent_model` in a copy of the user config, so explore and custom subagents use it too. A general subagent already follows the parent model.
+
 ## [7.22.1-memento.4] - 2026-11-16
 
 ### Added

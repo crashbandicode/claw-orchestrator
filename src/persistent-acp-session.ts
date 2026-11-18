@@ -21,10 +21,21 @@
 import { ChildProcess } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import { Readable, Writable } from 'node:stream';
 import * as acp from '@agentclientprotocol/sdk';
 
+import {
+  devinBtwPrompt,
+  devinBtwRefusal,
+  devinDataRoot,
+  devinSideId,
+  devinSideQuestion,
+  hideDevinSession,
+  readDevinTranscript,
+  writeDevinSideDocument,
+} from './devin-btw.js';
 import { killEngineTree, spawnEngine } from './engine-spawn.js';
 import { resolveAcpAgent } from './engine-presets.js';
 import { resolveAlias } from './models.js';
@@ -44,12 +55,65 @@ import { sanitizeSecrets } from './sanitize.js';
 
 const DEFAULT_TURN_TIMEOUT_MS = 600_000;
 
+const DEVIN_SESSION_MODE: Record<string, string> = {
+  bypassPermissions: 'bypass',
+  acceptEdits: 'accept-edits',
+  plan: 'plan',
+  default: 'normal',
+  manual: 'normal',
+};
+
+/** The ACP mode id for a Claw permission mode. `devin acp` has no permission flag. */
+export function devinSessionMode(permissionMode: string | undefined): string | undefined {
+  return permissionMode ? DEVIN_SESSION_MODE[permissionMode] : undefined;
+}
+
+function devinUserConfigPath(): string {
+  if (process.platform === 'win32') {
+    const root = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+    return path.join(root, 'devin', 'config.json');
+  }
+  const xdg = process.env.XDG_CONFIG_HOME;
+  const root = xdg && path.isAbsolute(xdg) ? xdg : path.join(os.homedir(), '.config');
+  return path.join(root, 'devin', 'config.json');
+}
+
+/** A Fusion family name or a concrete `fusion-…-sidekick-…` id. */
+export function isDevinFusionModel(model: string | undefined): boolean {
+  const selected = model?.trim().toLowerCase();
+  return selected === 'fusion' || !!selected?.startsWith('fusion-');
+}
+
+/**
+ * Keep the caller's Devin config and pin subagents to the Fusion pairing.
+ * `subagent_general` already follows the parent model; this is what
+ * `subagent_explore` and custom profiles without their own model use.
+ */
+export function devinFusionConfig(existing: unknown, model: string): Record<string, unknown> {
+  const base =
+    existing && typeof existing === 'object' && !Array.isArray(existing)
+      ? { ...(existing as Record<string, unknown>) }
+      : {};
+  const agent =
+    base.agent && typeof base.agent === 'object' && !Array.isArray(base.agent)
+      ? { ...(base.agent as Record<string, unknown>) }
+      : {};
+  agent.subagent_model = model.trim();
+  base.agent = agent;
+  return base;
+}
+
 /** Append Devin's model flag without replacing a preset that already chose one. */
-export function devinAcpLaunchArgs(args: readonly string[] | undefined, model: string | undefined): string[] {
+export function devinAcpLaunchArgs(
+  args: readonly string[] | undefined,
+  model: string | undefined,
+  configPath?: string,
+): string[] {
   const base = [...(args ?? [])];
+  const withConfig = configPath ? ['--config', configPath, ...base] : base;
   const selected = model?.trim();
-  if (!selected || base.includes('--model')) return base;
-  return [...base, '--model', selected];
+  if (!selected || withConfig.includes('--model')) return withConfig;
+  return [...withConfig, '--model', selected];
 }
 
 /** The slash text Devin's `/goal` command expects. */
@@ -117,6 +181,15 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
   /** The turn in flight: its text so far and how to fail it if the process dies. */
   private turnText = '';
   private turnFail: ((e: Error) => void) | null = null;
+  /** A `/btw` that Devin refused, collected off the parent turn. */
+  private _nativeBtw = false;
+  private _nativeBtwText = '';
+  /** The temporary session that answers when native `/btw` is unavailable. */
+  private _sideSessionId: string | null = null;
+  /** Overlay config that pins Fusion subagents, removed when the session stops. */
+  private _fusionConfigDir?: string;
+  private _sideText = '';
+  private _btwReadOnly = false;
 
   public sessionId?: string;
   private _stats = {
@@ -179,7 +252,9 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
     this.options.cwd = cwd;
 
     const command = (this.agent.commandEnv && process.env[this.agent.commandEnv]) || this.agent.command;
-    const args = command === 'devin' ? devinAcpLaunchArgs(this.agent.args, this.options.model) : [...(this.agent.args ?? [])];
+    const model = this.options.model?.trim();
+    const fusionConfig = command === 'devin' && isDevinFusionModel(model) ? this._fusionSubagentConfig(model!) : undefined;
+    const args = command === 'devin' ? devinAcpLaunchArgs(this.agent.args, model, fusionConfig) : [...(this.agent.args ?? [])];
     const proc = spawnEngine(command, args, {
       launcher: this.options.launcher,
       cwd,
@@ -224,7 +299,10 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
     const init = await Promise.race([
       agent.request(acp.methods.agent.initialize, {
         protocolVersion: acp.PROTOCOL_VERSION,
-        clientCapabilities: { elicitation: { form: {} } },
+        clientCapabilities: {
+          elicitation: { form: {} },
+          ...(this.agent.name === 'devin' ? { _meta: { 'cognition.ai/chains': true } } : {}),
+        },
         clientInfo: { name: 'claw-orchestrator', version: '1' },
       }),
       exited,
@@ -267,6 +345,14 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
       this.pendingInstructions = instructions || undefined;
     }
 
+    const devinMode = this.agent.name === 'devin' ? devinSessionMode(this.options.permissionMode) : undefined;
+    if (devinMode && this.acpSessionId) {
+      await agent.request(acp.methods.agent.session.setMode, {
+        sessionId: this.acpSessionId,
+        modeId: devinMode,
+      }).catch(() => undefined);
+    }
+
     this.sessionId = `acp-${this.agent.name}-${Date.now().toString(36)}`;
     this._startTime = new Date().toISOString();
     this._isReady = true;
@@ -287,6 +373,32 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
       killEngineTree(this.proc);
       this.proc = null;
     }
+    if (this._fusionConfigDir) {
+      fs.rmSync(this._fusionConfigDir, { recursive: true, force: true });
+      this._fusionConfigDir = undefined;
+    }
+  }
+
+  /** Copy the user Devin config and pin `agent.subagent_model` to this Fusion pairing. */
+  private _fusionSubagentConfig(model: string): string | undefined {
+    const source = devinUserConfigPath();
+    let existing: unknown = {};
+    if (fs.existsSync(source)) {
+      try {
+        existing = JSON.parse(fs.readFileSync(source, 'utf8'));
+      } catch {
+        this.emit(
+          SESSION_EVENT.LOG,
+          '[acp:devin] Fusion subagents kept the existing Devin config because it is not JSON',
+        );
+        return undefined;
+      }
+    }
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-devin-fusion-'));
+    this._fusionConfigDir = dir;
+    const file = path.join(dir, 'config.json');
+    fs.writeFileSync(file, JSON.stringify(devinFusionConfig(existing, model)));
+    return file;
   }
 
   pause(): void {
@@ -384,18 +496,21 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
   // ── Agent → client ─────────────────────────────────────────────────────
 
   private _answerPermission(params: acp.RequestPermissionRequest): acp.RequestPermissionResponse {
-    const allow = ALLOWING_MODES.has(this.options.permissionMode ?? '');
+    const sideQuestion = this._btwReadOnly && params.sessionId === this._sideSessionId;
+    const allow = !sideQuestion && ALLOWING_MODES.has(this.options.permissionMode ?? '');
     const kinds = allow ? ['allow_once', 'allow_always'] : ['reject_once', 'reject_always'];
     const option = kinds.map((k) => params.options.find((o) => o.kind === k)).find(Boolean);
-    this._addHistory({
-      time: new Date().toISOString(),
-      type: 'permission',
-      event: {
-        tool: params.toolCall.title,
-        options: params.options.slice(0, 8).map((item) => item.name || item.kind),
-        answer: option?.kind ?? 'cancelled',
-      },
-    });
+    if (!sideQuestion) {
+      this._addHistory({
+        time: new Date().toISOString(),
+        type: 'permission',
+        event: {
+          tool: params.toolCall.title,
+          options: params.options.slice(0, 8).map((item) => item.name || item.kind),
+          answer: option?.kind ?? 'cancelled',
+        },
+      });
+    }
     return option
       ? { outcome: { outcome: 'selected', optionId: option.optionId } }
       : { outcome: { outcome: 'cancelled' } };
@@ -419,8 +534,20 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
   }
 
   private _onUpdate(params: acp.SessionNotification): void {
-    if (params.sessionId !== this.acpSessionId) return;
     const update = params.update;
+    if (params.sessionId === this._sideSessionId) {
+      if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') {
+        this._sideText += update.content.text;
+      }
+      return;
+    }
+    if (params.sessionId !== this.acpSessionId) return;
+    if (this._nativeBtw) {
+      if (update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text') {
+        this._nativeBtwText += update.content.text;
+      }
+      return;
+    }
     this._stats.lastActivity = new Date().toISOString();
     switch (update.sessionUpdate) {
       case 'agent_message_chunk':
@@ -511,6 +638,120 @@ export class PersistentAcpSession extends EventEmitter implements ISession {
       breakdown: { inputCost: 0, cachedCost: 0, outputCost: 0 },
       totalUsd: this._stats.costUsd,
     };
+  }
+
+  /**
+   * One side question. A native `/btw` that Devin accepts stays on this
+   * session and out of its history. A refusal opens a hidden read-only
+   * session, then closes it. Either way the answer is written for Memento.
+   */
+  async btw(question: string, timeoutMs = 120_000): Promise<Record<string, unknown>> {
+    if (this.agent.name !== 'devin') {
+      throw new Error('Devin /btw requires acpAgent devin');
+    }
+    if (!this._isReady || !this.conn || !this.acpSessionId) throw new Error('Session not ready. Call start() first.');
+    const parentSessionId = this.acpSessionId;
+    const sideSessionId = devinSideId();
+    let answer = '';
+    let native = false;
+    if (!this._isBusy) {
+      this._isBusy = true;
+      try {
+        const result = await this._btwPrompt(parentSessionId, devinBtwPrompt(question), timeoutMs, 'native');
+        const text = result.text.trim();
+        if (text && !devinBtwRefusal(text)) {
+          native = true;
+          answer = text;
+        }
+      } finally {
+        this._isBusy = false;
+        this._nativeBtw = false;
+      }
+    }
+    if (!native) answer = (await this._btwFallback(question, timeoutMs)).trim();
+    if (!answer) throw new Error('Devin /btw returned no answer');
+    const file = writeDevinSideDocument(devinDataRoot(), {
+      parentSessionId,
+      sideSessionId,
+      question: question.trim(),
+      answer,
+      model: this.options.model,
+      native,
+    });
+    return { text: answer, parentSessionId, sideSessionId, native, path: file };
+  }
+
+  private async _btwPrompt(
+    sessionId: string,
+    text: string,
+    timeoutMs: number,
+    bucket: 'native' | 'side',
+  ): Promise<{ text: string }> {
+    const conn = this.conn!;
+    if (bucket === 'native') {
+      this._nativeBtw = true;
+      this._nativeBtwText = '';
+    } else {
+      this._sideText = '';
+    }
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([
+        conn.agent.request(acp.methods.agent.session.prompt, {
+          sessionId,
+          prompt: [{ type: 'text', text }],
+        }),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            conn.agent.notify(acp.methods.agent.session.cancel, { sessionId }).catch(() => undefined);
+            reject(new Error('Timeout waiting for Devin /btw'));
+          }, timeoutMs);
+        }),
+      ]);
+      return { text: bucket === 'native' ? this._nativeBtwText : this._sideText };
+    } finally {
+      clearTimeout(timer);
+      if (bucket === 'native') this._nativeBtw = false;
+    }
+  }
+
+  private async _btwFallback(question: string, timeoutMs: number): Promise<string> {
+    const conn = this.conn!;
+    const cwd = this.options.cwd || process.cwd();
+    const created = await conn.agent.request(acp.methods.agent.session.new, { cwd, mcpServers: [] });
+    const sideSessionId = created.sessionId;
+    this._sideSessionId = sideSessionId;
+    this._btwReadOnly = true;
+    const root = devinDataRoot();
+    hideDevinSession(root, sideSessionId);
+    try {
+      await conn.agent
+        .request(acp.methods.agent.session.setMode, { sessionId: sideSessionId, modeId: 'ask' })
+        .catch(() => undefined);
+      const transcript = [readDevinTranscript(root, this.acpSessionId || ''), this._historyTranscript()]
+        .filter(Boolean)
+        .join('\n');
+      const result = await this._btwPrompt(sideSessionId, devinSideQuestion(transcript, question), timeoutMs, 'side');
+      return result.text;
+    } finally {
+      this._btwReadOnly = false;
+      this._sideSessionId = null;
+      await conn.agent
+        .request(acp.methods.agent.session.delete, { sessionId: sideSessionId })
+        .catch(() => conn.agent.request(acp.methods.agent.session.close, { sessionId: sideSessionId }))
+        .catch(() => undefined);
+    }
+  }
+
+  private _historyTranscript(): string {
+    return this._history
+      .map((entry) => {
+        if (!entry.event || typeof entry.event !== 'object') return '';
+        const event = entry.event as { result?: unknown };
+        return typeof event.result === 'string' && event.result.trim() ? `assistant: ${event.result.trim()}` : '';
+      })
+      .filter(Boolean)
+      .join('\n');
   }
 
   async compact(_summary?: string): Promise<TurnResult> {

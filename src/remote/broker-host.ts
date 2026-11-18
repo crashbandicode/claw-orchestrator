@@ -15,6 +15,7 @@ export interface RemoteBrokerHost {
   ): Promise<{ output: string; sessionId?: string; error?: string }>;
   stopSession(name: string): Promise<void>;
   codexSide(name: string, prompt: string, timeoutMs?: number): Promise<Record<string, unknown>>;
+  devinBtw(name: string, prompt: string, timeoutMs?: number): Promise<Record<string, unknown>>;
   listSessions(): SessionInfo[];
   listPersistedSessions(): Array<{
     name: string;

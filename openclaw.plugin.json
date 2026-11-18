@@ -131,6 +131,8 @@
       "codex_goal_pause",
       "codex_goal_resume",
       "codex_goal_clear",
+      "devin_btw",
+      "devin_resume",
       "codex_side",
       "codex_interrupt",
       "codex_steer",

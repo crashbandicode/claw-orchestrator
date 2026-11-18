@@ -1325,6 +1325,11 @@ export class SessionManager {
     // config (agy resume-id lookups, _persistSession's registry entry) see the
     // real engine even when it came from the persisted registry.
     fullConfig.engine = engine;
+    // Devin's own default mode asks. Resume and start both run in bypass unless
+    // the caller named a different permission mode.
+    if (fullConfig.engine === 'acp' && fullConfig.acpAgent === 'devin' && !config.permissionMode) {
+      fullConfig.permissionMode = 'bypassPermissions';
+    }
     const orchestration = this._normalizeOrchestrationContext(name, fullConfig, engine);
     fullConfig.orchestration = orchestration;
     this._ensureOrchestrationRunStarted(orchestration);
@@ -1712,7 +1717,11 @@ export class SessionManager {
     // The new session's record starts as the source's, so a second handoff from
     // it carries the whole conversation rather than only the part it has seen.
     target.transcript = cloneTranscript(record);
-    target.pendingHandoff = rendered.text;
+    const sourceId = this._handoffMarkerId(source);
+    const handoffMarker = sourceId && /^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$/.test(sourceId)
+      ? `MEMENTO-HANDOFF-FROM: ${sourceId}\n`
+      : '';
+    target.pendingHandoff = `${handoffMarker}${rendered.text}`;
 
     const out = {
       name: targetName,
@@ -2990,6 +2999,21 @@ export class SessionManager {
     return await this.sendMessage(name, `/goal ${trimmed}`, { timeout: timeoutMs });
   }
 
+  /** Ask one Devin `/btw` question. The parent thread stays put. */
+  async devinBtw(name: string, prompt: string, timeoutMs?: number): Promise<Record<string, unknown>> {
+    this._assertDevinSession(name);
+    const managed = this.sessions.get(name);
+    if (!managed) throw new Error(`Session not found: ${name}`);
+    const session = managed.session as {
+      btw?: (question: string, timeoutMs?: number) => Promise<Record<string, unknown>>;
+    };
+    if (typeof session.btw !== 'function') {
+      throw new Error(`Session "${name}" does not support Devin /btw.`);
+    }
+    const result = await session.btw(prompt, timeoutMs);
+    return { ok: true, ...result };
+  }
+
   /** Ask one question on an ephemeral Codex side fork. The parent thread stays put. */
   async codexSide(name: string, prompt: string, timeoutMs?: number): Promise<Record<string, unknown>> {
     const managed = this.sessions.get(name);
@@ -3830,6 +3854,17 @@ export class SessionManager {
   private _resolveModel(alias: string, overrides?: Record<string, string>): string {
     if (overrides?.[alias]) return overrides[alias];
     return resolveAlias(alias);
+  }
+
+  /**
+   * Session id written into a handoff marker. OpenCode and Cursor expose a
+   * `live-` wrapper on `sessionId`; Memento indexes the native id.
+   */
+  private _handoffMarkerId(managed: ManagedSession): string | undefined {
+    const session = managed.session as { opencodeSessionId?: string; cursorChatId?: string };
+    if (managed.config.engine === 'opencode' && session.opencodeSessionId) return session.opencodeSessionId;
+    if (managed.config.engine === 'cursor' && session.cursorChatId) return session.cursorChatId;
+    return this._managedResumeId(managed);
   }
 
   private _managedResumeId(managed: ManagedSession): string | undefined {

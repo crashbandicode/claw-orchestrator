@@ -366,7 +366,11 @@ const plugin = {
             description:
               'Engine to use (default: claude). codex = `codex exec` per send (no /goal). codex-app = long-running `codex app-server` with /goal support. agy = Google Antigravity CLI (stream-json output with reported token usage; the conversation is resumed by its id on each send). grok = xAI Grok Build CLI (reports its own per-turn cost). opencode = sst/opencode CLI (provider-agnostic; pass model as `provider/model`). acp = any Agent Client Protocol agent, chosen with acpAgent. Use "custom" with customEngine config for any CLI. gemini and cursor are legacy, kept for existing callers: use agy and grok instead.',
           },
-          model: { type: 'string', description: 'Model to use (opus, sonnet, haiku, gpt-5.5, agy-pro, etc.)' },
+          model: {
+            type: 'string',
+            description:
+              'Model to use (opus, sonnet, haiku, gpt-5.5, agy-pro, etc.). For a Devin session, `fusion` or a `fusion-…-sidekick-…` id runs that Fusion pairing and launches its subagents on the same pairing.',
+          },
           claudeAccount: {
             type: 'string',
             description:
@@ -1266,6 +1270,87 @@ const plugin = {
     }
 
     // ─── Codex app-server v2 RPC tools (codex-app engine, Codex 0.137) ────
+
+    registerTool({
+      name: 'devin_btw',
+      description:
+        'Ask one Devin /btw side question. The parent thread stays in place, and a parent turn already running is left alone. Requires engine: "acp" and acpAgent: "devin".',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Session name (must be a Devin ACP session).' },
+          prompt: { type: 'string', description: 'The side question.' },
+          timeout: { type: 'number', description: 'Timeout in ms (default 120000).' },
+          ...REMOTE_CALL_PROPERTIES,
+        },
+        required: ['name', 'prompt'],
+      },
+      execute: async (_id, args) => {
+        const prompt = typeof args.prompt === 'string' ? args.prompt.trim() : '';
+        if (!prompt) throw new Error('Devin /btw requires a question');
+        return callRouted('session.btw', { ...args, prompt }, async () =>
+          getManager().devinBtw(args.name as string, prompt, args.timeout as number | undefined),
+        );
+      },
+    });
+
+    registerTool({
+      name: 'devin_resume',
+      description:
+        'Resume a Devin session by its id and continue it in bypass mode unless another permission mode is named. Requires the session name to be free. The id is Devin\'s own session id.',
+      parameters: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Name for the resumed Claw session.' },
+          session_id: { type: 'string', description: 'Devin session id to resume.' },
+          message: { type: 'string', description: 'Optional first prompt to send after the session is resumed.' },
+          cwd: { type: 'string', description: 'Working directory. Defaults to the current directory.' },
+          model: { type: 'string', description: 'Optional Devin model id.' },
+          permissionMode: {
+            type: 'string',
+            enum: ['acceptEdits', 'bypassPermissions', 'default', 'manual', 'dontAsk', 'plan', 'auto'],
+            description: 'Permission mode. Defaults to bypassPermissions.',
+          },
+          timeout: { type: 'number', description: 'Timeout in ms for the optional first prompt.' },
+          ...REMOTE_CALL_PROPERTIES,
+        },
+        required: ['name', 'session_id'],
+      },
+      execute: async (_id, args) => {
+        const sessionId = typeof args.session_id === 'string' ? args.session_id.trim() : '';
+        if (!sessionId) throw new Error('Devin resume requires a session id');
+        const permissionMode = typeof args.permissionMode === 'string' && args.permissionMode
+          ? args.permissionMode
+          : 'bypassPermissions';
+        const started = await callRouted(
+          'session.start',
+          {
+            ...args,
+            engine: 'acp',
+            acpAgent: 'devin',
+            resumeSessionId: sessionId,
+            permissionMode,
+          },
+          async () => getManager().startSession({
+            name: args.name as string,
+            cwd: args.cwd as string | undefined,
+            engine: 'acp',
+            acpAgent: 'devin',
+            model: args.model as string | undefined,
+            resumeSessionId: sessionId,
+            permissionMode: permissionMode as Parameters<SessionManager['startSession']>[0]['permissionMode'],
+          }),
+        );
+        const message = typeof args.message === 'string' ? args.message.trim() : '';
+        if (!message) return { ok: true, ...started, permissionMode };
+        const sent = await callRouted(
+          'session.send',
+          { ...args, message },
+          async () => getManager().sendMessage(args.name as string, message, { timeout: args.timeout as number | undefined }),
+        );
+        return { ok: !sent.error, ...started, permissionMode, result: sent };
+      },
+    });
 
     registerTool({
       name: 'codex_side',

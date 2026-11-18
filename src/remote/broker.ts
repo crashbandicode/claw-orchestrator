@@ -269,6 +269,8 @@ export class RemoteBroker {
         return this.sessions.health();
       case 'session.side':
         return this.sessionSide(payload);
+      case 'session.btw':
+        return this.sessionBtw(payload);
       case 'inbox.send':
         return this.inboxSend(payload);
       case 'inbox.read':
@@ -348,6 +350,19 @@ export class RemoteBroker {
         ...(plan ? { plan: true } : {}),
       });
       return { ok: true, ...result };
+    } finally {
+      this.sessions.releaseSessionHold(name);
+    }
+  }
+
+  private async sessionBtw(payload: Record<string, unknown>): Promise<unknown> {
+    const name = requiredString(payload.name, 'name');
+    const prompt = requiredText(payload.prompt, 'prompt');
+    const timeout = this.finiteNumber(payload.timeout, 'timeout');
+    if (!this.sessions.hasLiveSession(name)) throw new Error(`Session '${name}' not found`);
+    this.sessions.holdSession(name);
+    try {
+      return await this.sessions.devinBtw(name, prompt, timeout);
     } finally {
       this.sessions.releaseSessionHold(name);
     }

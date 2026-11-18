@@ -44,6 +44,8 @@ export const TOOL_ANNOTATIONS: Record<string, ToolAnnotation> = {
   devin_goal_status: { readOnlyHint: true, idempotentHint: true },
   devin_goal_clear: {},
   devin_goal_resume: { openWorldHint: true },
+  devin_btw: { openWorldHint: true },
+  devin_resume: { openWorldHint: true },
   claude_agents_list: { readOnlyHint: true, idempotentHint: true },
   plugin_details: { readOnlyHint: true, idempotentHint: true },
   codex_models: { readOnlyHint: true, idempotentHint: true },

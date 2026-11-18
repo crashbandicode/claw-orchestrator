@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PersistentAcpSession, devinAcpLaunchArgs, devinElicitationResponse, devinGoalCommand } from '../persistent-acp-session.js';
+import { PersistentAcpSession, devinAcpLaunchArgs, devinElicitationResponse, devinFusionConfig, devinGoalCommand, devinSessionMode, isDevinFusionModel } from '../persistent-acp-session.js';
 import { validatePreset, resolveAcpAgent, resolveCustomEngine, _resetEnginePresetCache } from '../engine-presets.js';
 import { __rejectCustomEngineOverHttpForTest as rejectOverHttp } from '../embedded-server.js';
 import type { AcpAgentConfig, SessionConfig, TurnResult } from '../types.js';
@@ -222,11 +222,28 @@ describe('Devin goal and model selection', () => {
     expect(devinGoalCommand('resume')).toBe('/goal resume');
     expect(() => devinGoalCommand('set', '  ')).toThrow(/objective/);
     expect(devinAcpLaunchArgs(['acp'], 'glm-5.3-flash')).toEqual(['acp', '--model', 'glm-5.3-flash']);
+    expect(devinSessionMode('bypassPermissions')).toBe('bypass');
     expect(devinAcpLaunchArgs(['acp', '--model', 'gpt-6-luna'], 'claude-haiku-5.5')).toEqual([
       'acp',
       '--model',
       'gpt-6-luna',
     ]);
+    expect(isDevinFusionModel('fusion')).toBe(true);
+    expect(isDevinFusionModel('fusion-claude-opus-5-5-xhigh-sidekick-swe-2-medium')).toBe(true);
+    expect(isDevinFusionModel('claude-haiku-5-5-low')).toBe(false);
+    expect(devinAcpLaunchArgs(['acp'], 'fusion', '/tmp/devin-fusion.json')).toEqual([
+      '--config',
+      '/tmp/devin-fusion.json',
+      'acp',
+      '--model',
+      'fusion',
+    ]);
+    expect(
+      devinFusionConfig({ agent: { model: 'swe-1-6-fast' }, permission_mode: 'auto' }, 'fusion'),
+    ).toEqual({
+      agent: { model: 'swe-1-6-fast', subagent_model: 'fusion' },
+      permission_mode: 'auto',
+    });
   });
 
   it('answers a form only when the throwaway switch is on', () => {
@@ -242,5 +259,62 @@ describe('Devin goal and model selection', () => {
       action: 'accept',
       content: { color: 'red', name: 'throwaway', proceed: true },
     });
+  });
+});
+
+describe('Devin /btw', () => {
+  const priorData = process.env.XDG_DATA_HOME;
+
+  afterEach(() => {
+    if (priorData === undefined) delete process.env.XDG_DATA_HOME;
+    else process.env.XDG_DATA_HOME = priorData;
+  });
+
+  function devin(env: Record<string, string> = {}): AcpAgentConfig {
+    return { ...agent(env), name: 'devin' };
+  }
+
+  it('keeps a native answer off the parent history and writes a side file', async () => {
+    process.env.XDG_DATA_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-btw-'));
+    const s = await open({ acpAgent: devin() });
+    await turn(s, 'main-ok');
+    const history = s.getHistory().length;
+    const turns = s.getStats().turns;
+    const result = await s.btw('what was said');
+    expect(result.native).toBe(true);
+    expect(String(result.text)).toContain('echo:/btw what was said');
+    expect(s.getHistory().length).toBe(history);
+    expect(s.getStats().turns).toBe(turns);
+    const doc = JSON.parse(fs.readFileSync(String(result.path), 'utf8')) as {
+      thread_source: string;
+      parent_thread_id: string;
+      steps: Array<{ message: string }>;
+    };
+    expect(doc.thread_source).toBe('side');
+    expect(doc.parent_thread_id).toBe(s.agentSessionId);
+    expect(doc.steps[0]?.message).toBe('what was said');
+  });
+
+  it('falls back when side chains are refused and rejects permission on that session', async () => {
+    process.env.XDG_DATA_HOME = fs.mkdtempSync(path.join(os.tmpdir(), 'clawo-btw-'));
+    const s = await open({
+      acpAgent: devin({ FIXTURE_BTW: 'refuse' }),
+      permissionMode: 'bypassPermissions',
+    });
+    await turn(s, 'main-ok');
+    const history = s.getHistory().length;
+    const turns = s.getStats().turns;
+    const result = await s.btw('PERMISSION side-ok');
+    expect(result.native).toBe(false);
+    expect(String(result.text)).toContain('permission=no');
+    expect(String(result.text)).toContain('side-ok');
+    expect(s.getHistory().length).toBe(history);
+    expect(s.getStats().turns).toBe(turns);
+    const doc = JSON.parse(fs.readFileSync(String(result.path), 'utf8')) as {
+      extra: { native_btw: boolean };
+      steps: Array<{ message: string }>;
+    };
+    expect(doc.extra.native_btw).toBe(false);
+    expect(doc.steps[0]?.message).toBe('PERMISSION side-ok');
   });
 });

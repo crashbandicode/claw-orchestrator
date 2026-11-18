@@ -44,6 +44,17 @@ const app = acp
     });
     return {};
   })
+  .onRequest('session/delete', (ctx) => {
+    sessions.delete(ctx.params.sessionId);
+    return {};
+  })
+  .onRequest('session/close', (ctx) => {
+    sessions.delete(ctx.params.sessionId);
+    return {};
+  })
+  .onRequest('session/set_mode', () => ({}))
+  .onRequest('session/set_config_option', () => ({}))
+  .onNotification('session/cancel', () => {})
   .onRequest('session/prompt', async (ctx) => {
     const id = ctx.params.sessionId;
     const state = sessions.get(id);
@@ -51,6 +62,17 @@ const app = acp
     const text = ctx.params.prompt.map((b) => (b.type === 'text' ? b.text : '')).join('');
     state.turns += 1;
     const emit = (update) => ctx.client.notify('session/update', { sessionId: id, update });
+
+    if (process.env.FIXTURE_BTW === 'refuse' && text.trimStart().startsWith('/btw ')) {
+      await emit({
+        sessionUpdate: 'agent_message_chunk',
+        content: {
+          type: 'text',
+          text: "/btw needs side-chain support (`cognition.ai/chains`), which this client doesn't use.",
+        },
+      });
+      return { stopReason: 'end_turn' };
+    }
 
     if (text.includes('CRASH')) process.exit(3);
     if (text.includes('SLOW')) await new Promise((r) => setTimeout(r, 3000));

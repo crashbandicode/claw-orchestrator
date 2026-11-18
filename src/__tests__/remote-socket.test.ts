@@ -86,6 +86,11 @@ class FakeHost implements RemoteBrokerHost {
     this.live.delete(name);
   }
 
+  async devinBtw(name: string, prompt: string): Promise<Record<string, unknown>> {
+    if (!this.live.has(name)) throw new Error(`Session '${name}' not found`);
+    return { ok: true, text: prompt, native: false };
+  }
+
   async codexSide(name: string, prompt: string): Promise<Record<string, unknown>> {
     if (!this.live.has(name)) throw new Error(`Session '${name}' not found`);
     return { ok: true, text: prompt, sideThreadId: 'side-1', parentThreadId: 'parent-1' };
