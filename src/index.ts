@@ -1342,13 +1342,17 @@ const plugin = {
           }),
         );
         const message = typeof args.message === 'string' ? args.message.trim() : '';
-        if (!message) return { ok: true, ...started, permissionMode };
+        const startedRecord = started !== null && typeof started === 'object'
+          ? started as Record<string, unknown>
+          : { started };
+        if (!message) return { ok: true, ...startedRecord, permissionMode };
         const sent = await callRouted(
           'session.send',
           { ...args, message },
           async () => getManager().sendMessage(args.name as string, message, { timeout: args.timeout as number | undefined }),
         );
-        return { ok: !sent.error, ...started, permissionMode, result: sent };
+        const sentRecord = sent !== null && typeof sent === 'object' ? sent as Record<string, unknown> : {};
+        return { ok: !sentRecord.error, ...startedRecord, permissionMode, result: sent };
       },
     });
 
